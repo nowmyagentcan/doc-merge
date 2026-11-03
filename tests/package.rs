@@ -311,7 +311,7 @@ fn sizes_are_capped_before_and_while_reading() {
         "Part [Content_Types].xml of 'in.docx' is over the limit: 100 MiB (at most 64 MiB)."
     );
 
-    // Over 512 MiB is refused from its size alone (the file is sparse and never read).
+    // Over 512 MiB is refused from its size alone (the file is never read).
     let p = dir.join("huge.pptx");
     std::fs::File::create(&p)
         .unwrap()
@@ -319,6 +319,7 @@ fn sizes_are_capped_before_and_while_reading() {
         .unwrap();
     let t = Instant::now();
     let e = Package::open(&p, 1, &big).unwrap_err();
+    std::fs::remove_file(&p).unwrap();
     assert!(t.elapsed() < Duration::from_millis(200));
     assert_eq!(
         e.message,
