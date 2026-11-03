@@ -2,18 +2,21 @@
 //! nothing and does no terminal or network I/O; the command line, the MCP server and the page
 //! all call it.
 
+pub mod docx;
 pub mod error;
 pub mod package;
 pub mod writer;
 pub mod xml;
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
-use error::Error;
-use package::Package;
+use serde::Serialize;
+
+use error::{Error, Warnings};
+use package::{Family, Kind, Package};
 
 /// Opens every input in order, then checks that they are all of one family.
 pub fn open_inputs(paths: &[PathBuf], run: &Rc<Run>) -> Result<Vec<Package>, Error> {
@@ -99,4 +102,75 @@ impl Origin {
             run: Run::new(None),
         }
     }
+}
+
+/// The merged file.
+#[derive(Debug, Serialize)]
+pub struct Output {
+    pub path: PathBuf,
+    pub kind: Kind,
+    pub bytes: u64,
+}
+
+/// One input and where its content landed.
+#[derive(Debug, Serialize)]
+pub struct Input {
+    pub path: PathBuf,
+    pub kind: Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<usize>,
+    /// 1-based, `[first, last]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_sections: Option<[usize; 2]>,
+}
+
+/// What a merge did, in the shape `--json` prints.
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub output: Output,
+    pub inputs: Vec<Input>,
+    pub warnings: Warnings,
+    pub elapsed_ms: u64,
+}
+
+/// Merges `paths` (the first is the base) into a new file at `output`.
+pub fn merge(paths: &[PathBuf], output: &Path, deadline: Option<Instant>) -> Result<Report, Error> {
+    let started = Instant::now();
+    let run = Run::new(deadline);
+    let mut inputs = open_inputs(paths, &run)?;
+    let mut warnings = Warnings::default();
+    let family = inputs[0].kind.family();
+    let (plan, counts) = match family {
+        Family::Word => {
+            let m = docx::merge(&mut inputs, &mut warnings)?;
+            (m.plan, m.sections)
+        }
+        _ => return Err(Error::internal("only Word documents can be merged so far")),
+    };
+    let bytes = writer::write(plan, &mut inputs, output)?;
+    let mut next = 1;
+    let inputs = inputs
+        .iter()
+        .zip(counts)
+        .map(|(p, n)| {
+            let first = next;
+            next += n;
+            Input {
+                path: std::path::absolute(&p.path).unwrap_or_else(|_| p.path.clone()),
+                kind: p.kind,
+                sections: Some(n),
+                output_sections: Some([first, next - 1]),
+            }
+        })
+        .collect();
+    Ok(Report {
+        output: Output {
+            path: std::path::absolute(output).unwrap_or_else(|_| output.into()),
+            kind: family.output(),
+            bytes,
+        },
+        inputs,
+        warnings,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
 }

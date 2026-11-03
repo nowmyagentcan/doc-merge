@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 
@@ -286,17 +286,7 @@ where
             }
             Event::Text(t) => self.text.push_str(&t.xml10_content()),
             Event::CData(t) => self.text.push_str(t),
-            Event::GeneralRef(g) => {
-                let c = match g.as_ref() {
-                    "lt" => '<',
-                    "gt" => '>',
-                    "amp" => '&',
-                    "apos" => '\'',
-                    "quot" => '"',
-                    _ => g.resolve_char_ref().ok().flatten().unwrap_or('\u{FFFD}'),
-                };
-                self.text.push(c);
-            }
+            Event::GeneralRef(g) => self.text.push(entity(g)),
             _ => {}
         }
         Ok(())
@@ -343,6 +333,267 @@ pub fn canonical(
             return Ok(canon.finish());
         }
         canon.push(&r, &event)?;
+    }
+}
+
+pub const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+
+/// An attribute as read: its name as written, its namespace URI and local name, and its value
+/// with references resolved. A namespace declaration has the namespace [`XMLNS`] and the
+/// prefix as its local name (empty for a default namespace).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attr {
+    pub key: String,
+    pub ns: String,
+    pub local: String,
+    pub value: String,
+}
+
+impl Attr {
+    pub fn new(key: &str, ns: &str, value: &str) -> Self {
+        Self {
+            key: key.into(),
+            ns: ns.into(),
+            local: key.rsplit(':').next().unwrap_or(key).into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn is_declaration(&self) -> bool {
+        self.ns == XMLNS
+    }
+}
+
+impl<'a> Reader<'a> {
+    /// Every attribute of `e`, namespace declarations included.
+    pub fn attrs(&self, e: &BytesStart<'a>) -> Result<Vec<Attr>, Error> {
+        let mut out = vec![];
+        for a in e.attributes() {
+            let a = a.map_err(|e| self.malformed(&e.to_string()))?;
+            let key: &str = a.key.as_ref();
+            let value = a
+                .normalized_value(XmlVersion::Implicit1_0)
+                .map_err(|e| self.malformed(&e.to_string()))?;
+            let ns = match key.strip_prefix("xmlns") {
+                Some(p) if p.is_empty() || p.starts_with(':') => XMLNS,
+                _ => self.attribute_ns(a.key),
+            };
+            let mut attr = Attr::new(key, ns, &value);
+            if key == "xmlns" {
+                attr.local.clear();
+            }
+            out.push(attr);
+        }
+        Ok(out)
+    }
+}
+
+/// `<name a="v"…>`, or `<name …/>` when `empty`, with the values escaped.
+pub fn start_tag(name: &str, attrs: &[Attr], empty: bool) -> String {
+    let mut s = format!("<{name}");
+    for a in attrs {
+        s += &format!(" {}=\"{}\"", a.key, escape(&a.value));
+    }
+    s += if empty { "/>" } else { ">" };
+    s
+}
+
+/// An element held whole, for the small parts that are compared and rebuilt (styles,
+/// numbering, themes) rather than streamed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// As written, e.g. `w:style`.
+    pub name: String,
+    pub ns: String,
+    pub local: String,
+    pub attrs: Vec<Attr>,
+    pub children: Vec<Child>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Child {
+    Node(Node),
+    /// With references resolved.
+    Text(String),
+}
+
+impl Node {
+    pub fn new(name: &str, ns: &str, attrs: Vec<Attr>) -> Self {
+        Self {
+            name: name.into(),
+            ns: ns.into(),
+            local: name.rsplit(':').next().unwrap_or(name).into(),
+            attrs,
+            children: vec![],
+        }
+    }
+
+    pub fn is(&self, ns: &str, local: &str) -> bool {
+        self.ns == ns && self.local == local
+    }
+
+    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+        self.children.iter().filter_map(|c| match c {
+            Child::Node(n) => Some(n),
+            Child::Text(_) => None,
+        })
+    }
+
+    pub fn nodes_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.children.iter_mut().filter_map(|c| match c {
+            Child::Node(n) => Some(n),
+            Child::Text(_) => None,
+        })
+    }
+
+    pub fn child(&self, ns: &str, local: &str) -> Option<&Node> {
+        self.nodes().find(|n| n.is(ns, local))
+    }
+
+    pub fn child_mut(&mut self, ns: &str, local: &str) -> Option<&mut Node> {
+        self.nodes_mut().find(|n| n.is(ns, local))
+    }
+
+    pub fn attr(&self, ns: &str, local: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|a| a.ns == ns && a.local == local)
+            .map(|a| a.value.as_str())
+    }
+
+    /// Sets an attribute, adding it as `prefix:local` when it is missing.
+    pub fn set_attr(&mut self, ns: &str, prefix: &str, local: &str, value: &str) {
+        match self
+            .attrs
+            .iter_mut()
+            .find(|a| a.ns == ns && a.local == local)
+        {
+            Some(a) => a.value = value.into(),
+            None => self
+                .attrs
+                .push(Attr::new(&format!("{prefix}:{local}"), ns, value)),
+        }
+    }
+
+    /// Calls `f` on this element and every element inside it, depth first.
+    pub fn walk_mut(&mut self, f: &mut impl FnMut(&mut Node)) {
+        f(self);
+        for n in self.nodes_mut() {
+            n.walk_mut(f);
+        }
+    }
+
+    pub fn walk(&self, f: &mut impl FnMut(&Node)) {
+        f(self);
+        for n in self.nodes() {
+            n.walk(f);
+        }
+    }
+
+    pub fn write(&self, out: &mut String) {
+        let empty = self.children.is_empty();
+        out.push_str(&start_tag(&self.name, &self.attrs, empty));
+        if empty {
+            return;
+        }
+        for c in &self.children {
+            match c {
+                Child::Node(n) => n.write(out),
+                Child::Text(t) => out.push_str(&escape_text(t)),
+            }
+        }
+        out.push_str(&format!("</{}>", self.name));
+    }
+
+    /// The canonical form, as [`Canon`] gives it for the same XML (without `mc:Ignorable`
+    /// prefixes resolved).
+    pub fn canonical(&self, out: &mut String) {
+        let mut attrs: Vec<(String, &str)> = self
+            .attrs
+            .iter()
+            .filter(|a| !a.is_declaration())
+            .map(|a| (format!("{{{}}}{}", a.ns, a.local), a.value.as_str()))
+            .collect();
+        attrs.sort();
+        out.push_str(&format!("<{{{}}}{}", self.ns, self.local));
+        for (k, v) in attrs {
+            out.push_str(&format!(" {k}=\"{}\"", escape(v)));
+        }
+        out.push('>');
+        for c in &self.children {
+            match c {
+                Child::Node(n) => n.canonical(out),
+                Child::Text(t) if !t.trim().is_empty() => out.push_str(&escape(t)),
+                Child::Text(_) => {}
+            }
+        }
+        out.push_str("</>");
+    }
+}
+
+fn escape_text(s: &str) -> Cow<'_, str> {
+    if s.contains(['<', '&', '>']) {
+        Cow::Owned(
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;"),
+        )
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// A character reference or one of the five predefined entities, resolved.
+fn entity(g: &BytesRef) -> char {
+    match g.as_ref() {
+        "lt" => '<',
+        "gt" => '>',
+        "amp" => '&',
+        "apos" => '\'',
+        "quot" => '"',
+        _ => g.resolve_char_ref().ok().flatten().unwrap_or('\u{FFFD}'),
+    }
+}
+
+/// A whole part as a tree of its root element.
+pub fn tree(text: &str, part: &str, origin: &Origin) -> Result<Node, Error> {
+    let mut r = Reader::new(text, part, origin);
+    let mut open: Vec<Node> = vec![];
+    let add_text = |open: &mut Vec<Node>, s: &str| {
+        if let Some(n) = open.last_mut() {
+            match n.children.last_mut() {
+                Some(Child::Text(t)) => t.push_str(s),
+                _ => n.children.push(Child::Text(s.into())),
+            }
+        }
+    };
+    loop {
+        let event = r.event()?;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let name = e.name().as_ref().to_owned();
+                let n = Node::new(&name, r.element_ns(e), r.attrs(e)?);
+                if matches!(event, Event::Start(_)) {
+                    open.push(n);
+                    continue;
+                }
+                match open.last_mut() {
+                    Some(p) => p.children.push(Child::Node(n)),
+                    None => return Ok(n),
+                }
+            }
+            Event::End(_) => {
+                let n = open.pop().expect("the reader pairs every end");
+                match open.last_mut() {
+                    Some(p) => p.children.push(Child::Node(n)),
+                    None => return Ok(n),
+                }
+            }
+            Event::Text(t) => add_text(&mut open, &t.xml10_content()),
+            Event::CData(t) => add_text(&mut open, t),
+            Event::GeneralRef(g) => add_text(&mut open, &entity(g).to_string()),
+            _ => {}
+        }
     }
 }
 
