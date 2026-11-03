@@ -846,6 +846,113 @@ mod tests {
         assert_eq!(m.renames[0].1, "A (3)");
     }
 
+    fn folded(defaults: &str, base: &str, own: &str) -> String {
+        let root = |d: &str| {
+            let text = format!("<w:styles {NS}><w:docDefaults>{d}</w:docDefaults></w:styles>");
+            xml::tree(&text, "s.xml", &Origin::test("x.docx")).unwrap()
+        };
+        let base = root(base);
+        let mut doc = sheet(&format!(
+            "<w:docDefaults>{defaults}</w:docDefaults>{}",
+            style("paragraph", "N", "Normal", own)
+        ));
+        doc.fold_defaults(base.child(W, "docDefaults"));
+        let mut out = String::new();
+        let s = &doc.styles[0];
+        for n in s.nodes().filter(|n| n.local != "name") {
+            n.write(&mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn defaults_go_under_a_styles_own_properties_in_schema_order() {
+        let defaults = r#"<w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:cs="Arial"/><w:sz w:val="24"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="278" w:lineRule="auto"/></w:pPr></w:pPrDefault>"#;
+        let own = r#"<w:pPr><w:keepNext/><w:spacing w:lineRule="exact" w:before="10"/><w:jc w:val="right"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial"/><w:b/><w:color w:val="FF0000"/><w:lang w:val="en-GB"/></w:rPr>"#;
+        assert_eq!(
+            folded(defaults, defaults, own),
+            r#"<w:pPr><w:keepNext/><w:spacing w:lineRule="exact" w:before="10" w:after="160"/><w:jc w:val="right"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:cs="Arial"/><w:b/><w:color w:val="FF0000"/><w:sz w:val="24"/><w:lang w:val="en-GB"/></w:rPr>"#
+        );
+    }
+
+    #[test]
+    fn what_only_the_base_defaults_set_falls_back_to_words_own_values() {
+        let base = r#"<w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:jc w:val="both"/></w:pPr></w:pPrDefault>"#;
+        assert_eq!(
+            folded("", base, ""),
+            r#"<w:pPr><w:jc w:val="left"/></w:pPr><w:rPr><w:sz w:val="20"/></w:rPr>"#
+        );
+    }
+
+    fn theme(fonts: &str, lang: &str) -> Theme {
+        let text = format!(
+            r#"<a:theme xmlns:a="{A}"><a:themeElements><a:clrScheme name="x"><a:dk1/></a:clrScheme><a:fontScheme name="y">{fonts}</a:fontScheme></a:themeElements></a:theme>"#
+        );
+        let o = Origin::test("x.docx");
+        let root = xml::tree(&text, "t.xml", &o).unwrap();
+        let settings = format!("<w:themeFontLang {NS} {lang}/>");
+        let lang = xml::tree(&settings, "s.xml", &o).unwrap();
+        Theme::new(&root, Some(&lang))
+    }
+
+    #[test]
+    fn theme_links_become_the_documents_own_values() {
+        let fonts = r#"<a:majorFont><a:latin typeface="Head"/><a:ea typeface=""/><a:cs typeface=""/><a:font script="Jpan" typeface="Mincho"/></a:majorFont><a:minorFont><a:latin typeface="Body"/><a:ea typeface=""/><a:cs typeface="Bidi"/></a:minorFont>"#;
+        let t = theme(fonts, r#"w:eastAsia="ja-JP""#);
+        let attr = |k: &str, v: &str| Attr::new(&format!("w:{k}"), W, v);
+        let mut attrs = vec![
+            attr("ascii", "Old"),
+            attr("asciiTheme", "majorHAnsi"),
+            attr("eastAsiaTheme", "majorEastAsia"),
+            attr("cstheme", "minorBidi"),
+            attr("hAnsiTheme", "majorBidi"),
+        ];
+        assert!(t.resolve(W, "rFonts", &mut attrs));
+        let got: Vec<_> = attrs
+            .iter()
+            .map(|a| (a.key.as_str(), a.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("w:ascii", "Head"),
+                ("w:eastAsia", "Mincho"),
+                ("w:cs", "Bidi")
+            ],
+            "an empty typeface leaves the attribute out"
+        );
+        let mut attrs = vec![
+            attr("val", "0F4761"),
+            attr("themeColor", "accent1"),
+            attr("themeShade", "BF"),
+        ];
+        assert!(t.resolve(W, "color", &mut attrs));
+        assert_eq!(attrs, [attr("val", "0F4761")]);
+        assert!(!t.resolve(W, "color", &mut attrs));
+        assert!(t.differs(&theme("<a:minorFont/>", "")));
+        assert!(!t.differs(&theme(fonts, "")));
+    }
+
+    #[test]
+    fn theme_links_compare_by_what_they_show_when_themes_differ() {
+        let linked = r#"<w:rPr><w:color w:val="111111" w:themeColor="accent1"/></w:rPr>"#;
+        let shown = r#"<w:rPr><w:color w:val="111111"/></w:rPr>"#;
+        let (a, b) = (theme("", ""), theme("<a:minorFont/>", ""));
+        let plain = |n: &str| n.to_string();
+        let doc = sheet(&style("paragraph", "H", "H", shown));
+        let src = Source {
+            sheet: &doc,
+            mode: StyleMode::Keep,
+            position: 2,
+            lists: &plain,
+            output_lists: &plain,
+            themes: Some((&a, &b)),
+        };
+        let mut out = Output::new(sheet(&style("paragraph", "H", "H", linked)));
+        let m = out.map(&src, &BTreeSet::from(["H".to_string()])).unwrap();
+        assert_eq!(m.ids["H"], "H");
+    }
+
     #[test]
     fn more_than_word_allows_is_refused() {
         let many: String = (0..MAX_STYLES)
