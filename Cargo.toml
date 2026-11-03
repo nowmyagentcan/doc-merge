@@ -1,0 +1,13 @@
+[package]
+name = "doc-merge"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Merge Word, PowerPoint or Excel files into one, keeping their layouts and formatting"
+repository = "https://github.com/nowmyagentcan/doc-merge"
+publish = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
