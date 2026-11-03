@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Merge Office files</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'><rect width='256' height='256' rx='57' fill='%232563eb'/><path transform='translate(48 48) scale(.625)' fill='%23fff' d='M234.36,170A12,12,0,0,1,230,186.37l-96,56a12,12,0,0,1-12.1,0l-96-56a12,12,0,0,1,12.09-20.74l90,52.48L218,165.63A12,12,0,0,1,234.36,170ZM218,117.63,128,170.11,38.05,117.63A12,12,0,0,0,26,138.37l96,56a12,12,0,0,0,12.1,0l96-56A12,12,0,0,0,218,117.63ZM20,80a12,12,0,0,1,6-10.37l96-56a12.06,12.06,0,0,1,12.1,0l96,56a12,12,0,0,1,0,20.74l-96,56a12,12,0,0,1-12.1,0l-96-56A12,12,0,0,1,20,80Zm35.82,0L128,122.11,200.18,80,128,37.89Z'/></svg>">
+<style>
+:root { --bg:#fafaf9; --fg:#1c1b1a; --muted:#6b6966; --line:#e7e5e2; --field:#f2f1ef; --accent:#0f7b4a; --danger:#b42318; --r:8px;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace; }
+@media (prefers-color-scheme: dark) { :root { --bg:#121110; --fg:#ecebe9; --muted:#9a9894; --line:#2a2826; --field:#1b1a19; --accent:#5fd38d; --danger:#f97066; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+main { max-width: 640px; margin: 0 auto; padding: 28px 16px 20px; display: grid; gap: 16px; }
+h1 { margin: 0; font-size: 19px; font-weight: 600; text-align: center; letter-spacing: -0.01em; }
+p, ul, ol { margin: 0; padding: 0; list-style: none; }
+svg { width: 16px; height: 16px; fill: currentColor; flex: none; }
+.visual { width: auto; height: 64px; justify-self: center; color: var(--muted); }
+form { display: grid; gap: 12px; }
+#zone { display: grid; place-content: center; min-height: 96px; padding: 16px; font: inherit; color: var(--fg); text-align: center;
+  white-space: normal; background: none; border: 2px dashed var(--line); border-radius: var(--r); cursor: pointer; }
+#zone.small { min-height: 56px; padding: 8px 16px; }
+#zone:hover, #zone.over { border-color: var(--accent); background: var(--field); }
+#list { display: grid; gap: 6px; }
+.row { display: grid; grid-template-columns: 20px 1fr auto; gap: 0 10px; align-items: start; padding: 8px 8px 8px 12px; background: var(--field); border-radius: var(--r); }
+.n { padding-top: 2px; font: 600 13px/20px var(--mono); color: var(--muted); }
+.n svg { position: relative; top: 2px; color: var(--danger); }
+.info { display: grid; min-width: 0; }
+.name { font-weight: 600; overflow-wrap: anywhere; }
+.meta { font-size: 13px; color: var(--muted); }
+.why { grid-column: 2 / -1; margin-top: 2px; font-size: 14px; color: var(--danger); }
+.row .hint { grid-column: 2 / -1; padding: 0; font-size: 14px; }
+.acts { display: flex; gap: 2px; }
+label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+input, select { width: 100%; min-height: 40px; padding: 8px 10px; font: inherit; font-size: 15px; color: var(--fg); background: var(--field); border: 1px solid var(--line); border-radius: var(--r); }
+.opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+summary { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--muted); cursor: pointer; list-style: none; border-radius: var(--r); }
+summary::-webkit-details-marker { display: none; }
+details[open] > summary svg { transform: rotate(90deg); }
+button { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 10px; font: inherit; font-size: 14px; color: var(--fg); background: var(--field); border: 1px solid var(--line); border-radius: var(--r); cursor: pointer; white-space: nowrap; }
+button:active:not(:disabled) { transform: translateY(1px); }
+button:disabled { opacity: .55; cursor: default; }
+.ib { justify-content: center; width: 32px; padding: 0; color: var(--muted); background: none; border-color: transparent; }
+.ib:hover:not(:disabled) { color: var(--fg); background: var(--bg); border-color: var(--line); }
+.ib:disabled { opacity: .3; }
+.go { justify-self: center; min-height: 40px; padding: 8px 40px; font-size: 15px; font-weight: 600; color: var(--bg); background: var(--accent); border-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#out { display: grid; gap: 12px; min-height: 88px; padding: 16px; border: 1px solid var(--line); border-radius: var(--r); align-content: start; }
+.muted { color: var(--muted); }
+.bar { width: 100%; height: 3px; overflow: hidden; border-radius: var(--r); }
+.bar::after { content: ""; display: block; width: 40%; height: 100%; background: var(--accent); animation: slide 1.1s linear infinite; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .bar::after { width: 100%; animation: none; } }
+.head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 12px; }
+.sum { display: flex; gap: 8px; align-items: baseline; font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.sum svg { position: relative; top: 2px; color: var(--accent); }
+.label { font-size: 13px; color: var(--muted); }
+.renames { display: grid; gap: 2px; font-size: 14px; }
+.renames b { font-weight: 600; }
+.renames .muted { margin-left: 6px; }
+.note, .err { display: flex; gap: 8px; align-items: baseline; font-size: 14px; }
+.note svg, .err svg { position: relative; top: 3px; }
+.err { font-size: 15px; font-weight: 600; color: var(--danger); }
+.hint { padding-left: 24px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+footer { display: flex; justify-content: center; align-items: center; gap: 16px; font-size: 13px; }
+footer a { display: inline-flex; color: var(--muted); border-radius: 4px; }
+footer a:hover { color: var(--fg); }
+footer svg { width: 18px; height: 18px; }
+@media (max-width: 520px) { .opts { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Merge PowerPoint, Excel or Word files.</h1>
+  <svg class="visual" viewBox="0 0 160 64" role="img" aria-label="Several documents become one document">
+    <path transform="translate(0 8) scale(.1875)" d="M213.66,66.34l-40-40A8,8,0,0,0,168,24H88A16,16,0,0,0,72,40V56H56A16,16,0,0,0,40,72V216a16,16,0,0,0,16,16H168a16,16,0,0,0,16-16V200h16a16,16,0,0,0,16-16V72A8,8,0,0,0,213.66,66.34ZM168,216H56V72h76.69L168,107.31v84.53c0,.06,0,.11,0,.16s0,.1,0,.16V216Zm32-32H184V104a8,8,0,0,0-2.34-5.66l-40-40A8,8,0,0,0,136,56H88V40h76.69L200,75.31Zm-56-32a8,8,0,0,1-8,8H88a8,8,0,0,1,0-16h48A8,8,0,0,1,144,152Zm0,32a8,8,0,0,1-8,8H88a8,8,0,0,1,0-16h48A8,8,0,0,1,144,184Z"/>
+    <path transform="translate(64 16) scale(.125)" d="M221.66,133.66l-72,72a8,8,0,0,1-11.32-11.32L196.69,136H40a8,8,0,0,1,0-16H196.69L138.34,61.66a8,8,0,0,1,11.32-11.32l72,72A8,8,0,0,1,221.66,133.66Z"/>
+    <path transform="translate(112 8) scale(.1875)" d="M213.66,82.34l-56-56A8,8,0,0,0,152,24H56A16,16,0,0,0,40,40V216a16,16,0,0,0,16,16H200a16,16,0,0,0,16-16V88A8,8,0,0,0,213.66,82.34ZM160,51.31,188.69,80H160ZM200,216H56V40h88V88a8,8,0,0,0,8,8h48V216Zm-32-80a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,136Zm0,32a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,168Z"/>
+  </svg>
+
+  <form>
+    <button type="button" id="zone">Drop PowerPoint, Excel or Word files here, or click to choose</button>
+    <input type="file" id="files" multiple hidden accept=".pptx,.potx,.ppsx,.xlsx,.xltx,.docx,.dotx">
+    <ol id="list" aria-label="Files in merge order" hidden></ol>
+    <details>
+      <summary><svg viewBox="0 0 256 256" aria-hidden="true"><path d="M181.66,133.66l-80,80a8,8,0,0,1-11.32-11.32L164.69,128,90.34,53.66a8,8,0,0,1,11.32-11.32l80,80A8,8,0,0,1,181.66,133.66Z"/></svg>Options</summary>
+      <div class="opts">
+        <label>Word styles
+          <select id="styles">
+            <option value="keep">Keep each document's look</option>
+            <option value="first">Use the first document's styles</option>
+          </select>
+        </label>
+        <label>Output name
+          <input id="name" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+    </details>
+    <button class="go" disabled>Merge</button>
+  </form>
+
+  <section id="out" aria-live="polite" aria-label="Result"></section>
+  <p id="say" class="sr" aria-live="polite"></p>
+
+  <footer>
+    <a href="https://nowmyagentcan.com">nowmyagentcan.com</a>
+    <a href="https://github.com/nowmyagentcan/doc-merge" aria-label="doc-merge on GitHub"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="M208.31,75.68A59.78,59.78,0,0,0,202.93,28,8,8,0,0,0,196,24a59.75,59.75,0,0,0-48,24H124A59.75,59.75,0,0,0,76,24a8,8,0,0,0-6.93,4,59.78,59.78,0,0,0-5.38,47.68A58.14,58.14,0,0,0,56,104v8a56.06,56.06,0,0,0,48.44,55.47A39.8,39.8,0,0,0,96,192v8H72a24,24,0,0,1-24-24A40,40,0,0,0,8,136a8,8,0,0,0,0,16,24,24,0,0,1,24,24,40,40,0,0,0,40,40H96v16a8,8,0,0,0,16,0V192a24,24,0,0,1,48,0v40a8,8,0,0,0,16,0V192a39.8,39.8,0,0,0-8.44-24.53A56.06,56.06,0,0,0,216,112v-8A58.14,58.14,0,0,0,208.31,75.68ZM200,112a40,40,0,0,1-40,40H112a40,40,0,0,1-40-40v-8a41.74,41.74,0,0,1,6.9-22.48A8,8,0,0,0,80,73.83a43.81,43.81,0,0,1,.79-33.58,43.88,43.88,0,0,1,32.32,20.06A8,8,0,0,0,119.82,64h32.35a8,8,0,0,0,6.74-3.69,43.87,43.87,0,0,1,32.32-20.06A43.81,43.81,0,0,1,192,73.83a8.09,8.09,0,0,0,1,7.65A41.72,41.72,0,0,1,200,104Z"/></svg></a>
+    <a href="https://x.com/chayp05" aria-label="nowmyagentcan on X"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="M214.75,211.71l-62.6-98.38,61.77-67.95a8,8,0,0,0-11.84-10.76L143.24,99.34,102.75,35.71A8,8,0,0,0,96,32H48a8,8,0,0,0-6.75,12.3l62.6,98.37-61.77,68a8,8,0,1,0,11.84,10.76l58.84-64.72,40.49,63.63A8,8,0,0,0,160,224h48a8,8,0,0,0,6.75-12.29ZM164.39,208,62.57,48h29L193.43,208Z"/></svg></a>
+  </footer>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const form = $("form"), zone = $("#zone"), input = $("#files"), list = $("#list"), go = $(".go"), out = $("#out"), nameIn = $("#name"), styles = $("#styles");
+const icon = d => `<svg viewBox="0 0 256 256" aria-hidden="true"><path d="${d}"/></svg>`;
+const UP = icon("M205.66,117.66a8,8,0,0,1-11.32,0L136,59.31V216a8,8,0,0,1-16,0V59.31L61.66,117.66a8,8,0,0,1-11.32-11.32l72-72a8,8,0,0,1,11.32,0l72,72A8,8,0,0,1,205.66,117.66Z");
+const DOWN = icon("M205.66,149.66l-72,72a8,8,0,0,1-11.32,0l-72-72a8,8,0,0,1,11.32-11.32L120,196.69V40a8,8,0,0,1,16,0V196.69l58.34-58.35a8,8,0,0,1,11.32,11.32Z");
+const REMOVE = icon("M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z");
+const DONE = icon("M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L96,188.69,218.34,66.34a8,8,0,0,1,11.32,11.32Z");
+const WARN = icon("M236.8,188.09,149.35,36.22h0a24.76,24.76,0,0,0-42.7,0L19.2,188.09a23.51,23.51,0,0,0,0,23.72A24.35,24.35,0,0,0,40.55,224h174.9a24.35,24.35,0,0,0,21.33-12.19A23.51,23.51,0,0,0,236.8,188.09ZM222.93,203.8a8.5,8.5,0,0,1-7.48,4.2H40.55a8.5,8.5,0,0,1-7.48-4.2,7.59,7.59,0,0,1,0-7.72L120.52,44.21a8.75,8.75,0,0,1,15,0l87.45,151.87A7.59,7.59,0,0,1,222.93,203.8ZM120,144V104a8,8,0,0,1,16,0v40a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,180Z");
+const FAIL = icon("M165.66,101.66,139.31,128l26.35,26.34a8,8,0,0,1-11.32,11.32L128,139.31l-26.34,26.35a8,8,0,0,1-11.32-11.32L116.69,128,90.34,101.66a8,8,0,0,1,11.32-11.32L128,116.69l26.34-26.35a8,8,0,0,1,11.32,11.32ZM232,128A104,104,0,1,1,128,24,104.11,104.11,0,0,1,232,128Zm-16,0a88,88,0,1,0-88,88A88.1,88.1,0,0,0,216,128Z");
+const SAVE = icon("M224,144v64a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8V144a8,8,0,0,1,16,0v56H208V144a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z");
+
+const FAMILY = { pptx: "powerpoint", potx: "powerpoint", ppsx: "powerpoint", xlsx: "excel", xltx: "excel", docx: "word", dotx: "word" };
+// label, noun, output extension, count unit
+const KINDS = {
+  powerpoint: ["PowerPoint", "PowerPoint deck", "pptx", "slide"],
+  excel: ["Excel", "Excel workbook", "xlsx", "sheet"],
+  word: ["Word", "Word document", "docx", "section"],
+};
+const GONE = { message: "Can't reach doc-merge.", hint: "Start it again with: doc-merge ui" };
+const MAX = 512 * 1048576;
+
+let items = [], seq = 0, busy = false, shown = "empty";
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const withIcon = (tag, cls, svg, ...text) => { const e = el(tag, cls); e.innerHTML = svg; const s = el("span"); s.append(...text); e.append(s); return e; };
+const plural = (n, word) => `${n.toLocaleString("en")} ${word}${n === 1 ? "" : "s"}`;
+const size = b => b < 1024 ? `${b} B` : b < 1048576 ? `${Math.round(b / 1024)} KB` : `${(b / 1048576).toFixed(1)} MB`;
+const time = ms => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+const family = it => it.info && FAMILY[it.info.kind];
+const lead = () => family(items.find(family) || {});
+const ready = () => { const f = lead(); return f ? items.filter(it => family(it) === f) : []; };
+const an = noun => (/^[AEIOU]/.test(noun) ? "an " : "a ") + noun;
+const outName = () => { const ext = KINDS[lead()][2]; let n = nameIn.value.trim() || "merged." + ext; return n.toLowerCase().endsWith("." + ext) ? n : n + "." + ext; };
+const say = text => { $("#say").textContent = text; };
+
+function describe(info) {
+  const [label, , ext, unit] = KINDS[FAMILY[info.kind]];
+  return `${label}${info.kind === ext ? "" : ` (.${info.kind})`} · ${plural(info[unit + "s"], unit)} · ${size(info.bytes)}`;
+}
+
+function row(it, k, f, inc) {
+  const li = el("li", "row"), n = inc.indexOf(it), info = el("div", "info"), acts = el("div", "acts"), mark = el("span", "n");
+  li.dataset.key = it.key;
+  if (n >= 0) mark.textContent = n + 1; else if (!it.pending) mark.innerHTML = WARN;
+  info.append(el("span", "name", it.name), el("span", "meta", it.pending ? "Reading…" : it.info ? describe(it.info) : size(it.bytes)));
+  li.append(mark, info, acts);
+  if (it.error) li.append(el("p", "why", it.error.message), it.error.hint ? el("p", "hint", it.error.hint) : "");
+  else if (family(it) && family(it) !== f) {
+    const mine = KINDS[family(it)][1];
+    li.append(el("p", "why", `Left out: it's ${an(mine)} and the first file is ${an(KINDS[f][1])}.`),
+      el("p", "hint", `Merge one kind at a time: remove it, or move it to the top to merge ${mine}s instead.`));
+  }
+  const button = (act, svg, label, off) => { const b = el("button", "ib"); b.type = "button"; b.dataset.act = act; b.innerHTML = svg; b.setAttribute("aria-label", `${label} ${it.name}`); b.title = label; b.disabled = busy || off; return b; };
+  if (!it.error) acts.append(button("up", UP, "Move up", k === 0), button("down", DOWN, "Move down", k === items.length - 1));
+  acts.append(button("remove", REMOVE, "Remove", false));
+  return li;
+}
+
+function render() {
+  const f = lead(), inc = ready(), a = document.activeElement, key = a.closest("li")?.dataset.key, act = a.dataset.act;
+  list.replaceChildren(...items.map((it, k) => row(it, k, f, inc)));
+  list.hidden = !items.length;
+  zone.classList.toggle("small", items.length > 0);
+  if (!nameIn.dataset.edited) nameIn.value = "merged." + (f ? KINDS[f][2] : "pptx");
+  go.disabled = busy || inc.length < 2 || items.some(it => it.pending);
+  if (key) { const li = list.querySelector(`[data-key="${key}"]`); (li?.querySelector(`[data-act="${act}"]:enabled`) || li?.querySelector("button:enabled"))?.focus(); }
+  if (shown === "empty") out.replaceChildren(el("p", "muted", inc.length > 1 ? `Ready to merge ${inc.length} ${KINDS[f][1]}s into ${outName()}.`
+    : inc.length ? `Add one more ${KINDS[f][1]} to merge.` : "The merged file will show here."));
+}
+
+function choose(files) {
+  for (const file of files) {
+    const it = { key: "f" + seq++, name: file.name, bytes: file.size, pending: true };
+    items.push(it);
+    if (file.size > MAX) {
+      it.pending = false;
+      it.error = { message: `'${file.name}' is over the limit: ${Math.round(file.size / 1048576)} MiB (at most 512 MiB).`, hint: "Merge fewer or smaller files at a time." };
+      continue;
+    }
+    upload(file).then(r => { if (r.error) it.error = r.error; else it.info = r; }, () => { it.error = GONE; })
+      .finally(() => { it.pending = false; if (it.removed && it.info) forget(it.info.id).catch(() => {}); render(); });
+  }
+  render();
+}
+
+list.addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const k = items.findIndex(it => it.key === b.closest("li").dataset.key), it = items[k];
+  if (b.dataset.act === "remove") {
+    items.splice(k, 1);
+    it.removed = true;
+    if (it.info) forget(it.info.id).catch(() => {});
+    render();
+    ((list.children[k] || list.children[k - 1])?.querySelector("[data-act=remove]") || zone).focus();
+    say(`${it.name} removed`);
+    return;
+  }
+  const j = b.dataset.act === "up" ? k - 1 : k + 1;
+  [items[k], items[j]] = [items[j], items[k]];
+  render();
+  say(`${it.name} moved to ${j + 1} of ${items.length}`);
+});
+
+async function start() {
+  if (go.disabled) return;
+  const f = lead(), inc = ready(), names = inc.map(it => it.name), name = outName();
+  busy = true;
+  render();
+  const wait = setTimeout(() => {
+    shown = "running";
+    out.setAttribute("aria-busy", "true");
+    out.replaceChildren(el("div", "bar"), el("p", "muted", `Merging ${inc.length} ${KINDS[f][1]}s…`));
+    out.firstChild.setAttribute("role", "progressbar");
+    out.firstChild.setAttribute("aria-label", "Merging");
+  }, 150);
+  let r;
+  try { r = await merge(inc.map(it => it.info.id), styles.value, name); } catch { r = { error: GONE }; }
+  clearTimeout(wait);
+  busy = false;
+  out.removeAttribute("aria-busy");
+  r.error ? fail(r.error) : done(r, names, f);
+  render();
+  (shown === "done" ? out.querySelector("button") : go.disabled ? zone : go).focus();
+}
+
+function done(r, names, f) {
+  const unit = KINDS[f][3], file = r.output.path.split(/[\\/]/).pop();
+  const count = unit === "sheet" ? r.inputs.reduce((n, i) => n + i.sheets.length, 0) : r.inputs.at(-1)[`output_${unit}s`][1];
+  const save = withIcon("button", null, SAVE, "Save");
+  save.type = "button";
+  save.onclick = () => download(file);
+  const head = el("div", "head");
+  head.append(withIcon("p", "sum", DONE, `${file} · ${plural(count, unit)} · ${size(r.output.bytes)} · ${time(r.elapsed_ms)}`), save);
+  const parts = [head];
+  if (r.renames.length) {
+    const box = el("ul", "renames");
+    box.append(el("li", "label", "Renamed"));
+    for (const x of r.renames.slice(0, 20)) {
+      const li = el("li");
+      li.append(`${x.kind.replace("_", " ")} `, el("b", null, x.from), " → ", el("b", null, x.to), el("span", "muted", names[x.input - 1]));
+      box.append(li);
+    }
+    const more = r.renames.length - 20 + r.renames_omitted;
+    if (more > 0) box.append(el("li", "muted", `… and ${more.toLocaleString("en")} more`));
+    parts.push(box);
+  }
+  for (const w of r.warnings) parts.push(withIcon("p", "note", WARN, w.message));
+  shown = "done";
+  out.replaceChildren(...parts);
+}
+
+function fail(error) {
+  shown = "error";
+  out.replaceChildren(withIcon("p", "err", FAIL, error.message), ...(error.hint ? [el("p", "hint", error.hint)] : []));
+}
+
+zone.addEventListener("click", () => input.click());
+input.addEventListener("change", () => { choose([...input.files]); input.value = ""; });
+nameIn.addEventListener("input", () => { nameIn.dataset.edited = nameIn.value.trim() ? "1" : ""; render(); });
+form.addEventListener("submit", e => { e.preventDefault(); start(); });
+addEventListener("dragover", e => { e.preventDefault(); zone.classList.add("over"); });
+addEventListener("dragleave", e => { if (!e.relatedTarget) zone.classList.remove("over"); });
+addEventListener("drop", e => { e.preventDefault(); zone.classList.remove("over"); choose([...e.dataTransfer.files]); });
+addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") { e.preventDefault(); input.click(); }
+  else if (e.key === "Enter" && e.target === document.body) { e.preventDefault(); start(); }
+});
+
+// Stand-ins for the four server calls (POST /api/files, DELETE /api/files/<id>, POST /api/merge, GET /api/result),
+// answering in the server's shapes from sample data until the page talks to it.
+const pause = ms => new Promise(r => setTimeout(r, ms));
+const samples = new Map();
+let uploads = 0;
+const SLIDES = { "deck-a.pptx": 12, "deck-b.pptx": 8, "old-4x3.pptx": 5 };
+
+async function upload(file) {
+  await pause(300);
+  const ext = file.name.split(".").pop().toLowerCase(), kind = FAMILY[ext];
+  if (/^(docm|dotm|pptm|potm|ppsm|xlsm|xltm)$/.test(ext))
+    return { error: { code: "macro_enabled", message: `'${file.name}' contains macros, which doc-merge doesn't merge.`, hint: "Save a copy without macros (.docx, .pptx or .xlsx) and merge that.", input: null } };
+  if (!kind)
+    return { error: { code: "not_office_file", message: `'${file.name}' isn't a Word, PowerPoint or Excel file.`, hint: "Use .docx, .pptx or .xlsx files (or .dotx, .potx, .ppsx, .xltx).", input: null } };
+  const id = String(++uploads), info = { id, name: file.name, kind: ext, bytes: file.size };
+  if (kind === "powerpoint") info.slides = SLIDES[file.name] || 3 + file.name.length % 9;
+  if (kind === "excel") info.sheets = 2;
+  if (kind === "word") info.sections = 1 + file.name.length % 3;
+  samples.set(id, info);
+  return info;
+}
+
+async function forget(id) { samples.delete(id); }
+
+async function merge(ids, styles, name) {
+  await pause(1200);
+  const files = ids.map(id => samples.get(id)), fams = files.map(i => FAMILY[i.kind]);
+  if (new Set(fams).size > 1) {
+    const n = f => plural(fams.filter(x => x === f).length, KINDS[f][1]);
+    return { error: { code: "mixed_formats", message: `The files mix ${[...new Set(fams)].map(n).join(" and ")}; doc-merge merges one kind at a time.`, hint: `Merge Word, PowerPoint and Excel files separately, e.g. doc-merge "folder\\*.pptx".`, input: null } };
+  }
+  const k = files.findIndex((i, n) => n > 0 && /pivot/i.test(i.name));
+  if (k > 0)
+    return { error: { code: "unsupported_variant", message: `'${files[k].name}' has pivot tables, which doc-merge can't merge yet.`, hint: "Remove the pivot tables (or paste their values) in Excel, save, and merge again.", input: k + 1 } };
+  let at = 1;
+  const r = { output: { path: name, kind: KINDS[fams[0]][2], bytes: files.reduce((n, i) => n + i.bytes, 0) }, inputs: [], renames: [], renames_omitted: 0, warnings: [], elapsed_ms: 120 + 60 * files.length };
+  files.forEach((i, n) => {
+    const input = { path: i.name, kind: i.kind };
+    if (i.slides) { input.slides = i.slides; input.output_slides = [at, at += i.slides - 1]; at++; }
+    if (i.sections) { input.sections = i.sections; input.output_sections = [at, at += i.sections - 1]; at++; }
+    if (i.sheets) input.sheets = ["Summary", "Data"].map(s => ({ name: s, output_name: n ? `${s} (${n + 1})` : s }));
+    if (i.sheets && n) r.renames.push(...input.sheets.map(s => ({ input: n + 1, kind: "sheet", from: s.name, to: s.output_name })));
+    if (/4x3/.test(i.name)) r.warnings.push({ code: "slides_scaled", input: n + 1, message: `Slides from ${i.name} (4:3) were scaled to fit the 16:9 slide size and centred.` });
+    r.inputs.push(input);
+  });
+  if (files.map(i => i.name).join() === "deck-a.pptx,deck-b.pptx,old-4x3.pptx") Object.assign(r, { elapsed_ms: 1180, output: { ...r.output, bytes: 2481102 }, renames: [{ input: 3, kind: "custom_show", from: "Short", to: "Short (3)" }] });
+  if (fams[0] === "word" && files.length > 1) r.warnings.push({ code: "theme_differs", input: 2, message: `Shapes and charts from ${files[1].name} use the first file's theme colours and fonts.` });
+  return r;
+}
+
+function download(name) {
+  const a = el("a");
+  a.href = URL.createObjectURL(new Blob(["sample"]));
+  a.download = name;
+  a.click();
+}
+
+render();
+</script>
+</body>
+</html>
