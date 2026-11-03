@@ -5,8 +5,8 @@ use std::path::Path;
 
 use common::*;
 use doc_merge::Run;
-use doc_merge::error::Warnings;
-use doc_merge::package::Package;
+use doc_merge::error::{Error, Warnings};
+use doc_merge::package::{Package, Rel, resolve};
 use doc_merge::writer::{self, Body, Plan};
 use quick_xml::events::{BytesStart, BytesText, Event};
 
@@ -269,4 +269,262 @@ fn output_entries_stay_under_2_gib() {
         "Part word/media/image1.png of the output is over the limit: 3,072 MiB (at most 2,047 MiB)."
     );
     assert_eq!(files_in(&dir), 1);
+}
+
+const CHART: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+const COLORS: &str = "application/vnd.ms-office.chartcolorstyle+xml";
+const CHART_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+const LINK_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+const HANDLED: &str = "urn:test:handled";
+
+/// A document whose main part reaches a graph: two pictures (one equal to the base's, one
+/// with the same size and CRC-32 but other bytes), two charts sharing a colour part that
+/// points back at the first chart, an embedded workbook, an external link and a diagram
+/// whose relationships need no change.
+fn appended() -> Vec<(String, Vec<u8>)> {
+    let forged = {
+        let mut b = vec![8u8; 2996];
+        let tail = forge_crc(&b, crc32(&[7u8; 3000]));
+        b.extend(tail);
+        b
+    };
+    assert_eq!(crc32(&forged), crc32(&[7u8; 3000]));
+    let xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    let data = "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml";
+    let mut parts = minimal(
+        "docx",
+        &[
+            (
+                "word/charts/chart1.xml",
+                CHART,
+                "<c:chartSpace xmlns:c=\"urn:c\"/>",
+            ),
+            (
+                "word/charts/chart2.xml",
+                CHART,
+                "<c:chartSpace xmlns:c=\"urn:c\"><c:x/></c:chartSpace>",
+            ),
+            (
+                "word/charts/colors1.xml",
+                COLORS,
+                "<cs:colorStyle xmlns:cs=\"urn:cs\"/>",
+            ),
+            (
+                "word/embeddings/Microsoft_Excel_Worksheet.xlsx",
+                xlsx,
+                "PK-not-really",
+            ),
+            (
+                "word/diagrams/data1.xml",
+                data,
+                "<dgm:dataModel xmlns:dgm=\"urn:d\"/>",
+            ),
+        ],
+    );
+    let doc_rels = rels(&[
+        ("rId1", IMAGE_REL, "media/image1.png"),
+        ("rId2", IMAGE_REL, "media/image2.png"),
+        ("rId3", CHART_REL, "charts/chart1.xml"),
+        ("rId4", CHART_REL, "charts/chart2.xml"),
+        ("rId5", LINK_REL, "!https://example.com/"),
+        ("rId6", "urn:test:data", "diagrams/data1.xml"),
+    ]);
+    set(
+        &mut parts,
+        "word/_rels/document.xml.rels",
+        doc_rels.as_bytes(),
+    );
+    set(&mut parts, "word/media/image1.png", &[7u8; 3000]);
+    set(&mut parts, "word/media/image2.png", &forged);
+    let chart1 = rels(&[
+        (
+            "rId1",
+            "urn:test:package",
+            "../embeddings/Microsoft_Excel_Worksheet.xlsx",
+        ),
+        ("rId2", "urn:test:colors", "colors1.xml"),
+        ("rId3", HANDLED, "../document.xml"),
+    ]);
+    set(
+        &mut parts,
+        "word/charts/_rels/chart1.xml.rels",
+        chart1.as_bytes(),
+    );
+    let chart2 = rels(&[
+        ("rId1", "urn:test:colors", "colors1.xml"),
+        ("rId3", IMAGE_REL, "../media/image1.png"),
+    ]);
+    set(
+        &mut parts,
+        "word/charts/_rels/chart2.xml.rels",
+        chart2.as_bytes(),
+    );
+    let colors = rels(&[("rId1", "urn:test:back", "chart1.xml")]);
+    set(
+        &mut parts,
+        "word/charts/_rels/colors1.xml.rels",
+        colors.as_bytes(),
+    );
+    let data_rels = rels(&[("rId1", LINK_REL, "!https://example.com/d")]);
+    set(
+        &mut parts,
+        "word/diagrams/_rels/data1.xml.rels",
+        data_rels.as_bytes(),
+    );
+    parts
+}
+
+/// The base: a picture and a chart with its colours, so the copies need new names.
+fn base_with_chart() -> Vec<(String, Vec<u8>)> {
+    let mut parts = word_with_parts();
+    let ct = content_types(&[
+        ("word/document.xml", &kind_parts("docx").1),
+        ("word/charts/chart1.xml", CHART),
+        ("word/charts/colors1.xml", COLORS),
+    ]);
+    set(&mut parts, "[Content_Types].xml", ct.as_bytes());
+    set(
+        &mut parts,
+        "word/charts/chart1.xml",
+        b"<c:chartSpace xmlns:c=\"urn:c\"/>",
+    );
+    set(
+        &mut parts,
+        "word/charts/colors1.xml",
+        b"<cs:colorStyle xmlns:cs=\"urn:cs\"/>",
+    );
+    let doc_rels = rels(&[
+        ("rId1", IMAGE_REL, "media/image1.png"),
+        ("rId2", CHART_REL, "charts/chart1.xml"),
+    ]);
+    set(
+        &mut parts,
+        "word/_rels/document.xml.rels",
+        doc_rels.as_bytes(),
+    );
+    let chart = rels(&[("rId1", "urn:test:colors", "colors1.xml")]);
+    set(
+        &mut parts,
+        "word/charts/_rels/chart1.xml.rels",
+        chart.as_bytes(),
+    );
+    parts
+}
+
+/// Copies the graph of every internal relationship of b's main part and writes the output;
+/// returns the output names in relationship order.
+fn copy_appended(
+    dir: &Path,
+    b_parts: &[(String, Vec<u8>)],
+    out: &Path,
+) -> Result<Vec<String>, Error> {
+    let a = write(dir, "a.docx", &build(&base_with_chart()));
+    let b = write(dir, "b.docx", &build(b_parts));
+    let (mut plan, mut inputs, _) = base_plan(&a);
+    inputs.push(Package::open(&b, 2, &Run::new(None))?);
+    let main_rels = inputs[1].rels_of("word/document.xml")?;
+    let handled = |r: &Rel, _: &str| (r.kind == HANDLED).then(|| "word/document.xml".to_string());
+    let mut names = vec![];
+    for r in main_rels.iter().filter(|r| !r.external) {
+        let target = resolve("word/document.xml", &r.target).unwrap();
+        names.push(plan.copy_graph(&mut inputs, 1, &target, &handled)?);
+    }
+    writer::write(plan, &mut inputs, out)?;
+    Ok(names)
+}
+
+type Stored = Vec<(String, Vec<u8>, zip::DateTime)>;
+
+fn stored_bytes(list: &Stored, name: &str) -> Vec<u8> {
+    list.iter().find(|e| e.0 == name).unwrap().1.clone()
+}
+
+#[test]
+fn part_graphs_are_copied_once_with_their_relationships() {
+    let dir = temp_dir("graph");
+    let out = dir.join("out.docx");
+    let names = copy_appended(&dir, &appended(), &out).unwrap();
+    assert_eq!(
+        names,
+        [
+            "word/media/image1.png",
+            "word/media/image2.png",
+            "word/charts/chart2.xml",
+            "word/charts/chart3.xml",
+            "word/diagrams/data1.xml",
+        ],
+        "the equal picture is shared; the look-alike is not"
+    );
+    let all = entries(&out);
+    let listed: Vec<&str> = all.iter().map(|e| e.0.as_str()).collect();
+    let colours = listed.iter().filter(|n| n.contains("colors")).count();
+    assert_eq!(
+        colours, 3,
+        "the base's colours, one copy and its rels: {listed:?}"
+    );
+    assert!(listed.contains(&"word/embeddings/Microsoft_Excel_Worksheet.xlsx"));
+    assert_eq!(text(&all, "word/media/image2.png").len(), 3000);
+
+    let chart2 = text(&all, "word/charts/_rels/chart2.xml.rels");
+    for want in [
+        r#"Id="rId1" Type="urn:test:package" Target="../embeddings/Microsoft_Excel_Worksheet.xlsx""#,
+        r#"Id="rId2" Type="urn:test:colors" Target="colors2.xml""#,
+        r#"Id="rId3" Type="urn:test:handled" Target="../document.xml""#,
+    ] {
+        assert!(chart2.contains(want), "{want} in {chart2}");
+    }
+    let chart3 = text(&all, "word/charts/_rels/chart3.xml.rels");
+    assert!(chart3.contains(r#"Id="rId1" Type="urn:test:colors" Target="colors2.xml""#));
+    assert!(chart3.contains(r#"Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png""#));
+    let colors = text(&all, "word/charts/_rels/colors2.xml.rels");
+    assert!(
+        colors.contains(r#"Target="chart2.xml""#),
+        "the cycle links back: {colors}"
+    );
+
+    // Parts and unchanged relationships are copied as stored.
+    let (source, output) = (stored(&dir.join("b.docx")), stored(&out));
+    assert_eq!(
+        stored_bytes(&output, "word/charts/chart2.xml"),
+        stored_bytes(&source, "word/charts/chart1.xml")
+    );
+    let data_rels = "word/diagrams/_rels/data1.xml.rels";
+    assert_eq!(
+        stored_bytes(&output, data_rels),
+        stored_bytes(&source, data_rels)
+    );
+    assert!(
+        text(&all, data_rels).contains(r#"Target="https://example.com/d" TargetMode="External""#)
+    );
+
+    let ct = text(&all, "[Content_Types].xml");
+    assert!(ct.contains(&format!(
+        r#"<Override PartName="/word/charts/chart3.xml" ContentType="{CHART}"/>"#
+    )));
+    assert!(ct.contains(r#"<Override PartName="/word/embeddings/Microsoft_Excel_Worksheet.xlsx""#));
+
+    let dir2 = temp_dir("graph-again");
+    let again = dir2.join("out.docx");
+    copy_appended(&dir2, &appended(), &again).unwrap();
+    let same = std::fs::read(&out).unwrap() == std::fs::read(&again).unwrap();
+    assert!(same, "two runs give the same bytes");
+}
+
+#[test]
+fn a_missing_target_is_refused() {
+    let mut parts = appended();
+    let broken = rels(&[("rId1", "urn:x", "colors9.xml")]);
+    set(
+        &mut parts,
+        "word/charts/_rels/chart1.xml.rels",
+        broken.as_bytes(),
+    );
+    let dir = temp_dir("graph-missing");
+    let e = copy_appended(&dir, &parts, &dir.join("out.docx")).unwrap_err();
+    assert_eq!(
+        e.message,
+        "'b.docx' is damaged or unsafe: word/charts/chart1.xml points to a missing part colors9.xml."
+    );
+    assert_eq!(e.input, Some(2));
 }

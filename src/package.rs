@@ -506,11 +506,12 @@ impl Package {
     /// The entry of a part, by its name compared ignoring ASCII case (and, failing that,
     /// with `%XX` escapes decoded).
     pub fn find(&self, part: &str) -> Option<&Entry> {
-        let get = |p: &str| {
-            self.by_name
-                .get(&p.to_ascii_lowercase())
-                .map(|&i| &self.entries[i])
-        };
+        self.position(part).map(|i| &self.entries[i])
+    }
+
+    /// Where [`Package::find`]'s entry is in `entries`.
+    pub fn position(&self, part: &str) -> Option<usize> {
+        let get = |p: &str| self.by_name.get(&p.to_ascii_lowercase()).copied();
         get(part).or_else(|| get(&unescape(part)?))
     }
 

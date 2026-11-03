@@ -15,8 +15,8 @@ use zip::{CompressionMethod, DateTime, System, ZipWriter};
 
 use crate::error::{Error, Warning, Warnings, mib};
 use crate::package::{
-    self, CONTENT_TYPES, ContentTypes, MAX_PARSED, Package, ROOT_RELS, Rel, SIGNATURE_ORIGIN,
-    is_signature, parse_rels, resolve,
+    self, CONTENT_TYPES, ContentTypes, MAX_PARSED, Package, RELS_TYPE, ROOT_RELS, Rel,
+    SIGNATURE_ORIGIN, is_signature, parse_rels, rels_name, resolve,
 };
 use crate::xml::Reader;
 
@@ -55,7 +55,28 @@ pub struct Plan {
     /// Lower-case names taken, and per numbered stem the number below which all are taken.
     taken: HashSet<String>,
     next: HashMap<String, u32>,
+    /// Parts copied so far: (input, lower-case source name) to output name.
+    copies: HashMap<(usize, String), String>,
+    /// Media in the output as stored, by (size, CRC-32).
+    media: HashMap<(u64, u32), Vec<Stored>>,
 }
+
+/// A part copied as stored: (output name, input, entry).
+type Stored = (String, usize, usize);
+
+/// Media parts over this size are never compared for sharing.
+const MAX_SHARED: u64 = 64 << 20;
+
+fn is_media(part: &str, content_type: &str) -> bool {
+    part.to_ascii_lowercase().contains("/media/")
+        || ["image/", "audio/", "video/"]
+            .iter()
+            .any(|t| content_type.starts_with(t))
+}
+
+/// Says where a relationship that a family handles itself should point instead of copying
+/// its target: given the relationship and its target in the input, the output part.
+pub type Mapped<'a> = &'a dyn Fn(&Rel, &str) -> Option<String>;
 
 impl Plan {
     /// The base's entries in their order, as stored, except its signature, which the merged
@@ -94,6 +115,12 @@ impl Plan {
             } else {
                 Body::Raw { input: 0, entry: i }
             };
+            if pkg.types.of(&e.name).is_some_and(|t| is_media(&e.name, t)) {
+                plan.media
+                    .entry((e.size, e.crc))
+                    .or_default()
+                    .push((e.name.clone(), 0, i));
+            }
             plan.take(&e.name);
             plan.parts.push(Part {
                 name: e.name.clone(),
@@ -168,6 +195,123 @@ impl Plan {
         {
             p.body = body;
         }
+    }
+
+    /// Copies part `part` of `inputs[input]` and every part it reaches through its
+    /// relationships, each once (a part met again, also through a cycle, is linked), keeping
+    /// every relationship id and pointing the targets at the copies. A relationship `mapped`
+    /// answers for points where it says and isn't followed; external targets are never opened.
+    /// A media part whose bytes equal a part already in the output is shared instead.
+    /// Returns the output name of `part`.
+    pub fn copy_graph(
+        &mut self,
+        inputs: &mut [Package],
+        input: usize,
+        part: &str,
+        mapped: Mapped,
+    ) -> Result<String, Error> {
+        let (name, new) = self.place(inputs, input, part)?;
+        let mut pending = if new {
+            vec![(part.to_string(), name.clone())]
+        } else {
+            vec![]
+        };
+        while let Some((source, out)) = pending.pop() {
+            let pkg = &mut inputs[input];
+            let Some(rels_entry) = pkg.position(&rels_name(&source)) else {
+                continue;
+            };
+            let rels = pkg.rels_of(&source)?;
+            let mut copied = Vec::with_capacity(rels.len());
+            for r in &rels {
+                if r.external {
+                    copied.push(r.clone());
+                    continue;
+                }
+                let pkg = &inputs[input];
+                let target = resolve(&source, &r.target).and_then(|t| pkg.find(&t));
+                let Some(target) = target.map(|e| e.name.clone()) else {
+                    let why = format!("{source} points to a missing part {}", r.target);
+                    return Err(pkg.origin.bad(&why));
+                };
+                let to = match mapped(r, &target) {
+                    Some(to) => to,
+                    None => {
+                        let (to, new) = self.place(inputs, input, &target)?;
+                        if new {
+                            pending.push((target, to.clone()));
+                        }
+                        to
+                    }
+                };
+                copied.push(Rel {
+                    target: relative(&out, &to),
+                    ..r.clone()
+                });
+            }
+            let body = if copied == rels {
+                Body::Raw {
+                    input,
+                    entry: rels_entry,
+                }
+            } else {
+                Body::Data(rels_xml(&copied))
+            };
+            let rels_out = rels_name(&out);
+            self.type_part(&rels_out, RELS_TYPE, true);
+            self.add(rels_out, body, None);
+        }
+        Ok(name)
+    }
+
+    /// The output name for part `part` of `inputs[input]`, and whether it is a new copy (not
+    /// a part copied before, nor an equal media part already in the output).
+    fn place(
+        &mut self,
+        inputs: &mut [Package],
+        input: usize,
+        part: &str,
+    ) -> Result<(String, bool), Error> {
+        let key = (input, part.to_ascii_lowercase());
+        if let Some(name) = self.copies.get(&key) {
+            return Ok((name.clone(), false));
+        }
+        let pkg = &inputs[input];
+        let i = pkg.position(part).expect("a part of the input");
+        let e = pkg.entries[i].clone();
+        let source_type = pkg.types.of(&e.name).unwrap_or_default().to_string();
+        let by_default = pkg.types.override_of(&e.name).is_none();
+        let media = is_media(&e.name, &source_type);
+        if media && e.size <= MAX_SHARED {
+            let mut ours = None;
+            for (name, j, k) in self
+                .media
+                .get(&(e.size, e.crc))
+                .cloned()
+                .unwrap_or_default()
+            {
+                if self.types.of(&name) != Some(source_type.as_str()) {
+                    continue;
+                }
+                if ours.is_none() {
+                    ours = Some(inputs[input].read(&e.name, MAX_SHARED)?);
+                }
+                let theirs = inputs[j].entries[k].name.clone();
+                if inputs[j].read(&theirs, MAX_SHARED)? == *ours.as_ref().unwrap() {
+                    self.copies.insert(key, name.clone());
+                    return Ok((name, false));
+                }
+            }
+        }
+        let name = self.claim(&e.name);
+        if media {
+            let at = (name.clone(), input, i);
+            self.media.entry((e.size, e.crc)).or_default().push(at);
+        }
+        self.type_part(&name, &source_type, by_default);
+        self.copies.insert(key, name.clone());
+        self.add(name.clone(), Body::Raw { input, entry: i }, None);
+        Ok((name, true))
     }
 
     /// Types a new part: nothing when the output's default for its extension already says
