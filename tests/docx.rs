@@ -41,7 +41,7 @@ fn bodies_join_in_order_with_their_sections() {
     assert!(at("Document A") < at("Title of B"));
     assert!(at("Clause B one.") < at("Document C"));
     let at = |s: &str| doc.find(s).unwrap_or_else(|| panic!("{s} missing"));
-    assert!(at("The end of A.") < at("orient=\"landscape\""));
+    assert!(at("orient=\"landscape\"") < at("The end of A."));
     assert!(at("orient=\"landscape\"") < at("Title of B"));
     // a: 2 sections, b: 1, c: 1; the body's own break is c's, the others sit in paragraphs.
     let sections: Vec<_> = report.inputs.iter().map(|i| i.output_sections).collect();
@@ -188,4 +188,39 @@ fn first_mode_takes_the_first_documents_styles() {
     let b = &doc[doc.find("Title of B").unwrap()..];
     assert!(b.contains(r#"<w:pStyle w:val="ClauseText"/>"#));
     assert!(!text(&parts, "word/styles.xml").contains("ClauseText_2"));
+}
+
+#[test]
+fn a_document_keeps_its_defaults_and_theme_under_the_base() {
+    let (report, parts) = merged("look", &["a.docx", "b.docx"]);
+    let styles = text(&parts, "word/styles.xml");
+    let normal = styles
+        .split("<w:style ")
+        .find(|s| s.contains(r#"w:styleId="Normal_2""#));
+    let normal = normal.expect("b's Normal is copied");
+    assert!(normal.contains(r#"<w:sz w:val="24"/>"#), "{normal}");
+    assert!(normal.contains(r#"w:ascii="Aptos""#), "{normal}");
+    assert!(normal.contains(r#"w:line="278""#), "{normal}");
+    assert!(!normal.contains("w:asciiTheme"), "{normal}");
+    let codes: Vec<_> = report.warnings.list().iter().map(|w| w.code).collect();
+    assert_eq!(codes, ["theme_differs"]);
+    // Every paragraph of b either names a style or gets b's copied Normal.
+    let doc = text(&parts, "word/document.xml");
+    let b = &doc[doc.find("Title of B").unwrap()..];
+    assert!(b.contains(r#"<w:pStyle w:val="Normal_2"/>"#));
+    assert!(!b.contains("w:themeColor"));
+    let a = &doc[..doc.find("The end of A.").unwrap()];
+    assert!(!a.contains("Normal_2"));
+    // The theme stays the base's.
+    assert_eq!(
+        text(&parts, "word/theme/theme1.xml"),
+        text(&entries(&fixture("a.docx")), "word/theme/theme1.xml")
+    );
+}
+
+#[test]
+fn first_mode_folds_nothing_and_keeps_theme_links() {
+    let (report, parts) = merged_with("first-look", &["a.docx", "b.docx"], StyleMode::First);
+    assert!(report.warnings.list().is_empty());
+    assert!(!text(&parts, "word/styles.xml").contains("Normal_2"));
 }

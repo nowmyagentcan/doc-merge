@@ -9,12 +9,12 @@ use std::io::Write;
 
 use quick_xml::events::{BytesStart, Event};
 
-use crate::error::{Error, Warnings};
+use crate::error::{Error, Warning, Warnings};
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, RELS_TYPE, Rel, rels_name, resolve};
 use crate::writer::{Body, Plan, R, relative, rels_xml};
 use crate::xml::{self, Attr, MC, Node, Reader, XMLNS, start_tag};
 use crate::{Origin, Rename, StyleMode};
-use styles::{Sheet, Source};
+use styles::{Sheet, Source, Theme};
 
 pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const O: &str = "urn:schemas-microsoft-com:office:office";
@@ -66,7 +66,12 @@ pub fn merge(
     let mut rels = Rels::new(base_rels.clone());
     let base_styles = held(&mut inputs[0], &main, &base_rels, "styles")?;
     let mut style_root = Prefixes::of(base_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
-    let mut out_styles = styles::Output::new(Sheet::new(base_styles.as_ref().map(|h| &h.tree)));
+    let base_sheet = Sheet::new(base_styles.as_ref().map(|h| &h.tree));
+    let base_defaults = base_sheet.defaults.clone();
+    let base_p = base_sheet.default_of("paragraph").map(String::from);
+    let base_table = base_sheet.default_of("table").map(String::from);
+    let base_theme = theme(&mut inputs[0], &main, &base_rels)?;
+    let mut out_styles = styles::Output::new(base_sheet);
     let mut docs = vec![];
     let mut sections = vec![];
     let mut renames = vec![];
@@ -107,7 +112,16 @@ pub fn merge(
             }
         }
         let doc_styles = held(&mut inputs[i], &part, &own, "styles")?;
-        let sheet = Sheet::new(doc_styles.as_ref().map(|h| &h.tree));
+        let mut sheet = Sheet::new(doc_styles.as_ref().map(|h| &h.tree));
+        let keep = mode == StyleMode::Keep;
+        if keep && sheet.defaults_differ(base_defaults.as_ref()) {
+            sheet.fold_defaults(base_defaults.as_ref());
+        }
+        let doc_theme = theme(&mut inputs[i], &part, &own)?
+            .filter(|t| keep && base_theme.as_ref().is_some_and(|b| t.differs(b)));
+        if doc_theme.is_some() {
+            warnings.push(Warning::theme_differs(i + 1, &origin.name));
+        }
         let plain = |n: &str| n.to_string();
         let source = Source {
             sheet: &sheet,
@@ -115,6 +129,7 @@ pub fn merge(
             position: i + 1,
             lists: &plain,
             output_lists: &plain,
+            themes: doc_theme.as_ref().zip(base_theme.as_ref()),
         };
         let mut seeds = uses.styles.clone();
         seeds.extend(
@@ -130,8 +145,15 @@ pub fn merge(
             from: from.clone(),
             to: to.clone(),
         }));
+        let bare = |kind: &str, output: &Option<String>| {
+            let new = mapped.ids.get(sheet.default_of(kind)?)?;
+            (Some(new) != output.as_ref()).then(|| new.clone())
+        };
         let mut rw = Rewrite {
             rids: Some(HashMap::new()),
+            bare_p: bare("paragraph", &base_p),
+            bare_table: bare("table", &base_table),
+            theme: doc_theme,
             styles: mapped.ids,
             local: root.merge(&uses.root),
             w,
@@ -216,6 +238,15 @@ pub fn merge(
         sections,
         renames,
     })
+}
+
+/// A document's theme, read with its `w:themeFontLang`.
+fn theme(pkg: &mut Package, main: &str, rels: &[Rel]) -> Result<Option<Theme>, Error> {
+    let settings = held(pkg, main, rels, "settings")?;
+    let lang = settings
+        .as_ref()
+        .and_then(|h| h.tree.child(W, "themeFontLang"));
+    Ok(held(pkg, main, rels, "theme")?.map(|h| Theme::new(&h.tree, lang)))
 }
 
 /// Which registry part is being written.
@@ -317,12 +348,17 @@ fn extend(
 fn story(text: &str, part: &str, origin: &Origin, rw: &Rewrite) -> Result<Vec<u8>, Error> {
     let mut r = Reader::new(text, part, origin);
     let mut buf = Vec::with_capacity(text.len());
+    let mut bare = Bare::default();
     loop {
         let event = r.event()?;
         match &event {
             Event::Eof => return Ok(buf),
-            Event::Start(e) => start(&r, e, false, rw, false, false, &mut buf)?,
-            Event::Empty(e) => start(&r, e, true, rw, false, false, &mut buf)?,
+            Event::Start(e) => start(&r, e, false, rw, Place::Inner, &mut bare, &mut buf)?,
+            Event::Empty(e) => start(&r, e, true, rw, Place::Inner, &mut bare, &mut buf)?,
+            Event::End(_) => {
+                bare.end(rw, &mut buf);
+                put(&mut buf, &event);
+            }
             _ => put(&mut buf, &event),
         }
     }
@@ -625,6 +661,11 @@ struct Rewrite {
     rids: Option<HashMap<String, String>>,
     /// Old to new style ids.
     styles: HashMap<String, String>,
+    /// Set when theme links come off this document's content.
+    theme: Option<Theme>,
+    /// The style for paragraphs and tables with none, when not the output's default.
+    bare_p: Option<String>,
+    bare_table: Option<String>,
     /// Declarations each top-level element brings because the output root binds their prefix
     /// to another namespace.
     local: Vec<Attr>,
@@ -635,8 +676,11 @@ struct Rewrite {
 
 impl Rewrite {
     /// Rewrites the attributes of an element; true when something changed.
-    fn attrs(&self, ns: &str, local: &str, attrs: &mut [Attr]) -> bool {
-        let mut changed = false;
+    fn attrs(&self, ns: &str, local: &str, attrs: &mut Vec<Attr>) -> bool {
+        let mut changed = self
+            .theme
+            .as_ref()
+            .is_some_and(|t| t.resolve(ns, local, attrs));
         if ns == W
             && matches!(
                 local,
@@ -713,6 +757,7 @@ fn body(
     let mut plain = true;
     let mut sect: Option<Vec<u8>> = None;
     let mut first_sect = rw.appended;
+    let mut bare = Bare::default();
     loop {
         let event = r.event()?;
         let depth = stack.len();
@@ -754,6 +799,22 @@ fn body(
                 let empty = matches!(event, Event::Empty(_));
                 let t = tag(r.element_ns(e), e.local_name().as_ref().as_bytes());
                 let parent = stack.last().copied();
+                if depth == b && t == Tag::SectPr {
+                    let mut s = vec![];
+                    let top = Place::Top;
+                    element(
+                        &mut r,
+                        e,
+                        empty,
+                        rw,
+                        &mut first_sect,
+                        top,
+                        &mut bare,
+                        &mut s,
+                    )?;
+                    sect = Some(s);
+                    continue;
+                }
                 if depth == b {
                     if let Some((p, _)) = held.take() {
                         out.write_all(&p).map_err(io)?;
@@ -762,10 +823,25 @@ fn body(
                     buf.clear();
                     mark = None;
                     plain = true;
-                    if t == Tag::SectPr {
-                        let mut s = vec![];
-                        element(&mut r, e, empty, rw, &mut first_sect, true, &mut s)?;
-                        sect = Some(s);
+                    if t == Tag::P && empty {
+                        let top = Place::Top;
+                        element(
+                            &mut r,
+                            e,
+                            false,
+                            rw,
+                            &mut first_sect,
+                            top,
+                            &mut bare,
+                            &mut buf,
+                        )?;
+                        let mut m = Mark::Wrap(buf.len());
+                        bare.end(rw, &mut buf);
+                        if let Some(at) = bare.made.take() {
+                            m = Mark::Insert(at);
+                        }
+                        buf.extend(format!("</{}>", e.name().as_ref()).as_bytes());
+                        held = Some((std::mem::take(&mut buf), m));
                         continue;
                     }
                 }
@@ -776,13 +852,28 @@ fn body(
                     }
                     plain &= t != Tag::SectPr;
                 }
-                let whole = element(&mut r, e, empty, rw, &mut first_sect, depth == b, &mut buf)?;
+                let place = if depth == b { Place::Top } else { Place::Inner };
+                let whole = element(
+                    &mut r,
+                    e,
+                    empty,
+                    rw,
+                    &mut first_sect,
+                    place,
+                    &mut bare,
+                    &mut buf,
+                )?;
                 let top_p = depth == b + 1 && stack[b] == Tag::P;
                 match t {
                     Tag::P if depth == b && !empty => mark = Some(Mark::Wrap(buf.len())),
                     Tag::PPr if top_p && empty => mark = Some(Mark::Expand(at, buf.len())),
                     Tag::PPr if top_p => mark = None,
                     _ => {}
+                }
+                if let Some(at) = bare.made.take()
+                    && top_p
+                {
+                    mark = Some(Mark::Insert(at));
                 }
                 if !empty && !whole {
                     stack.push(t);
@@ -811,6 +902,13 @@ fn body(
                         .base
                         .then(|| text[end.unwrap_or(text.len())..].to_string()));
                 }
+                bare.end(rw, &mut buf);
+                if let Some(at) = bare.made.take()
+                    && t == Tag::P
+                    && depth == b
+                {
+                    mark = Some(Mark::Insert(at));
+                }
                 if t == Tag::PPr
                     && depth == b + 1
                     && stack[b] == Tag::P
@@ -838,6 +936,99 @@ fn body(
     Err(origin.bad(&format!("part {part} has no body")))
 }
 
+/// Where an element is, for what it needs besides the rewrite.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Inner,
+    /// A child of the body: it declares the prefixes the output root can't.
+    Top,
+    /// A child of an appended document's first section break.
+    FirstSection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Block {
+    P,
+    Table,
+}
+
+/// Gives paragraphs and tables with no style their document's default one, when that isn't the
+/// output's default.
+#[derive(Default)]
+struct Bare {
+    /// A block just opened, and whether its properties have begun.
+    open: Option<(Block, bool)>,
+    /// Where the last `w:pPr` made here ends, for a section break to go in.
+    made: Option<usize>,
+}
+
+impl Bare {
+    fn names(block: Block) -> (&'static str, &'static str) {
+        match block {
+            Block::P => ("pPr", "pStyle"),
+            Block::Table => ("tblPr", "tblStyle"),
+        }
+    }
+
+    fn style(rw: &Rewrite, block: Block, buf: &mut Vec<u8>) {
+        let w = &rw.w;
+        let id = match block {
+            Block::P => &rw.bare_p,
+            Block::Table => &rw.bare_table,
+        };
+        let attrs = [Attr::new(
+            &format!("{w}:val"),
+            W,
+            id.as_deref().unwrap_or(""),
+        )];
+        let name = format!("{w}:{}", Self::names(block).1);
+        buf.extend(start_tag(&name, &attrs, true).as_bytes());
+    }
+
+    /// Writes whole properties holding just the style.
+    fn make(&mut self, rw: &Rewrite, block: Block, buf: &mut Vec<u8>) {
+        let (props, w) = (Self::names(block).0, &rw.w);
+        buf.extend(format!("<{w}:{props}>").as_bytes());
+        Self::style(rw, block, buf);
+        self.made = Some(buf.len());
+        buf.extend(format!("</{w}:{props}>").as_bytes());
+    }
+
+    /// Runs before an element's start is written; true when this wrote it in its place.
+    fn before(&mut self, rw: &Rewrite, name: (&str, &str), empty: bool, buf: &mut Vec<u8>) -> bool {
+        let Some((block, inside)) = self.open else {
+            return false;
+        };
+        let (props, style) = Self::names(block);
+        let is = |local: &str| name.0 == W && name.1 == local;
+        if inside {
+            if !is(style) {
+                Self::style(rw, block, buf);
+            }
+            self.open = None;
+        } else if is(props) && empty {
+            self.make(rw, block, buf);
+            self.open = None;
+            return true;
+        } else if is(props) {
+            self.open = Some((block, true));
+        } else if block == Block::P {
+            self.make(rw, block, buf);
+            self.open = None;
+        }
+        false
+    }
+
+    /// Runs before an element's end is written.
+    fn end(&mut self, rw: &Rewrite, buf: &mut Vec<u8>) {
+        match self.open.take() {
+            Some((block, true)) => Self::style(rw, block, buf),
+            Some((Block::P, false)) => self.make(rw, Block::P, buf),
+            _ => {}
+        }
+    }
+}
+
 /// A held paragraph with the section break `s` put where `m` says.
 fn splice(mut p: Vec<u8>, m: Mark, s: &[u8], w: &str) -> Vec<u8> {
     let wrapped = || {
@@ -856,21 +1047,22 @@ fn splice(mut p: Vec<u8>, m: Mark, s: &[u8], w: &str) -> Vec<u8> {
     p
 }
 
-/// Writes an element's start tag with the rewrite applied (a top-level one also declares the
-/// prefixes the output root can't). A section break is written whole, and the first one of an
-/// appended document starts a new page; returns true then.
+/// Writes an element's start tag with the rewrite applied. A section break is written whole,
+/// and the first one of an appended document starts a new page; returns true then.
+#[allow(clippy::too_many_arguments)]
 fn element<'a>(
     r: &mut Reader<'a>,
     e: &BytesStart<'a>,
     empty: bool,
     rw: &Rewrite,
     first_sect: &mut bool,
-    top: bool,
+    place: Place,
+    bare: &mut Bare,
     buf: &mut Vec<u8>,
 ) -> Result<bool, Error> {
     let sect = tag(r.element_ns(e), e.local_name().as_ref().as_bytes()) == Tag::SectPr;
     let first = sect && std::mem::take(first_sect);
-    start(r, e, empty, rw, top, false, buf)?;
+    start(r, e, empty, rw, place, bare, buf)?;
     if !sect || empty {
         return Ok(false);
     }
@@ -880,8 +1072,13 @@ fn element<'a>(
         match &event {
             Event::Start(e) | Event::Empty(e) => {
                 let empty = matches!(event, Event::Empty(_));
-                let new_page = first && r.depth() == depth + usize::from(!empty);
-                start(r, e, empty, rw, false, new_page, buf)?;
+                let child = first && r.depth() == depth + usize::from(!empty);
+                let place = if child {
+                    Place::FirstSection
+                } else {
+                    Place::Inner
+                };
+                start(r, e, empty, rw, place, bare, buf)?;
             }
             Event::End(_) if r.depth() < depth => {
                 put(buf, &event);
@@ -893,15 +1090,14 @@ fn element<'a>(
     }
 }
 
-/// One start tag, rewritten when the rewrite changes it; with `new_page`, a `w:type` that
-/// would continue the page becomes `nextPage`.
+/// One start tag, rebuilt only when the rewrite changes it.
 fn start<'a>(
     r: &Reader<'a>,
     e: &BytesStart<'a>,
     empty: bool,
     rw: &Rewrite,
-    top: bool,
-    new_page: bool,
+    place: Place,
+    bare: &mut Bare,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     let event = if empty {
@@ -913,28 +1109,46 @@ fn start<'a>(
         put(buf, &event);
         return Ok(());
     }
+    let (ns, local) = (r.element_ns(e), e.local_name());
+    let local: &str = local.as_ref();
+    if bare.before(rw, (ns, local), empty, buf) {
+        return Ok(());
+    }
     let mut attrs = r.attrs(e)?;
-    let mut changed = rw.attrs(r.element_ns(e), e.local_name().as_ref(), &mut attrs);
-    if top && !rw.local.is_empty() {
+    let mut changed = rw.attrs(ns, local, &mut attrs);
+    if place == Place::Top && !rw.local.is_empty() {
         attrs.extend(rw.local.iter().cloned());
         changed = true;
     }
-    if new_page
-        && r.element_ns(e) == W
-        && e.local_name().as_ref() == "type"
+    if place == Place::FirstSection
+        && ns == W
+        && local == "type"
         && let Some(v) = attrs.iter_mut().find(|a| a.ns == W && a.local == "val")
         && matches!(v.value.as_str(), "continuous" | "nextColumn")
     {
         v.value = "nextPage".into();
         changed = true;
     }
-    if changed {
-        buf.extend(start_tag(e.name().as_ref(), &attrs, empty).as_bytes());
+    let block = match (ns == W, local) {
+        (true, "p") if rw.bare_p.is_some() => Some(Block::P),
+        (true, "tbl") if rw.bare_table.is_some() => Some(Block::Table),
+        _ => None,
+    };
+    let opened = empty && block == Some(Block::P);
+    if changed || opened {
+        buf.extend(start_tag(e.name().as_ref(), &attrs, empty && !opened).as_bytes());
     } else {
         put(buf, &event);
     }
+    if opened {
+        bare.make(rw, Block::P, buf);
+        buf.extend(format!("</{}>", e.name().as_ref()).as_bytes());
+    } else if !empty && let Some(b) = block {
+        bare.open = Some((b, false));
+    }
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,5 +1186,157 @@ mod tests {
             "<?xml version=\"1.0\"?>\r\n"
         );
         assert_eq!(declaration("<a/>"), "");
+    }
+
+    fn rewritten(body: &str, rw: &Rewrite) -> String {
+        let text = format!(r#"<w:hdr xmlns:w="{W}">{body}</w:hdr>"#);
+        let bytes = story(&text, "word/header1.xml", &Origin::test("x.docx"), rw).unwrap();
+        let out = String::from_utf8(bytes).unwrap();
+        let inner = out.split_once('>').unwrap().1;
+        inner.strip_suffix("</w:hdr>").unwrap().to_string()
+    }
+
+    #[test]
+    fn bare_paragraphs_and_tables_take_the_default_style() {
+        let rw = Rewrite {
+            w: "w".into(),
+            appended: true,
+            bare_p: Some("Normal_2".into()),
+            bare_table: Some("Plain_2".into()),
+            ..Rewrite::default()
+        };
+        let style = r#"<w:pStyle w:val="Normal_2"/>"#;
+        for (input, want) in [
+            ("<w:p/>", format!("<w:p><w:pPr>{style}</w:pPr></w:p>")),
+            ("<w:p></w:p>", format!("<w:p><w:pPr>{style}</w:pPr></w:p>")),
+            (
+                "<w:p><w:r/></w:p>",
+                format!("<w:p><w:pPr>{style}</w:pPr><w:r/></w:p>"),
+            ),
+            (
+                "<w:p><w:pPr/></w:p>",
+                format!("<w:p><w:pPr>{style}</w:pPr></w:p>"),
+            ),
+            (
+                "<w:p><w:pPr></w:pPr></w:p>",
+                format!("<w:p><w:pPr>{style}</w:pPr></w:p>"),
+            ),
+            (
+                r#"<w:p><w:pPr><w:jc w:val="left"/></w:pPr></w:p>"#,
+                format!(r#"<w:p><w:pPr>{style}<w:jc w:val="left"/></w:pPr></w:p>"#),
+            ),
+            (
+                r#"<w:p><w:pPr><w:pStyle w:val="X"/></w:pPr></w:p>"#,
+                r#"<w:p><w:pPr><w:pStyle w:val="X"/></w:pPr></w:p>"#.to_string(),
+            ),
+            (
+                "<w:tbl><w:tblPr/><w:tblGrid/></w:tbl>",
+                r#"<w:tbl><w:tblPr><w:tblStyle w:val="Plain_2"/></w:tblPr><w:tblGrid/></w:tbl>"#
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(rewritten(input, &rw), want, "{input}");
+        }
+    }
+
+    fn joined(first: &str, second: &str) -> String {
+        let doc =
+            |b: &str| format!(r#"<w:document xmlns:w="{W}"><w:body>{b}</w:body></w:document>"#);
+        let origin = Origin::test("x.docx");
+        let plain = Rewrite {
+            w: "w".into(),
+            ..Rewrite::default()
+        };
+        let mut out: Vec<u8> = vec![];
+        let root = [Attr::new("xmlns:w", XMLNS, W)];
+        let role = |base, last| Role {
+            base,
+            last,
+            root: &root,
+        };
+        let tail = body(
+            &doc(first),
+            "d",
+            &origin,
+            &plain,
+            &role(true, false),
+            &mut out,
+        );
+        let tail = tail.unwrap().unwrap();
+        let appended = Rewrite {
+            appended: true,
+            w: "w".into(),
+            ..Rewrite::default()
+        };
+        let second = doc(second);
+        body(
+            &second,
+            "d",
+            &origin,
+            &appended,
+            &role(false, true),
+            &mut out,
+        )
+        .unwrap();
+        out.extend(tail.as_bytes());
+        let text = String::from_utf8(out).unwrap();
+        let inner = text.split_once("<w:body>").unwrap().1;
+        inner
+            .strip_suffix("</w:body></w:document>")
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn the_body_section_break_lands_in_the_last_paragraph() {
+        let sect = r#"<w:sectPr><w:pgSz w:w="1"/></w:sectPr>"#;
+        let carried = |p: &str| joined(&format!("{p}{sect}"), "<w:p/>");
+        assert_eq!(
+            carried("<w:p><w:r/></w:p>"),
+            format!("<w:p><w:pPr>{sect}</w:pPr><w:r/></w:p><w:p></w:p><w:sectPr/>")
+        );
+        assert_eq!(
+            carried("<w:p/>"),
+            format!("<w:p><w:pPr>{sect}</w:pPr></w:p><w:p></w:p><w:sectPr/>")
+        );
+        assert_eq!(
+            carried("<w:p><w:pPr/></w:p>"),
+            format!("<w:p><w:pPr>{sect}</w:pPr></w:p><w:p></w:p><w:sectPr/>")
+        );
+        assert_eq!(
+            carried(r#"<w:p><w:pPr><w:rPr/><w:pPrChange w:id="1"/></w:pPr></w:p>"#),
+            format!(
+                r#"<w:p><w:pPr><w:rPr/>{sect}<w:pPrChange w:id="1"/></w:pPr></w:p><w:p></w:p><w:sectPr/>"#
+            )
+        );
+        assert_eq!(
+            carried("<w:tbl/>"),
+            format!("<w:tbl/><w:p><w:pPr>{sect}</w:pPr></w:p><w:p></w:p><w:sectPr/>")
+        );
+        let own = format!("<w:p><w:pPr>{sect}</w:pPr></w:p>");
+        assert_eq!(
+            carried(&own),
+            format!("{own}<w:p><w:pPr>{sect}</w:pPr></w:p><w:p></w:p><w:sectPr/>")
+        );
+    }
+
+    #[test]
+    fn an_appended_first_section_starts_on_a_new_page() {
+        let sect = |t: &str| format!(r#"<w:sectPr><w:type w:val="{t}"/></w:sectPr>"#);
+        for (from, to) in [
+            ("continuous", "nextPage"),
+            ("nextColumn", "nextPage"),
+            ("oddPage", "oddPage"),
+            ("evenPage", "evenPage"),
+        ] {
+            let out = joined("<w:p/>", &format!("<w:p/>{}", sect(from)));
+            assert!(out.ends_with(&sect(to)), "{out}");
+        }
+        let later = format!(
+            "<w:p><w:pPr>{}</w:pPr></w:p><w:p/>{}",
+            sect("oddPage"),
+            sect("continuous")
+        );
+        assert!(joined("<w:p/>", &later).ends_with(&sect("continuous")));
     }
 }

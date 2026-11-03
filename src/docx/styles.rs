@@ -139,6 +139,7 @@ fn canon(
     based: &dyn Fn(&str) -> String,
     named: &dyn Fn(&str) -> String,
     lists: ListForm,
+    theme: Option<&Theme>,
 ) -> String {
     let mut n = s.clone();
     n.children.retain(
@@ -146,6 +147,9 @@ fn canon(
     );
     n.attrs.retain(|a| !(a.ns == W && a.local == "styleId"));
     n.walk_mut(&mut |x| {
+        if let Some(t) = theme {
+            t.resolve(&x.ns, &x.local, &mut x.attrs);
+        }
         if x.ns != W {
             return;
         }
@@ -184,6 +188,8 @@ pub struct Source<'a> {
     pub lists: ListForm<'a>,
     /// The output's numbering, by the same form.
     pub output_lists: ListForm<'a>,
+    /// This document's theme and the output's, when they differ and links come off.
+    pub themes: Option<(&'a Theme, &'a Theme)>,
 }
 
 /// The output's styles: the base's and, after them, the copies.
@@ -274,14 +280,15 @@ impl Output {
 
     fn equal(&self, i: usize, s: &Node, src: &Source, mapped: &Mapped) -> bool {
         let shown = |id: &str| self.shown(id);
-        let ours = canon(&self.styles[i], &shown, &shown, src.output_lists);
+        let (theirs, base) = src.themes.unzip();
+        let ours = canon(&self.styles[i], &shown, &shown, src.output_lists, base);
         let own = |id: &str| {
             src.sheet
                 .get(id)
                 .map_or(id.to_lowercase(), |s| name_of(s).to_lowercase())
         };
         let based = |id: &str| mapped.ids.get(id).map_or(own(id), |new| self.shown(new));
-        ours == canon(s, &based, &own, src.lists)
+        ours == canon(s, &based, &own, src.lists, theirs)
     }
 
     /// Adds a copy of `s` and returns its id. On a clash it gets a new name and id; an id taken
@@ -328,6 +335,369 @@ impl Output {
     }
 }
 
+const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+/// A document's theme, as far as text needs it.
+pub struct Theme {
+    /// The canonical form of its colours and fonts.
+    form: String,
+    /// `minorHAnsi` and the like to typefaces.
+    fonts: HashMap<String, String>,
+}
+
+/// The script a language's theme font is listed under.
+fn script(lang: &str) -> Option<&'static str> {
+    let (base, region) = lang.split_once('-').unwrap_or((lang, ""));
+    Some(match base {
+        "ja" => "Jpan",
+        "ko" => "Hang",
+        "zh" if ["TW", "HK", "MO"].contains(&region) => "Hant",
+        "zh" => "Hans",
+        "ar" | "fa" | "ur" => "Arab",
+        "he" => "Hebr",
+        "th" => "Thai",
+        _ => return None,
+    })
+}
+
+impl Theme {
+    /// `lang` is the document's `w:themeFontLang`.
+    pub fn new(root: &Node, lang: Option<&Node>) -> Self {
+        let elements = root.child(A, "themeElements");
+        let mut form = String::new();
+        for local in ["clrScheme", "fontScheme"] {
+            if let Some(n) = elements.and_then(|e| e.child(A, local)) {
+                let mut n = n.clone();
+                n.attrs.retain(|a| a.local != "name");
+                n.canonical(&mut form);
+            }
+        }
+        let mut fonts = HashMap::new();
+        let scheme = elements.and_then(|e| e.child(A, "fontScheme"));
+        for (family, word) in [("majorFont", "major"), ("minorFont", "minor")] {
+            let Some(f) = scheme.and_then(|s| s.child(A, family)) else {
+                continue;
+            };
+            let face = |local: &str| {
+                let n = f.child(A, local);
+                n.and_then(|n| n.attr("", "typeface"))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let scripted = |attr: &str, local: &str| {
+                let wanted = lang.and_then(|l| l.attr(W, attr)).and_then(script);
+                let listed = f.nodes().find(|n| {
+                    n.is(A, "font") && wanted.is_some() && n.attr("", "script") == wanted
+                });
+                listed
+                    .and_then(|n| n.attr("", "typeface"))
+                    .map_or(face(local), String::from)
+            };
+            fonts.insert(format!("{word}Ascii"), face("latin"));
+            fonts.insert(format!("{word}HAnsi"), face("latin"));
+            fonts.insert(format!("{word}EastAsia"), scripted("eastAsia", "ea"));
+            fonts.insert(format!("{word}Bidi"), scripted("bidi", "cs"));
+        }
+        Self { form, fonts }
+    }
+
+    pub fn differs(&self, other: &Theme) -> bool {
+        self.form != other.form
+    }
+
+    /// Takes the theme links off an element, leaving the colours Word wrote beside them and
+    /// this theme's typefaces. True when something changed.
+    pub fn resolve(&self, ns: &str, local: &str, attrs: &mut Vec<Attr>) -> bool {
+        const COLOUR: [&str; 6] = [
+            "themeColor",
+            "themeTint",
+            "themeShade",
+            "themeFill",
+            "themeFillTint",
+            "themeFillShade",
+        ];
+        let before = attrs.len();
+        attrs.retain(|a| !(a.ns == W && COLOUR.contains(&a.local.as_str())));
+        let mut changed = attrs.len() != before;
+        if ns != W || local != "rFonts" {
+            return changed;
+        }
+        for (linked, plain) in [
+            ("asciiTheme", "ascii"),
+            ("hAnsiTheme", "hAnsi"),
+            ("eastAsiaTheme", "eastAsia"),
+            ("cstheme", "cs"),
+        ] {
+            let Some(i) = attrs.iter().position(|a| a.ns == W && a.local == linked) else {
+                continue;
+            };
+            let a = attrs.remove(i);
+            changed = true;
+            attrs.retain(|x| !(x.ns == W && x.local == plain));
+            if let Some(face) = self.fonts.get(&a.value).filter(|f| !f.is_empty()) {
+                attrs.push(Attr::new(&a.key.replace(linked, plain), W, face));
+            }
+        }
+        changed
+    }
+}
+
+/// `w:pPr` children in schema order.
+const PPR: [&str; 36] = [
+    "pStyle",
+    "keepNext",
+    "keepLines",
+    "pageBreakBefore",
+    "framePr",
+    "widowControl",
+    "numPr",
+    "suppressLineNumbers",
+    "pBdr",
+    "shd",
+    "tabs",
+    "suppressAutoHyphens",
+    "kinsoku",
+    "wordWrap",
+    "overflowPunct",
+    "topLinePunct",
+    "autoSpaceDE",
+    "autoSpaceDN",
+    "bidi",
+    "adjustRightInd",
+    "snapToGrid",
+    "spacing",
+    "ind",
+    "contextualSpacing",
+    "mirrorIndents",
+    "suppressOverlap",
+    "jc",
+    "textDirection",
+    "textAlignment",
+    "textboxTightWrap",
+    "outlineLvl",
+    "divId",
+    "cnfStyle",
+    "rPr",
+    "sectPr",
+    "pPrChange",
+];
+
+/// `w:rPr` children in schema order; a name not listed (another namespace's extension) goes
+/// just before the last.
+const RPR: [&str; 40] = [
+    "rStyle",
+    "rFonts",
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "caps",
+    "smallCaps",
+    "strike",
+    "dstrike",
+    "outline",
+    "shadow",
+    "emboss",
+    "imprint",
+    "noProof",
+    "snapToGrid",
+    "vanish",
+    "webHidden",
+    "color",
+    "spacing",
+    "w",
+    "kern",
+    "position",
+    "sz",
+    "szCs",
+    "highlight",
+    "u",
+    "effect",
+    "bdr",
+    "shd",
+    "fitText",
+    "vertAlign",
+    "rtl",
+    "cs",
+    "em",
+    "lang",
+    "eastAsianLayout",
+    "specVanish",
+    "oMath",
+    "rPrChange",
+];
+
+/// `w:style` children in schema order, up to where a new `w:pPr` or `w:rPr` can go.
+const STYLE: [&str; 22] = [
+    "name",
+    "aliases",
+    "basedOn",
+    "next",
+    "link",
+    "autoRedefine",
+    "hidden",
+    "uiPriority",
+    "semiHidden",
+    "unhideWhenUsed",
+    "qFormat",
+    "locked",
+    "personal",
+    "personalCompose",
+    "personalReply",
+    "rsid",
+    "pPr",
+    "rPr",
+    "tblPr",
+    "trPr",
+    "tcPr",
+    "tblStylePr",
+];
+
+/// Attributes that say the same thing, so one already set keeps the others out.
+const SAME_MEANING: [&[&str]; 8] = [
+    &["ascii", "asciiTheme"],
+    &["hAnsi", "hAnsiTheme"],
+    &["eastAsia", "eastAsiaTheme"],
+    &["cs", "cstheme"],
+    &["firstLine", "hanging", "firstLineChars", "hangingChars"],
+    &["line", "lineRule"],
+    &["before", "beforeLines", "beforeAutospacing"],
+    &["after", "afterLines", "afterAutospacing"],
+];
+
+type Fallback<'a> = (&'a str, &'a [(&'a str, &'a str)]);
+
+/// What Word uses when nothing sets these properties.
+const WORD_PPR: [Fallback; 3] = [
+    (
+        "spacing",
+        &[
+            ("before", "0"),
+            ("after", "0"),
+            ("line", "240"),
+            ("lineRule", "auto"),
+        ],
+    ),
+    ("ind", &[("left", "0"), ("right", "0"), ("firstLine", "0")]),
+    ("jc", &[("val", "left")]),
+];
+const WORD_RPR: [Fallback; 3] = [
+    (
+        "rFonts",
+        &[
+            ("ascii", "Times New Roman"),
+            ("hAnsi", "Times New Roman"),
+            ("cs", "Times New Roman"),
+        ],
+    ),
+    ("sz", &[("val", "20")]),
+    ("szCs", &[("val", "20")]),
+];
+
+/// Puts `child` into `parent` where `order` says it belongs.
+fn insert_ordered(parent: &mut Node, child: Node, order: &[&str]) {
+    let rank = |n: &Node| {
+        let listed = order.iter().position(|o| n.ns == W && n.local == *o);
+        listed.unwrap_or(order.len() - 2)
+    };
+    let at = parent
+        .children
+        .iter()
+        .position(|c| matches!(c, Child::Node(n) if rank(n) > rank(&child)))
+        .unwrap_or(parent.children.len());
+    parent.children.insert(at, Child::Node(child));
+}
+
+fn default_props(defaults: Option<&Node>, outer: &str, inner: &str) -> Vec<Node> {
+    let props = defaults
+        .and_then(|d| d.child(W, outer))
+        .and_then(|o| o.child(W, inner));
+    props.map_or(vec![], |p| p.nodes().cloned().collect())
+}
+
+/// Adds `props` under a style's own `local` element: what the style sets stays, and of a
+/// shared element it takes only the attributes it lacks.
+fn fold_into(s: &mut Node, local: &str, props: &[Node], order: &[&str]) {
+    if props.is_empty() {
+        return;
+    }
+    if s.child(W, local).is_none() {
+        let prefix = s.name.strip_suffix("style").unwrap_or("w:");
+        let n = Node::new(&format!("{prefix}{local}"), W, vec![]);
+        insert_ordered(s, n, &STYLE);
+    }
+    let own = s.child_mut(W, local).expect("added above");
+    for p in props {
+        match own.child_mut(W, &p.local) {
+            Some(mine) if ["spacing", "ind", "rFonts"].contains(&p.local.as_str()) => {
+                for a in p.attrs.iter().filter(|a| !a.is_declaration()) {
+                    let group = SAME_MEANING.iter().find(|g| g.contains(&a.local.as_str()));
+                    let set = mine.attrs.iter().any(|b| {
+                        b.local == a.local || group.is_some_and(|g| g.contains(&b.local.as_str()))
+                    });
+                    if !set {
+                        mine.attrs.push(a.clone());
+                    }
+                }
+            }
+            Some(_) => {}
+            None => insert_ordered(own, p.clone(), order),
+        }
+    }
+}
+
+/// Adds to `own` what Word uses for each property of `table` that only `theirs` sets.
+fn fall_back(own: &mut Vec<Node>, theirs: &[Node], table: &[Fallback]) {
+    for (local, attrs) in table {
+        let has = |list: &[Node]| list.iter().any(|n| n.local == *local);
+        if has(theirs) && !has(own) {
+            let attrs = attrs
+                .iter()
+                .map(|(k, v)| Attr::new(&format!("w:{k}"), W, v))
+                .collect();
+            own.push(Node::new(&format!("w:{local}"), W, attrs));
+        }
+    }
+}
+
+impl Sheet {
+    /// Whether this document's defaults say something else than `base`.
+    pub fn defaults_differ(&self, base: Option<&Node>) -> bool {
+        let form = |d: Option<&Node>| {
+            let mut s = String::new();
+            if let Some(d) = d {
+                d.canonical(&mut s);
+            }
+            s
+        };
+        form(self.defaults.as_ref()) != form(base)
+    }
+
+    /// Moves this document's defaults into its paragraph styles with no parent, so they hold
+    /// under the base's defaults. What only the base's defaults set comes in as what Word uses
+    /// when nothing sets it.
+    pub fn fold_defaults(&mut self, base: Option<&Node>) {
+        let mut ppr = default_props(self.defaults.as_ref(), "pPrDefault", "pPr");
+        let mut rpr = default_props(self.defaults.as_ref(), "rPrDefault", "rPr");
+        fall_back(
+            &mut ppr,
+            &default_props(base, "pPrDefault", "pPr"),
+            &WORD_PPR,
+        );
+        fall_back(
+            &mut rpr,
+            &default_props(base, "rPrDefault", "rPr"),
+            &WORD_RPR,
+        );
+        for s in &mut self.styles {
+            if type_of(s) == "paragraph" && reference(s, "basedOn").is_none() {
+                fold_into(s, "pPr", &ppr, &PPR);
+                fold_into(s, "rPr", &rpr, &RPR);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +725,7 @@ mod tests {
             position: 2,
             lists: &plain,
             output_lists: &plain,
+            themes: None,
         };
         let seeds: BTreeSet<String> = ids.iter().map(|s| s.to_string()).collect();
         out.map(&src, &doc.closure(&seeds, &|_| vec![])).unwrap()
@@ -486,6 +857,7 @@ mod tests {
             position: 2,
             lists: &plain,
             output_lists: &plain,
+            themes: None,
         };
         let e = out
             .map(&src, &BTreeSet::from(["New".to_string()]))
