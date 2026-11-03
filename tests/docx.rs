@@ -104,6 +104,9 @@ fn untouched_parts_are_copied_byte_for_byte_and_runs_repeat() {
             || n == "word/_rels/document.xml.rels"
             || n.starts_with("word/styles.xml")
             || n.starts_with("word/numbering.xml")
+            || ["footnotes", "endnotes", "comments"].iter().any(|k| {
+                n.starts_with(&format!("word/{k}.xml")) || n.starts_with(&format!("word/_rels/{k}"))
+            })
             || n.starts_with("word/header")
             || n.starts_with("word/footer")
             || n.starts_with("word/diagrams/data")
@@ -274,4 +277,69 @@ fn a_base_with_no_numbering_gets_the_part() {
     assert!(numbering.contains("<w:abstractNum "));
     assert!(text(&parts, "[Content_Types].xml").contains("/word/numbering.xml"));
     assert!(text(&parts, "word/_rels/document.xml.rels").contains("numbering.xml"));
+}
+
+#[test]
+fn notes_and_comments_join_the_outputs_parts_with_new_ids() {
+    let (_, parts) = merged("notes", &["a.docx", "b.docx"]);
+    let doc = text(&parts, "word/document.xml");
+    let comments = text(&parts, "word/comments.xml");
+    let ids = values(&comments, "w:comment", "w:id");
+    let authors = values(&comments, "w:comment", "w:author");
+    assert_eq!(authors, ["Author A", "Author B"]);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 2, "{ids:?}");
+    for element in [
+        "w:commentReference",
+        "w:commentRangeStart",
+        "w:commentRangeEnd",
+    ] {
+        assert_eq!(values(&doc, element, "w:id"), ids, "{element}");
+    }
+    let endnotes = text(&parts, "word/endnotes.xml");
+    assert!(words(&endnotes).contains("An endnote of B."));
+    let wanted = values(&doc, "w:endnoteReference", "w:id");
+    assert_eq!(wanted.len(), 1);
+    assert!(values(&endnotes, "w:endnote", "w:id").contains(&wanted[0]));
+    // The base's separators stay, and only once.
+    assert_eq!(count(&endnotes, r#"w:type="separator""#), 1);
+}
+
+#[test]
+fn a_base_with_no_notes_takes_the_first_part_with_its_separators() {
+    let (_, parts) = merged("new-notes", &["c.docx", "a.docx"]);
+    let footnotes = text(&parts, "word/footnotes.xml");
+    assert_eq!(count(&footnotes, r#"w:type="separator""#), 1);
+    assert!(words(&footnotes).contains("A footnote with a picture"));
+    let wanted = values(
+        &text(&parts, "word/document.xml"),
+        "w:footnoteReference",
+        "w:id",
+    );
+    assert!(values(&footnotes, "w:footnote", "w:id").contains(&wanted[0]));
+    // The picture inside the note moved to the note part's own relationships.
+    let rels = text(&parts, "word/_rels/footnotes.xml.rels");
+    assert!(rels.contains("media/image"), "{rels}");
+    let types = text(&parts, "[Content_Types].xml");
+    assert!(types.contains("/word/footnotes.xml") && types.contains("/word/comments.xml"));
+    let document_rels = text(&parts, "word/_rels/document.xml.rels");
+    assert!(document_rels.contains("footnotes.xml"));
+}
+
+#[test]
+fn content_controls_keep_their_text_and_lose_their_binding() {
+    let (_, parts) = merged("binding", &["a.docx", "b.docx"]);
+    let doc = text(&parts, "word/document.xml");
+    assert!(!doc.contains("dataBinding"));
+    assert!(words(&doc).contains("Title of B"));
+    let (_, parts) = merged("binding-base", &["b.docx", "a.docx"]);
+    assert!(text(&parts, "word/document.xml").contains("dataBinding"));
+}
+
+#[test]
+fn only_one_style_is_the_default_of_its_type() {
+    let (_, parts) = merged("one-default", &["a.docx", "b.docx"]);
+    let styles = text(&parts, "word/styles.xml");
+    let paragraph = r#"<w:style w:type="paragraph" w:default="1""#;
+    assert_eq!(count(&styles, paragraph), 1);
 }

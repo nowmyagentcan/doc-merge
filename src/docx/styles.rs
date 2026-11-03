@@ -318,6 +318,8 @@ impl Output {
             (name.to_string(), id.to_string())
         };
         let mut n = s.clone();
+        // The output has one default style of each type: the base's.
+        n.attrs.retain(|a| !(a.ns == W && a.local == "default"));
         n.set_attr(W, "w", "styleId", &new_id);
         if new_name != name {
             mapped.renames.push((name.to_string(), new_name.clone()));

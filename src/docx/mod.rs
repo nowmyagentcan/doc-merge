@@ -1,9 +1,11 @@
 //! Word: the bodies joined in order, every appended document starting on a new page with its
-//! own sections, its styles mapped or copied (`styles`), its lists copied (`numbering`), and the
-//! parts its content points to copied with new relationship ids.
+//! own sections, its styles mapped or copied (`styles`), its lists copied (`numbering`), its
+//! notes and comments appended (`notes`), and the parts its content points to copied with new
+//! relationship ids.
 
-pub mod numbering;
-pub mod styles;
+mod notes;
+mod numbering;
+mod styles;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
@@ -15,10 +17,12 @@ use crate::package::{MAX_PARSED, MAX_STREAMED, Package, RELS_TYPE, Rel, rels_nam
 use crate::writer::{Body, Plan, R, relative, rels_xml};
 use crate::xml::{self, Attr, MC, Node, Reader, XMLNS, start_tag};
 use crate::{Origin, Rename, StyleMode};
+use notes::{KINDS, Notes};
 use numbering::Lists;
 use styles::{Sheet, Source, Theme};
 
 pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const W15: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 const O: &str = "urn:schemas-microsoft-com:office:office";
 const DSP: &str = "http://schemas.microsoft.com/office/drawing/2008/diagram";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
@@ -52,7 +56,8 @@ fn held(pkg: &mut Package, main: &str, rels: &[Rel], kind: &str) -> Result<Optio
             .origin
             .bad(&format!("{main} points to a missing part {}", r.target)));
     };
-    let text = pkg.text(&part, MAX_PARSED)?;
+    let large = KINDS.iter().any(|k| k.0 == kind);
+    let text = pkg.text(&part, if large { MAX_STREAMED } else { MAX_PARSED })?;
     let tree = xml::tree(&text, &part, &pkg.origin)?;
     Ok(Some(Held { part, text, tree }))
 }
@@ -84,6 +89,10 @@ pub fn merge(
     let num_rels_before = num_rels.list.len();
     let mut out_lists =
         numbering::Output::new(Lists::new(base_numbering.as_ref().map(|h| &h.tree)));
+    let mut notes = vec![];
+    for kind in KINDS {
+        notes.push(Notes::open(&mut inputs[0], &main, &base_rels, kind)?);
+    }
     let mut docs = vec![];
     let mut sections = vec![];
     let mut renames = vec![];
@@ -123,6 +132,16 @@ pub fn merge(
                 uses.nums.extend(found.nums);
                 stories.push((id.clone(), target, text));
             }
+        }
+        let mut doc_notes = vec![];
+        for (kind, _) in KINDS {
+            let h = held(&mut inputs[i], &part, &own, kind)?;
+            if let Some(h) = &h {
+                let found = scan(&h.text, &h.part, &origin)?;
+                uses.styles.extend(found.styles);
+                uses.nums.extend(found.nums);
+            }
+            doc_notes.push(h);
         }
         let doc_styles = held(&mut inputs[i], &part, &own, "styles")?;
         let mut sheet = Sheet::new(doc_styles.as_ref().map(|h| &h.tree));
@@ -196,6 +215,7 @@ pub fn merge(
         let mut rw = Rewrite {
             rids: Some(HashMap::new()),
             nums: copied.nums,
+            notes: Default::default(),
             bare_p: bare("paragraph", &base_p),
             bare_table: bare("table", &base_table),
             theme: doc_theme,
@@ -224,6 +244,11 @@ pub fn merge(
             .chain(&mut added.nums[copied.added_nums])
         {
             s.attrs.extend(local.iter().cloned());
+        }
+        for (k, h) in doc_notes.iter().enumerate() {
+            if let Some(h) = h {
+                rw.notes[k] = notes[k].add(&mut plan, inputs, i, h, &mut rw)?;
+            }
         }
         let mut done = HashSet::new();
         for id in &uses.rids {
@@ -274,6 +299,9 @@ pub fn merge(
     )?;
     if num_rels.list.len() > num_rels_before {
         rels_part(&mut plan, &inputs[0], &num_part, &num_rels);
+    }
+    for n in &notes {
+        n.finish(&mut plan, &mut rels, &inputs[0], &main, &origin)?;
     }
     let root_attrs = root.attrs;
     let count = inputs.len();
@@ -435,8 +463,11 @@ fn story(text: &str, part: &str, origin: &Origin, rw: &Rewrite) -> Result<Vec<u8
         let event = r.event()?;
         match &event {
             Event::Eof => return Ok(buf),
-            Event::Start(e) => start(&r, e, false, rw, Place::Inner, &mut bare, &mut buf)?,
-            Event::Empty(e) => start(&r, e, true, rw, Place::Inner, &mut bare, &mut buf)?,
+            Event::Start(e) | Event::Empty(e) => {
+                let empty = matches!(event, Event::Empty(_));
+                let place = Place::Inner;
+                element(&mut r, e, empty, rw, &mut false, place, &mut bare, &mut buf)?;
+            }
             Event::End(_) => {
                 bare.end(rw, &mut buf);
                 put(&mut buf, &event);
@@ -754,6 +785,8 @@ struct Rewrite {
     styles: HashMap<String, String>,
     /// Old to new `w:numId`s.
     nums: HashMap<String, String>,
+    /// Old to new note and comment ids, by [`KINDS`].
+    notes: [HashMap<String, String>; 3],
     /// Set when theme links come off this document's content.
     theme: Option<Theme>,
     /// The style for paragraphs and tables with none, when not the output's default.
@@ -796,6 +829,20 @@ impl Rewrite {
             && local == "numId"
             && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "val")
             && let Some(new) = self.nums.get(&a.value)
+        {
+            changed |= *new != a.value;
+            a.value = new.clone();
+        }
+        let notes = match local {
+            "footnoteReference" => Some(&self.notes[0]),
+            "endnoteReference" => Some(&self.notes[1]),
+            "commentReference" | "commentRangeStart" | "commentRangeEnd" => Some(&self.notes[2]),
+            _ => None,
+        };
+        if ns == W
+            && let Some(map) = notes
+            && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "id")
+            && let Some(new) = map.get(&a.value)
         {
             changed |= *new != a.value;
             a.value = new.clone();
@@ -1149,7 +1196,9 @@ fn splice(mut p: Vec<u8>, m: Mark, s: &[u8], w: &str) -> Vec<u8> {
 }
 
 /// Writes an element's start tag with the rewrite applied. A section break is written whole,
-/// and the first one of an appended document starts a new page; returns true then.
+/// and the first one of an appended document starts a new page. An appended content control
+/// loses its data binding, or Word could refill it from the base's data. Returns true when the
+/// element's content has been dealt with too.
 #[allow(clippy::too_many_arguments)]
 fn element<'a>(
     r: &mut Reader<'a>,
@@ -1161,7 +1210,15 @@ fn element<'a>(
     bare: &mut Bare,
     buf: &mut Vec<u8>,
 ) -> Result<bool, Error> {
-    let sect = tag(r.element_ns(e), e.local_name().as_ref().as_bytes()) == Tag::SectPr;
+    let ns = r.element_ns(e);
+    if rw.appended && (ns == W || ns == W15) && e.local_name().as_ref() == "dataBinding" {
+        let depth = r.depth();
+        while !empty && r.depth() >= depth {
+            r.event()?;
+        }
+        return Ok(true);
+    }
+    let sect = tag(ns, e.local_name().as_ref().as_bytes()) == Tag::SectPr;
     let first = sect && std::mem::take(first_sect);
     start(r, e, empty, rw, place, bare, buf)?;
     if !sect || empty {
