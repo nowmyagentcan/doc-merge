@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 pub const CT_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
 pub const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -33,10 +33,17 @@ pub fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     p
 }
 
+/// The timestamp of every entry the builders write.
+pub fn source_time() -> DateTime {
+    DateTime::from_date_and_time(2024, 5, 6, 7, 8, 10).unwrap()
+}
+
 /// A ZIP of `parts`, deflated, in order.
 pub fn zip(parts: &[(&str, &[u8])]) -> Vec<u8> {
     let mut z = ZipWriter::new(Cursor::new(Vec::new()));
-    let o = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let o = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .last_modified_time(source_time());
     for (name, data) in parts {
         z.start_file(*name, o).unwrap();
         z.write_all(data).unwrap();
@@ -286,6 +293,20 @@ pub fn entries(path: &Path) -> Vec<(String, Vec<u8>)> {
             let mut b = vec![];
             f.read_to_end(&mut b).unwrap();
             (f.name().unwrap().into_owned(), b)
+        })
+        .collect()
+}
+
+/// The entries of a written ZIP as stored: (name, compressed bytes, timestamp).
+pub fn stored(path: &Path) -> Vec<(String, Vec<u8>, DateTime)> {
+    let mut z = ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    (0..z.len())
+        .map(|i| {
+            let mut f = z.by_index_raw(i).unwrap();
+            let mut b = vec![];
+            f.read_to_end(&mut b).unwrap();
+            let time = f.last_modified().unwrap();
+            (f.name().unwrap().into_owned(), b, time)
         })
         .collect()
 }

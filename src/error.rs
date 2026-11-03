@@ -240,7 +240,20 @@ fn and_list(items: &[String]) -> String {
 
 /// A file size for messages, in whole MiB rounded up, so 512 MiB and one byte is `513 MiB`.
 pub fn mib(bytes: u64) -> String {
-    format!("{} MiB", bytes.div_ceil(1 << 20))
+    format!("{} MiB", thousands(bytes.div_ceil(1 << 20)))
+}
+
+/// `1234567` as `1,234,567`.
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Something the merge did that the user should know about; the exit code stays 0.
@@ -372,6 +385,8 @@ mod tests {
             "'huge.pptx' is over the limit: 572 MiB (at most 512 MiB)."
         );
         assert_eq!(mib((512 << 20) + 1), "513 MiB");
+        assert_eq!(mib(3 << 30), "3,072 MiB");
+        assert_eq!(thousands(999), "999");
         assert_eq!(
             Error::date_system_differs("b.xlsx", "a.xlsx", true).message,
             "'b.xlsx' uses the 1904 date system and 'a.xlsx' uses the 1900 one; its dates would shift by four years."

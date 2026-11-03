@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod package;
+pub mod writer;
 pub mod xml;
 
 use std::cell::Cell;

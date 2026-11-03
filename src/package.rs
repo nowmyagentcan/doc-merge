@@ -13,7 +13,7 @@ use quick_xml::events::Event;
 use serde::Serialize;
 use zip::{CompressionMethod, ZipArchive};
 
-use crate::error::{Error, Foreign, mib};
+use crate::error::{Error, Foreign, mib, thousands};
 use crate::xml::{self, Reader};
 use crate::{Origin, Run};
 
@@ -293,7 +293,9 @@ pub struct Entry {
     /// Its position in the ZIP, for raw copies.
     pub index: usize,
     pub size: u64,
+    pub compressed: u64,
     pub crc: u32,
+    pub time: Option<zip::DateTime>,
 }
 
 /// One opened input.
@@ -419,7 +421,9 @@ impl Package {
                 name: part,
                 index,
                 size: e.size(),
+                compressed: e.compressed_size(),
                 crc: e.crc32(),
+                time: e.last_modified(),
             });
         }
         zip.validate_header_consistency().map_err(|e| {
@@ -587,18 +591,6 @@ fn allowed_name(part: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
-fn thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// The entry count the end-of-central-directory record declares, read before the directory
 /// itself so a hostile count is refused without parsing it; none when there is no record.
 fn declared_entries(file: &mut File, len: u64) -> Option<u64> {
@@ -674,7 +666,5 @@ mod tests {
             assert!(!allowed_name(bad), "{bad}");
         }
         assert!(is_signature("_XmlSignatures/sig1.xml"));
-        assert_eq!(thousands(1234567), "1,234,567");
-        assert_eq!(thousands(999), "999");
     }
 }
