@@ -53,7 +53,8 @@ fn name_of(s: &Node) -> &str {
     s.child(W, "name").and_then(val).unwrap_or(id_of(s))
 }
 
-fn reference<'a>(s: &'a Node, local: &str) -> Option<&'a str> {
+/// The `w:val` of an element's `local` child.
+pub fn reference<'a>(s: &'a Node, local: &str) -> Option<&'a str> {
     s.child(W, local).and_then(val)
 }
 

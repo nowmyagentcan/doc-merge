@@ -13,11 +13,7 @@ fn fixture(name: &str) -> PathBuf {
 
 /// Merges fixtures into a fresh folder; returns the report and the output's parts.
 fn merged(test: &str, names: &[&str]) -> (Report, Vec<(String, Vec<u8>)>) {
-    let out = temp_dir(test).join("out.docx");
-    let paths: Vec<PathBuf> = names.iter().map(|n| fixture(n)).collect();
-    let report = merge(&paths, &out, &Options::default(), None).unwrap();
-    let parts = entries(&out);
-    (report, parts)
+    merged_with(test, names, StyleMode::Keep)
 }
 
 /// The text of every `w:t` in a part, joined.

@@ -561,40 +561,27 @@ fn diagram_drawing(
     let text = inputs[i].text(data, MAX_PARSED)?;
     let mut tree = xml::tree(&text, data, &origin)?;
     let own = inputs[i].rels_of(part)?;
-    let mut changed = false;
-    let mut found = vec![];
+    let mut id = None;
     tree.walk(&mut |n| {
-        if n.is(DSP, "dataModelExt")
-            && let Some(id) = n.attr("", "relId")
-        {
-            found.push(id.to_string());
+        if n.is(DSP, "dataModelExt") {
+            id = n.attr("", "relId").map(String::from);
         }
     });
-    let mut map = HashMap::new();
-    for id in found {
-        let Some(r) = own.iter().find(|r| r.id == id && r.kind == DIAGRAM_DRAWING) else {
-            continue;
-        };
-        let (new, _) = copy_rel(plan, inputs, i, part, &r.clone(), to, rels)?;
-        map.insert(id, new);
-    }
+    let Some(r) = own
+        .iter()
+        .find(|r| Some(&r.id) == id.as_ref() && r.kind == DIAGRAM_DRAWING)
+    else {
+        return Ok(());
+    };
+    let (new, _) = copy_rel(plan, inputs, i, part, r, to, rels)?;
     tree.walk_mut(&mut |n| {
-        if n.is(DSP, "dataModelExt")
-            && let Some(a) = n
-                .attrs
-                .iter_mut()
-                .find(|a| a.ns.is_empty() && a.local == "relId")
-            && let Some(new) = map.get(&a.value)
-        {
-            a.value = new.clone();
-            changed = true;
+        if n.is(DSP, "dataModelExt") {
+            n.set_attr("", "", "relId", &new);
         }
     });
-    if changed {
-        let mut out = declaration(&text);
-        tree.write(&mut out);
-        plan.replace(copied, Body::Data(out.into_bytes()));
-    }
+    let mut out = declaration(&text);
+    tree.write(&mut out);
+    plan.replace(copied, Body::Data(out.into_bytes()));
     Ok(())
 }
 
@@ -648,12 +635,9 @@ impl Prefixes {
         }
         let ignorable = root.iter().find(|a| a.ns == MC && a.local == "Ignorable");
         let wanted: Vec<&str> = ignorable
-            .map(|a| a.value.split_whitespace().collect())
-            .unwrap_or_default();
-        let wanted: Vec<String> = wanted
-            .into_iter()
+            .iter()
+            .flat_map(|a| a.value.split_whitespace())
             .filter(|p| !local.iter().any(|d| d.local == *p))
-            .map(String::from)
             .collect();
         if wanted.is_empty() {
             return local;

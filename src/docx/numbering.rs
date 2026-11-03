@@ -6,15 +6,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
 use crate::docx::W;
+use crate::docx::styles::reference;
 use crate::error::Error;
 use crate::xml::{Attr, Child, Node};
 
 fn id(n: &Node, local: &str) -> u64 {
     n.attr(W, local).and_then(|v| v.parse().ok()).unwrap_or(0)
-}
-
-fn reference<'a>(n: &'a Node, local: &str) -> Option<&'a str> {
-    n.child(W, local).and_then(|c| c.attr(W, "val"))
 }
 
 /// The lists of one document.
