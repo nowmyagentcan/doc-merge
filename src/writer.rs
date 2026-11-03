@@ -141,7 +141,7 @@ impl Plan {
         self.taken.insert(name.to_ascii_lowercase());
     }
 
-    pub fn is_taken(&self, name: &str) -> bool {
+    fn is_taken(&self, name: &str) -> bool {
         self.taken.contains(&name.to_ascii_lowercase())
     }
 

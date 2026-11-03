@@ -15,12 +15,6 @@ pub struct Error {
     pub exit: u8,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
 const RESAVE: &str = "Save it as .docx, .pptx or .xlsx.";
 const SMALLER: &str = "Merge fewer or smaller files at a time.";
 const TRY: &str = "Try: doc-merge a.pptx b.pptx -o all.pptx";

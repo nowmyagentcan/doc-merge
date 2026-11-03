@@ -100,14 +100,6 @@ impl Family {
             Family::Excel => Kind::Xlsx,
         }
     }
-
-    pub fn extension(self) -> &'static str {
-        match self {
-            Family::Word => "docx",
-            Family::PowerPoint => "pptx",
-            Family::Excel => "xlsx",
-        }
-    }
 }
 
 /// One relationship of a part.

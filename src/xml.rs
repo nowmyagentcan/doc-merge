@@ -165,7 +165,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The namespace URI of an attribute name on the current element; empty when it has none.
-    pub fn attribute_ns(&self, name: QName) -> &str {
+    fn attribute_ns(&self, name: QName) -> &str {
         uri(self.inner.resolver().resolve_attribute(name).0)
     }
 
