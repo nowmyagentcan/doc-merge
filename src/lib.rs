@@ -3,13 +3,33 @@
 //! all call it.
 
 pub mod error;
+pub mod package;
 pub mod xml;
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
 use error::Error;
+use package::Package;
+
+/// Opens every input in order, then checks that they are all of one family.
+pub fn open_inputs(paths: &[PathBuf], run: &Rc<Run>) -> Result<Vec<Package>, Error> {
+    let pkgs = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Package::open(p, i + 1, run))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut counts = [0; 3];
+    for p in &pkgs {
+        counts[p.kind.family() as usize] += 1;
+    }
+    if counts.iter().filter(|&&n| n > 0).count() > 1 {
+        return Err(Error::mixed_formats(counts));
+    }
+    Ok(pkgs)
+}
 
 /// The most bytes one run inflates, over all its inputs.
 pub const MAX_INFLATED: u64 = 4 << 30;
