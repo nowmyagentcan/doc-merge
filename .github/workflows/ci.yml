@@ -50,20 +50,21 @@ jobs:
           using DocumentFormat.OpenXml.Packaging;
           using DocumentFormat.OpenXml.Validation;
           var validator = new OpenXmlValidator(FileFormatVersions.Microsoft365);
-          IEnumerable<ValidationErrorInfo> Errors(string path)
+          List<(string Text, string Where)> Errors(string path)
           {
               using var doc = WordprocessingDocument.Open(path, false);
-              return validator.Validate(doc).ToList();
+              return validator.Validate(doc)
+                  .Select(e => (e.Description, $"{e.Part?.Uri} {e.Path?.XPath}")).ToList();
           }
           var known = Directory.GetFiles(args[0], "*.docx").SelectMany(Errors)
-              .Select(e => e.Description).ToHashSet();
+              .Select(e => e.Text).ToHashSet();
           var failed = false;
           foreach (var path in Directory.GetFiles(args[1]))
           {
-              foreach (var e in Errors(path).Where(e => !known.Contains(e.Description)))
+              foreach (var e in Errors(path).Where(e => !known.Contains(e.Text)))
               {
                   failed = true;
-                  Console.WriteLine($"{Path.GetFileName(path)}: {e.Part?.Uri} {e.Path?.XPath}: {e.Description}");
+                  Console.WriteLine($"{Path.GetFileName(path)}: {e.Where}: {e.Text}");
               }
           }
           return failed ? 1 : 0;
