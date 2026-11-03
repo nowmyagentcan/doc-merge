@@ -394,3 +394,51 @@ fn inputs_must_share_a_family() {
     );
     assert_eq!(e.input, None);
 }
+
+/// Every part of every committed fixture, and of the packages embedded in them, inflated.
+fn fixture_parts(name: &str, bytes: &[u8], out: &mut Vec<(String, Vec<u8>)>) {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).unwrap();
+        let mut b = vec![];
+        std::io::Read::read_to_end(&mut f, &mut b).unwrap();
+        let part = format!("{name}/{}", f.name().unwrap());
+        if b.starts_with(b"PK\x03\x04") {
+            fixture_parts(&part, &b, out);
+        }
+        out.push((part, b));
+    }
+}
+
+#[test]
+fn fixtures_carry_no_personal_data() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut parts = vec![];
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x != "ps1") {
+            let bytes = std::fs::read(&p).unwrap();
+            assert!(bytes.len() <= 500 << 10, "{} is over 500 KB", p.display());
+            fixture_parts(
+                &p.file_name().unwrap().to_string_lossy(),
+                &bytes,
+                &mut parts,
+            );
+        }
+    }
+    assert!(parts.len() > 50, "only {} parts", parts.len());
+    let email = |t: &str| {
+        t.split(|c: char| c.is_whitespace() || "<>\"'=:;,()[]".contains(c))
+            .any(|w| {
+                w.split_once('@')
+                    .is_some_and(|(u, d)| !u.is_empty() && d.contains('.'))
+            })
+    };
+    for (name, bytes) in parts {
+        let t = String::from_utf8_lossy(&bytes);
+        for bad in [r":\", r"\Users", "/Users/", "/home/"] {
+            assert!(!t.contains(bad), "{name} holds {bad}");
+        }
+        assert!(!email(&t), "{name} holds an email address");
+    }
+}
