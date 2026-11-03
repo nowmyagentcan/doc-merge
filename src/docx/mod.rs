@@ -1,7 +1,8 @@
 //! Word: the bodies joined in order, every appended document starting on a new page with its
-//! own sections, its styles mapped or copied (`styles`), and the parts its content points to
-//! copied with new relationship ids.
+//! own sections, its styles mapped or copied (`styles`), its lists copied (`numbering`), and the
+//! parts its content points to copied with new relationship ids.
 
+pub mod numbering;
 pub mod styles;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -14,6 +15,7 @@ use crate::package::{MAX_PARSED, MAX_STREAMED, Package, RELS_TYPE, Rel, rels_nam
 use crate::writer::{Body, Plan, R, relative, rels_xml};
 use crate::xml::{self, Attr, MC, Node, Reader, XMLNS, start_tag};
 use crate::{Origin, Rename, StyleMode};
+use numbering::Lists;
 use styles::{Sheet, Source, Theme};
 
 pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -72,6 +74,16 @@ pub fn merge(
     let base_table = base_sheet.default_of("table").map(String::from);
     let base_theme = theme(&mut inputs[0], &main, &base_rels)?;
     let mut out_styles = styles::Output::new(base_sheet);
+    let base_numbering = held(&mut inputs[0], &main, &base_rels, "numbering")?;
+    let mut num_root = Prefixes::of(base_numbering.as_ref().map_or(&[], |h| &h.tree.attrs));
+    let num_part = base_numbering
+        .as_ref()
+        .map_or("word/numbering.xml", |h| &h.part)
+        .to_string();
+    let mut num_rels = Rels::new(inputs[0].rels_of(&num_part)?);
+    let num_rels_before = num_rels.list.len();
+    let mut out_lists =
+        numbering::Output::new(Lists::new(base_numbering.as_ref().map(|h| &h.tree)));
     let mut docs = vec![];
     let mut sections = vec![];
     let mut renames = vec![];
@@ -108,6 +120,7 @@ pub fn merge(
                 let text = inputs[i].text(&target, MAX_PARSED)?;
                 let found = scan(&text, &target, &origin)?;
                 uses.styles.extend(found.styles);
+                uses.nums.extend(found.nums);
                 stories.push((id.clone(), target, text));
             }
         }
@@ -122,13 +135,14 @@ pub fn merge(
         if doc_theme.is_some() {
             warnings.push(Warning::theme_differs(i + 1, &origin.name));
         }
-        let plain = |n: &str| n.to_string();
+        let doc_numbering = held(&mut inputs[i], &part, &own, "numbering")?;
+        let lists = Lists::new(doc_numbering.as_ref().map(|h| &h.tree));
         let source = Source {
             sheet: &sheet,
             mode,
             position: i + 1,
-            lists: &plain,
-            output_lists: &plain,
+            lists: &|n| lists.form(n),
+            output_lists: &|n| out_lists.lists.form(n),
             themes: doc_theme.as_ref().zip(base_theme.as_ref()),
         };
         let mut seeds = uses.styles.clone();
@@ -138,7 +152,8 @@ pub fn merge(
                 .filter_map(|k| sheet.default_of(k))
                 .map(String::from),
         );
-        let mapped = out_styles.map(&source, &sheet.closure(&seeds, &|_| vec![]))?;
+        seeds.extend(uses.nums.iter().flat_map(|n| lists.links(n)));
+        let mapped = out_styles.map(&source, &sheet.closure(&seeds, &|n| lists.links(n)))?;
         renames.extend(mapped.renames.iter().map(|(from, to)| Rename {
             input: i + 1,
             kind: "style",
@@ -149,8 +164,38 @@ pub fn merge(
             let new = mapped.ids.get(sheet.default_of(kind)?)?;
             (Some(new) != output.as_ref()).then(|| new.clone())
         };
+        // Lists reached only through a style the output already has stay the output's.
+        for s in &out_styles.styles[mapped.copied.clone()] {
+            s.walk(&mut |n| {
+                if n.is(W, "numId")
+                    && let Some(v) = n.attr(W, "val")
+                {
+                    uses.nums.insert(v.to_string());
+                }
+            });
+        }
+        let num_source = doc_numbering.as_ref().map_or("", |h| h.part.as_str());
+        let num_own = inputs[i].rels_of(num_source)?;
+        let mut bullet = |old: &str| {
+            let Some(r) = num_own.iter().find(|r| r.id == old) else {
+                let why = format!("{num_source} points to a missing relationship {old}");
+                return Err(origin.bad(&why));
+            };
+            let new = copy_rel(
+                &mut plan,
+                inputs,
+                i,
+                num_source,
+                r,
+                &num_part,
+                &mut num_rels,
+            )?;
+            Ok(new.0)
+        };
+        let copied = out_lists.copy(&lists, &uses.nums, i + 1, &mut bullet)?;
         let mut rw = Rewrite {
             rids: Some(HashMap::new()),
+            nums: copied.nums,
             bare_p: bare("paragraph", &base_p),
             bare_table: bare("table", &base_table),
             theme: doc_theme,
@@ -164,6 +209,20 @@ pub fn merge(
             s.walk_mut(&mut |n| {
                 rw.attrs(&n.ns, &n.local, &mut n.attrs);
             });
+            s.attrs.extend(local.iter().cloned());
+        }
+        let local = num_root.merge(doc_numbering.as_ref().map_or(&[], |h| &h.tree.attrs));
+        let added = &mut out_lists.lists;
+        for s in &mut added.abstracts[copied.abstracts] {
+            s.walk_mut(&mut |n| {
+                rw.attrs(&n.ns, &n.local, &mut n.attrs);
+            });
+            s.attrs.extend(local.iter().cloned());
+        }
+        for s in added.bullets[copied.bullets]
+            .iter_mut()
+            .chain(&mut added.nums[copied.added_nums])
+        {
             s.attrs.extend(local.iter().cloned());
         }
         let mut done = HashSet::new();
@@ -183,29 +242,39 @@ pub fn merge(
         }
         docs.push(rw);
     }
-    let added: String = out_styles.added().iter().fold(String::new(), |mut s, n| {
-        n.write(&mut s);
-        s
-    });
+    let origin = inputs[0].origin.clone();
     let parts = Parts {
         main: &main,
         kind: "styles",
-        root_name: "styles",
     };
-    let base_held = base_styles
-        .as_ref()
-        .map(|h| (h.part.as_str(), h.text.as_str()));
-    let origin = inputs[0].origin.clone();
-    let inserts: [(&[&str], &str); 1] = [(&[], &added)];
+    let inserts: [(&[&str], &str); 1] = [(&[], &written(out_styles.added()))];
+    let base = base_styles.as_ref();
     registry(
         &mut plan,
         &mut rels,
         &parts,
-        base_held,
+        base,
         &style_root,
         &inserts,
         &origin,
     )?;
+    let [bullets, abstracts, nums] = out_lists.added().map(written);
+    let inserts: [(&[&str], &str); 3] = [
+        (&["abstractNum", "num", "numIdMacAtCleanup"], &bullets),
+        (&["num", "numIdMacAtCleanup"], &abstracts),
+        (&["numIdMacAtCleanup"], &nums),
+    ];
+    let parts = Parts {
+        main: &main,
+        kind: "numbering",
+    };
+    let base = base_numbering.as_ref();
+    registry(
+        &mut plan, &mut rels, &parts, base, &num_root, &inserts, &origin,
+    )?;
+    if num_rels.list.len() > num_rels_before {
+        rels_part(&mut plan, &inputs[0], &num_part, &num_rels);
+    }
     let root_attrs = root.attrs;
     let count = inputs.len();
     plan.replace(
@@ -226,18 +295,32 @@ pub fn merge(
             out.write_all(tail.as_bytes()).map_err(io)
         })),
     );
-    let doc_rels = rels_name(&main);
-    if inputs[0].has(&doc_rels) {
-        plan.replace(&doc_rels, Body::Data(rels_xml(&rels.list)));
-    } else {
-        plan.type_part(&doc_rels, RELS_TYPE, true);
-        plan.add(doc_rels, Body::Data(rels_xml(&rels.list)), None);
-    }
+    rels_part(&mut plan, &inputs[0], &main, &rels);
     Ok(Merged {
         plan,
         sections,
         renames,
     })
+}
+
+/// Elements as text, one after another.
+fn written(nodes: &[Node]) -> String {
+    let mut s = String::new();
+    for n in nodes {
+        n.write(&mut s);
+    }
+    s
+}
+
+/// Writes the relationships of an output part, replacing the base's when it has them.
+fn rels_part(plan: &mut Plan, base: &Package, part: &str, rels: &Rels) {
+    let name = rels_name(part);
+    if base.has(&name) {
+        plan.replace(&name, Body::Data(rels_xml(&rels.list)));
+    } else {
+        plan.type_part(&name, RELS_TYPE, true);
+        plan.add(name, Body::Data(rels_xml(&rels.list)), None);
+    }
 }
 
 /// A document's theme, read with its `w:themeFontLang`.
@@ -252,9 +335,8 @@ fn theme(pkg: &mut Package, main: &str, rels: &[Rel]) -> Result<Option<Theme>, E
 /// Which registry part is being written.
 struct Parts<'a> {
     main: &'a str,
-    /// The relationship type's last word, also the part's file stem and content type word.
+    /// The word its relationship type, file name, content type and root element share.
     kind: &'a str,
-    root_name: &'a str,
 }
 
 /// Writes a registry part with `inserts` (see [`extend`]) when any has content: the base's
@@ -263,7 +345,7 @@ fn registry(
     plan: &mut Plan,
     rels: &mut Rels,
     parts: &Parts,
-    base: Option<(&str, &str)>,
+    base: Option<&Held>,
     root: &Prefixes,
     inserts: &[(&[&str], &str)],
     origin: &Origin,
@@ -271,13 +353,13 @@ fn registry(
     if inserts.iter().all(|i| i.1.is_empty()) {
         return Ok(());
     }
-    if let Some((part, text)) = base {
-        let bytes = extend(text, part, origin, &root.attrs, inserts)?;
-        plan.replace(part, Body::Data(bytes));
+    if let Some(h) = base {
+        let bytes = extend(&h.text, &h.part, origin, &root.attrs, inserts)?;
+        plan.replace(&h.part, Body::Data(bytes));
         return Ok(());
     }
     let w = prefix_of(&root.attrs, W).unwrap_or("w");
-    let name = format!("{w}:{}", parts.root_name);
+    let name = format!("{w}:{}", parts.kind);
     let mut text =
         String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n");
     text += &start_tag(&name, &root.attrs, false);
@@ -578,6 +660,8 @@ struct Uses {
     /// Relationship ids, in the order first met.
     rids: Vec<String>,
     styles: BTreeSet<String>,
+    /// `w:numId`s, without 0, which means no list.
+    nums: BTreeSet<String>,
     sections: usize,
     root: Vec<Attr>,
 }
@@ -641,6 +725,13 @@ fn scan(text: &str, part: &str, origin: &Origin) -> Result<Uses, Error> {
         {
             uses.styles.insert(a.value.clone());
         }
+        if r.element_ns(e) == W
+            && e.local_name().as_ref() == "numId"
+            && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "val")
+            && a.value != "0"
+        {
+            uses.nums.insert(a.value.clone());
+        }
         for a in attrs.iter().filter(|a| is_rid(a)) {
             if seen.insert(a.value.clone()) {
                 uses.rids.push(a.value.clone());
@@ -661,6 +752,8 @@ struct Rewrite {
     rids: Option<HashMap<String, String>>,
     /// Old to new style ids.
     styles: HashMap<String, String>,
+    /// Old to new `w:numId`s.
+    nums: HashMap<String, String>,
     /// Set when theme links come off this document's content.
     theme: Option<Theme>,
     /// The style for paragraphs and tables with none, when not the output's default.
@@ -695,6 +788,14 @@ impl Rewrite {
             )
             && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "val")
             && let Some(new) = self.styles.get(&a.value)
+        {
+            changed |= *new != a.value;
+            a.value = new.clone();
+        }
+        if ns == W
+            && local == "numId"
+            && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "val")
+            && let Some(new) = self.nums.get(&a.value)
         {
             changed |= *new != a.value;
             a.value = new.clone();

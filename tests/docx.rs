@@ -224,3 +224,54 @@ fn first_mode_folds_nothing_and_keeps_theme_links() {
     assert!(report.warnings.list().is_empty());
     assert!(!text(&parts, "word/styles.xml").contains("Normal_2"));
 }
+
+/// The values of an attribute on an element, in order.
+fn values(xml: &str, element: &str, attr: &str) -> Vec<String> {
+    xml.split(&format!("<{element} "))
+        .skip(1)
+        .filter_map(|s| {
+            let tag = &s[..s.find('>')?];
+            let v = tag.split(&format!("{attr}=\"")).nth(1)?;
+            Some(v[..v.find('"')?].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn each_documents_lists_restart_with_their_own_ids() {
+    for mode in [StyleMode::Keep, StyleMode::First] {
+        let (_, parts) = merged_with("lists", &["a.docx", "b.docx"], mode);
+        let numbering = text(&parts, "word/numbering.xml");
+        let nsids = values(&numbering, "w:nsid", "w:val");
+        let unique: std::collections::HashSet<_> = nsids.iter().collect();
+        assert_eq!(unique.len(), nsids.len(), "{nsids:?}");
+        let ids = values(&numbering, "w:num", "w:numId");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        let abstracts = values(&numbering, "w:abstractNum", "w:abstractNumId");
+        let targets = values(&numbering, "w:abstractNumId", "w:val");
+        assert!(targets.iter().all(|t| abstracts.contains(t)), "{targets:?}");
+        // Schema order: every abstract before the first num.
+        assert!(numbering.rfind("<w:abstractNum ").unwrap() < numbering.find("<w:num ").unwrap());
+        let doc = text(&parts, "word/document.xml");
+        let split = doc.find("The end of A.").unwrap();
+        let (a, b) = doc.split_at(split);
+        let a_nums = values(a, "w:numId", "w:val");
+        let b_nums = values(b, "w:numId", "w:val");
+        assert!(!b_nums.is_empty());
+        assert!(
+            b_nums
+                .iter()
+                .all(|n| !a_nums.contains(n) && ids.contains(n))
+        );
+    }
+}
+
+#[test]
+fn a_base_with_no_numbering_gets_the_part() {
+    let (_, parts) = merged("new-numbering", &["c.docx", "a.docx"]);
+    let numbering = text(&parts, "word/numbering.xml");
+    assert!(numbering.contains("<w:abstractNum "));
+    assert!(text(&parts, "[Content_Types].xml").contains("/word/numbering.xml"));
+    assert!(text(&parts, "word/_rels/document.xml.rels").contains("numbering.xml"));
+}
