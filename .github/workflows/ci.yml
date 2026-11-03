@@ -28,18 +28,16 @@ jobs:
       - run: cargo deny check licenses
   validity:
     runs-on: ubuntu-latest
-    env:
-      OUT: ${{ runner.temp }}/out
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: DOC_MERGE_OUT="$OUT" cargo test --locked --test office -- --ignored
+      - run: DOC_MERGE_OUT="$RUNNER_TEMP/out" cargo test --locked --test office -- --ignored
       - name: LibreOffice converts every merged file
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui
-          soffice --headless --convert-to pdf --outdir "$RUNNER_TEMP/pdf" "$OUT"/*
-          for f in "$OUT"/*; do
+          soffice --headless --convert-to pdf --outdir "$RUNNER_TEMP/pdf" "$RUNNER_TEMP/out"/*
+          for f in "$RUNNER_TEMP/out"/*; do
             test -s "$RUNNER_TEMP/pdf/$(basename "${f%.*}").pdf"
           done
       - name: The Open XML SDK finds nothing in them that the inputs lacked
@@ -70,4 +68,4 @@ jobs:
           }
           return failed ? 1 : 0;
           CS
-          dotnet run -- "$GITHUB_WORKSPACE/tests/fixtures" "$OUT"
+          dotnet run -- "$GITHUB_WORKSPACE/tests/fixtures" "$RUNNER_TEMP/out"
