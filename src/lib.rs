@@ -124,26 +124,60 @@ pub struct Input {
     pub output_sections: Option<[usize; 2]>,
 }
 
+/// A name the merge changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Rename {
+    pub input: usize,
+    pub kind: &'static str,
+    pub from: String,
+    pub to: String,
+}
+
+/// At most this many renames are listed; the rest are counted.
+const MAX_RENAMES: usize = 1_000;
+
 /// What a merge did, in the shape `--json` prints.
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub output: Output,
     pub inputs: Vec<Input>,
+    pub renames: Vec<Rename>,
+    pub renames_omitted: usize,
     pub warnings: Warnings,
     pub elapsed_ms: u64,
 }
 
+/// How clashing Word styles are settled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StyleMode {
+    /// Each document keeps its look; clashing styles are copied under new names.
+    #[default]
+    Keep,
+    /// The first document's definitions win.
+    First,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    pub styles: StyleMode,
+}
+
 /// Merges `paths` (the first is the base) into a new file at `output`.
-pub fn merge(paths: &[PathBuf], output: &Path, deadline: Option<Instant>) -> Result<Report, Error> {
+pub fn merge(
+    paths: &[PathBuf],
+    output: &Path,
+    options: &Options,
+    deadline: Option<Instant>,
+) -> Result<Report, Error> {
     let started = Instant::now();
     let run = Run::new(deadline);
     let mut inputs = open_inputs(paths, &run)?;
     let mut warnings = Warnings::default();
     let family = inputs[0].kind.family();
-    let (plan, counts) = match family {
+    let (plan, counts, mut renames) = match family {
         Family::Word => {
-            let m = docx::merge(&mut inputs, &mut warnings)?;
-            (m.plan, m.sections)
+            let m = docx::merge(&mut inputs, options.styles, &mut warnings)?;
+            (m.plan, m.sections, m.renames)
         }
         _ => return Err(Error::internal("only Word documents can be merged so far")),
     };
@@ -163,6 +197,8 @@ pub fn merge(paths: &[PathBuf], output: &Path, deadline: Option<Instant>) -> Res
             }
         })
         .collect();
+    let renames_omitted = renames.len().saturating_sub(MAX_RENAMES);
+    renames.truncate(MAX_RENAMES);
     Ok(Report {
         output: Output {
             path: std::path::absolute(output).unwrap_or_else(|_| output.into()),
@@ -170,6 +206,8 @@ pub fn merge(paths: &[PathBuf], output: &Path, deadline: Option<Instant>) -> Res
             bytes,
         },
         inputs,
+        renames,
+        renames_omitted,
         warnings,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })

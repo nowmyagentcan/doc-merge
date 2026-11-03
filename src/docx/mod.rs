@@ -1,16 +1,20 @@
 //! Word: the bodies joined in order, every appended document starting on a new page with its
-//! own sections, and the parts its content points to copied with new relationship ids.
+//! own sections, its styles mapped or copied (`styles`), and the parts its content points to
+//! copied with new relationship ids.
 
-use std::collections::{HashMap, HashSet};
+pub mod styles;
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 
 use quick_xml::events::{BytesStart, Event};
 
-use crate::Origin;
 use crate::error::{Error, Warnings};
-use crate::package::{MAX_PARSED, MAX_STREAMED, Package, Rel, rels_name, resolve};
+use crate::package::{MAX_PARSED, MAX_STREAMED, Package, RELS_TYPE, Rel, rels_name, resolve};
 use crate::writer::{Body, Plan, R, relative, rels_xml};
-use crate::xml::{self, Attr, MC, Reader, XMLNS, start_tag};
+use crate::xml::{self, Attr, MC, Node, Reader, XMLNS, start_tag};
+use crate::{Origin, Rename, StyleMode};
+use styles::{Sheet, Source};
 
 pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const O: &str = "urn:schemas-microsoft-com:office:office";
@@ -18,54 +22,170 @@ const DSP: &str = "http://schemas.microsoft.com/office/drawing/2008/diagram";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
 const DIAGRAM_DRAWING: &str =
     "http://schemas.microsoft.com/office/2007/relationships/diagramDrawing";
+const WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
 
-/// What a merge of Word documents gives besides the plan: each input's section count.
+/// What a merge of Word documents gives besides the plan.
 pub struct Merged {
     pub plan: Plan,
+    /// Each input's section count.
     pub sections: Vec<usize>,
+    pub renames: Vec<Rename>,
 }
 
-pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, Error> {
+/// A part a document points to by relationship type: its name, text and tree.
+struct Held {
+    part: String,
+    text: String,
+    tree: Node,
+}
+
+fn held(pkg: &mut Package, main: &str, rels: &[Rel], kind: &str) -> Result<Option<Held>, Error> {
+    let wanted = format!("{REL}{kind}");
+    let Some(r) = rels.iter().find(|r| r.kind == wanted && !r.external) else {
+        return Ok(None);
+    };
+    let part = resolve(main, &r.target).and_then(|t| pkg.find(&t).map(|e| e.name.clone()));
+    let Some(part) = part else {
+        return Err(pkg
+            .origin
+            .bad(&format!("{main} points to a missing part {}", r.target)));
+    };
+    let text = pkg.text(&part, MAX_PARSED)?;
+    let tree = xml::tree(&text, &part, &pkg.origin)?;
+    Ok(Some(Held { part, text, tree }))
+}
+
+pub fn merge(
+    inputs: &mut [Package],
+    mode: StyleMode,
+    warnings: &mut Warnings,
+) -> Result<Merged, Error> {
     let mut plan = Plan::base(&inputs[0], warnings)?;
     let main = inputs[0].main.clone();
-    let mut rels = Rels::new(inputs[0].rels_of(&main)?);
+    let base_rels = inputs[0].rels_of(&main)?;
+    let mut rels = Rels::new(base_rels.clone());
+    let base_styles = held(&mut inputs[0], &main, &base_rels, "styles")?;
+    let mut style_root = Prefixes::of(base_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
+    let mut out_styles = styles::Output::new(Sheet::new(base_styles.as_ref().map(|h| &h.tree)));
     let mut docs = vec![];
     let mut sections = vec![];
+    let mut renames = vec![];
     let mut root = Prefixes::default();
     for i in 0..inputs.len() {
         let part = inputs[i].main.clone();
         let origin = inputs[i].origin.clone();
         let text = inputs[i].text(&part, MAX_STREAMED)?;
-        let uses = scan(&text, &part, &origin)?;
+        let mut uses = scan(&text, &part, &origin)?;
         drop(text);
         sections.push(uses.sections);
+        let w = prefix_of(&uses.root, W).unwrap_or("w").to_string();
         if i == 0 {
             root = Prefixes::of(&uses.root);
             docs.push(Rewrite {
-                w: prefix_of(&uses.root, W).unwrap_or("w").into(),
+                w,
                 ..Rewrite::default()
             });
             continue;
         }
-        let mut rw = Rewrite {
-            rids: Some(HashMap::new()),
-            local: root.merge(&uses.root),
-            w: prefix_of(&uses.root, W).unwrap_or("w").into(),
-            appended: true,
-        };
         let own = inputs[i].rels_of(&part)?;
+        let mut stories = vec![];
         for id in &uses.rids {
             let Some(r) = own.iter().find(|r| &r.id == id) else {
                 return Err(origin.bad(&format!("{part} points to a missing relationship {id}")));
             };
-            let new = copy_rel(&mut plan, inputs, i, &part, r, &main, &mut rels)?;
+            if r.external || ![format!("{REL}header"), format!("{REL}footer")].contains(&r.kind) {
+                continue;
+            }
+            let Some(target) = resolve(&part, &r.target) else {
+                continue;
+            };
+            if inputs[i].has(&target) {
+                let text = inputs[i].text(&target, MAX_PARSED)?;
+                let found = scan(&text, &target, &origin)?;
+                uses.styles.extend(found.styles);
+                stories.push((id.clone(), target, text));
+            }
+        }
+        let doc_styles = held(&mut inputs[i], &part, &own, "styles")?;
+        let sheet = Sheet::new(doc_styles.as_ref().map(|h| &h.tree));
+        let plain = |n: &str| n.to_string();
+        let source = Source {
+            sheet: &sheet,
+            mode,
+            position: i + 1,
+            lists: &plain,
+            output_lists: &plain,
+        };
+        let mut seeds = uses.styles.clone();
+        seeds.extend(
+            ["paragraph", "table"]
+                .iter()
+                .filter_map(|k| sheet.default_of(k))
+                .map(String::from),
+        );
+        let mapped = out_styles.map(&source, &sheet.closure(&seeds, &|_| vec![]))?;
+        renames.extend(mapped.renames.iter().map(|(from, to)| Rename {
+            input: i + 1,
+            kind: "style",
+            from: from.clone(),
+            to: to.clone(),
+        }));
+        let mut rw = Rewrite {
+            rids: Some(HashMap::new()),
+            styles: mapped.ids,
+            local: root.merge(&uses.root),
+            w,
+            appended: true,
+        };
+        let local = style_root.merge(doc_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
+        for s in &mut out_styles.styles[mapped.copied] {
+            s.walk_mut(&mut |n| {
+                rw.attrs(&n.ns, &n.local, &mut n.attrs);
+            });
+            s.attrs.extend(local.iter().cloned());
+        }
+        let mut done = HashSet::new();
+        for id in &uses.rids {
+            let Some(r) = own.iter().find(|r| &r.id == id) else {
+                continue;
+            };
+            let (new, copied) = copy_rel(&mut plan, inputs, i, &part, r, &main, &mut rels)?;
             rw.rids.as_mut().unwrap().insert(id.clone(), new);
+            if let Some((_, source, text)) = stories.iter().find(|s| &s.0 == id)
+                && let Some(copied) = copied
+                && done.insert(copied.clone())
+            {
+                let body = story(text, source, &origin, &rw)?;
+                plan.replace(&copied, Body::Data(body));
+            }
         }
         docs.push(rw);
     }
+    let added: String = out_styles.added().iter().fold(String::new(), |mut s, n| {
+        n.write(&mut s);
+        s
+    });
+    let parts = Parts {
+        main: &main,
+        kind: "styles",
+        root_name: "styles",
+    };
+    let base_held = base_styles
+        .as_ref()
+        .map(|h| (h.part.as_str(), h.text.as_str()));
+    let origin = inputs[0].origin.clone();
+    let inserts: [(&[&str], &str); 1] = [(&[], &added)];
+    registry(
+        &mut plan,
+        &mut rels,
+        &parts,
+        base_held,
+        &style_root,
+        &inserts,
+        &origin,
+    )?;
     let root_attrs = root.attrs;
     let count = inputs.len();
-    let base_main = main.clone();
     plan.replace(
         &main,
         Body::Stream(Box::new(move |out, inputs| {
@@ -84,14 +204,128 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
             out.write_all(tail.as_bytes()).map_err(io)
         })),
     );
-    let doc_rels = rels_name(&base_main);
+    let doc_rels = rels_name(&main);
     if inputs[0].has(&doc_rels) {
         plan.replace(&doc_rels, Body::Data(rels_xml(&rels.list)));
     } else {
-        plan.type_part(&doc_rels, crate::package::RELS_TYPE, true);
+        plan.type_part(&doc_rels, RELS_TYPE, true);
         plan.add(doc_rels, Body::Data(rels_xml(&rels.list)), None);
     }
-    Ok(Merged { plan, sections })
+    Ok(Merged {
+        plan,
+        sections,
+        renames,
+    })
+}
+
+/// Which registry part is being written.
+struct Parts<'a> {
+    main: &'a str,
+    /// The relationship type's last word, also the part's file stem and content type word.
+    kind: &'a str,
+    root_name: &'a str,
+}
+
+/// Writes a registry part with `inserts` (see [`extend`]) when any has content: the base's
+/// part extended, or a new part when the base has none.
+fn registry(
+    plan: &mut Plan,
+    rels: &mut Rels,
+    parts: &Parts,
+    base: Option<(&str, &str)>,
+    root: &Prefixes,
+    inserts: &[(&[&str], &str)],
+    origin: &Origin,
+) -> Result<(), Error> {
+    if inserts.iter().all(|i| i.1.is_empty()) {
+        return Ok(());
+    }
+    if let Some((part, text)) = base {
+        let bytes = extend(text, part, origin, &root.attrs, inserts)?;
+        plan.replace(part, Body::Data(bytes));
+        return Ok(());
+    }
+    let w = prefix_of(&root.attrs, W).unwrap_or("w");
+    let name = format!("{w}:{}", parts.root_name);
+    let mut text =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n");
+    text += &start_tag(&name, &root.attrs, false);
+    for (_, content) in inserts {
+        text += content;
+    }
+    text += &format!("</{name}>");
+    let part = plan.claim(&format!("word/{}.xml", parts.kind));
+    plan.type_part(&part, &format!("{WML}{}+xml", parts.kind), false);
+    let target = relative(parts.main, &part);
+    rels.add(&format!("{REL}{}", parts.kind), target, false);
+    plan.add(part, Body::Data(text.into_bytes()), None);
+    Ok(())
+}
+
+/// A registry part with its root's attributes replaced and new top-level content added. Each
+/// insert goes before the first top-level element it names, or at the end of the root.
+fn extend(
+    text: &str,
+    part: &str,
+    origin: &Origin,
+    root: &[Attr],
+    inserts: &[(&[&str], &str)],
+) -> Result<Vec<u8>, Error> {
+    let mut r = Reader::new(text, part, origin);
+    let mut buf = Vec::with_capacity(text.len());
+    let mut next = 0;
+    loop {
+        let event = r.event()?;
+        match &event {
+            Event::Eof => return Ok(buf),
+            Event::Start(e) | Event::Empty(e) => {
+                let empty = matches!(event, Event::Empty(_));
+                let depth = r.depth() - usize::from(!empty);
+                if depth == 0 {
+                    buf.extend(start_tag(e.name().as_ref(), root, false).as_bytes());
+                    if empty {
+                        for (_, content) in inserts {
+                            buf.extend(content.as_bytes());
+                        }
+                        buf.extend(format!("</{}>", e.name().as_ref()).as_bytes());
+                    }
+                    continue;
+                }
+                if depth == 1 {
+                    let local = e.local_name();
+                    while next < inserts.len() && inserts[next].0.contains(&local.as_ref()) {
+                        buf.extend(inserts[next].1.as_bytes());
+                        next += 1;
+                    }
+                }
+                put(&mut buf, &event);
+            }
+            Event::End(_) => {
+                if r.depth() == 0 {
+                    for (_, content) in &inserts[next..] {
+                        buf.extend(content.as_bytes());
+                    }
+                }
+                put(&mut buf, &event);
+            }
+            _ => put(&mut buf, &event),
+        }
+    }
+}
+
+/// A header or footer with the rewrite applied.
+fn story(text: &str, part: &str, origin: &Origin, rw: &Rewrite) -> Result<Vec<u8>, Error> {
+    let mut r = Reader::new(text, part, origin);
+    let mut buf = Vec::with_capacity(text.len());
+    loop {
+        let event = r.event()?;
+        match &event {
+            Event::Eof => return Ok(buf),
+            Event::Start(e) => start(&r, e, false, rw, false, false, &mut buf)?,
+            Event::Empty(e) => start(&r, e, true, rw, false, false, &mut buf)?,
+            _ => put(&mut buf, &event),
+        }
+    }
 }
 
 fn io(e: std::io::Error) -> Error {
@@ -135,7 +369,7 @@ impl Rels {
 }
 
 /// Copies what relationship `r` of `part` (in input `i`) points to into the output, and adds a
-/// relationship to it from the output's part `to`. Returns the new relationship id.
+/// relationship to it from the output's part `to`. Returns the new id and the copy's name.
 pub fn copy_rel(
     plan: &mut Plan,
     inputs: &mut [Package],
@@ -144,9 +378,9 @@ pub fn copy_rel(
     r: &Rel,
     to: &str,
     rels: &mut Rels,
-) -> Result<String, Error> {
+) -> Result<(String, Option<String>), Error> {
     if r.external {
-        return Ok(rels.add(&r.kind, r.target.clone(), true));
+        return Ok((rels.add(&r.kind, r.target.clone(), true), None));
     }
     let target = resolve(part, &r.target).and_then(|t| inputs[i].find(&t).map(|e| e.name.clone()));
     let Some(target) = target else {
@@ -157,7 +391,8 @@ pub fn copy_rel(
     if r.kind == format!("{REL}diagramData") {
         diagram_drawing(plan, inputs, i, part, &target, &copied, to, rels)?;
     }
-    Ok(rels.add(&r.kind, relative(to, &copied), false))
+    let id = rels.add(&r.kind, relative(to, &copied), false);
+    Ok((id, Some(copied)))
 }
 
 /// A SmartArt diagram's data names its drawing by a relationship id of the part that shows the
@@ -191,7 +426,7 @@ fn diagram_drawing(
         let Some(r) = own.iter().find(|r| r.id == id && r.kind == DIAGRAM_DRAWING) else {
             continue;
         };
-        let new = copy_rel(plan, inputs, i, part, &r.clone(), to, rels)?;
+        let (new, _) = copy_rel(plan, inputs, i, part, &r.clone(), to, rels)?;
         map.insert(id, new);
     }
     tree.walk_mut(&mut |n| {
@@ -306,6 +541,7 @@ impl Prefixes {
 struct Uses {
     /// Relationship ids, in the order first met.
     rids: Vec<String>,
+    styles: BTreeSet<String>,
     sections: usize,
     root: Vec<Attr>,
 }
@@ -363,6 +599,12 @@ fn scan(text: &str, part: &str, origin: &Origin) -> Result<Uses, Error> {
             uses.sections += 1;
             body_sect |= stack.last() == Some(&Tag::Body);
         }
+        if r.element_ns(e) == W
+            && matches!(e.local_name().as_ref(), "pStyle" | "rStyle" | "tblStyle")
+            && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "val")
+        {
+            uses.styles.insert(a.value.clone());
+        }
         for a in attrs.iter().filter(|a| is_rid(a)) {
             if seen.insert(a.value.clone()) {
                 uses.rids.push(a.value.clone());
@@ -381,6 +623,8 @@ fn scan(text: &str, part: &str, origin: &Origin) -> Result<Uses, Error> {
 struct Rewrite {
     /// Old to new relationship ids (body only).
     rids: Option<HashMap<String, String>>,
+    /// Old to new style ids.
+    styles: HashMap<String, String>,
     /// Declarations each top-level element brings because the output root binds their prefix
     /// to another namespace.
     local: Vec<Attr>,
@@ -391,8 +635,26 @@ struct Rewrite {
 
 impl Rewrite {
     /// Rewrites the attributes of an element; true when something changed.
-    fn attrs(&self, attrs: &mut [Attr]) -> bool {
+    fn attrs(&self, ns: &str, local: &str, attrs: &mut [Attr]) -> bool {
         let mut changed = false;
+        if ns == W
+            && matches!(
+                local,
+                "pStyle"
+                    | "rStyle"
+                    | "tblStyle"
+                    | "basedOn"
+                    | "next"
+                    | "link"
+                    | "styleLink"
+                    | "numStyleLink"
+            )
+            && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "val")
+            && let Some(new) = self.styles.get(&a.value)
+        {
+            changed |= *new != a.value;
+            a.value = new.clone();
+        }
         if let Some(rids) = &self.rids {
             for a in attrs.iter_mut().filter(|a| is_rid(a)) {
                 if let Some(new) = rids.get(&a.value) {
@@ -652,7 +914,7 @@ fn start<'a>(
         return Ok(());
     }
     let mut attrs = r.attrs(e)?;
-    let mut changed = rw.attrs(&mut attrs);
+    let mut changed = rw.attrs(r.element_ns(e), e.local_name().as_ref(), &mut attrs);
     if top && !rw.local.is_empty() {
         attrs.extend(rw.local.iter().cloned());
         changed = true;

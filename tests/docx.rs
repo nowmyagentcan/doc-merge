@@ -3,7 +3,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use doc_merge::{Report, merge};
+use doc_merge::{Options, Report, StyleMode, merge};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -15,7 +15,7 @@ fn fixture(name: &str) -> PathBuf {
 fn merged(test: &str, names: &[&str]) -> (Report, Vec<(String, Vec<u8>)>) {
     let out = temp_dir(test).join("out.docx");
     let paths: Vec<PathBuf> = names.iter().map(|n| fixture(n)).collect();
-    let report = merge(&paths, &out, None).unwrap();
+    let report = merge(&paths, &out, &Options::default(), None).unwrap();
     let parts = entries(&out);
     (report, parts)
 }
@@ -123,8 +123,8 @@ fn untouched_parts_are_copied_byte_for_byte_and_runs_repeat() {
     }
     let dir = temp_dir("twice");
     let paths: Vec<PathBuf> = names.iter().map(|n| fixture(n)).collect();
-    merge(&paths, &dir.join("1.docx"), None).unwrap();
-    merge(&paths, &dir.join("2.docx"), None).unwrap();
+    merge(&paths, &dir.join("1.docx"), &Options::default(), None).unwrap();
+    merge(&paths, &dir.join("2.docx"), &Options::default(), None).unwrap();
     assert_eq!(
         std::fs::read(dir.join("1.docx")).unwrap(),
         std::fs::read(dir.join("2.docx")).unwrap()
@@ -146,4 +146,46 @@ fn smartart_keeps_its_drawing() {
         .find(|r| r.contains(&format!("Id=\"{id}\"")))
         .unwrap();
     assert!(rel.contains("diagramDrawing") && rel.contains("diagrams/drawing1.xml"));
+}
+
+fn merged_with(test: &str, names: &[&str], styles: StyleMode) -> (Report, Vec<(String, Vec<u8>)>) {
+    let out = temp_dir(test).join("out.docx");
+    let paths: Vec<PathBuf> = names.iter().map(|n| fixture(n)).collect();
+    let report = merge(&paths, &out, &Options { styles }, None).unwrap();
+    let parts = entries(&out);
+    (report, parts)
+}
+
+#[test]
+fn clashing_styles_are_copied_under_new_names() {
+    let (report, parts) = merged("keep", &["a.docx", "b.docx"]);
+    let styles = text(&parts, "word/styles.xml");
+    assert!(styles.contains(r#"w:styleId="ClauseText_2""#));
+    assert!(styles.contains(r#"<w:name w:val="ClauseText (2)"/>"#));
+    assert!(styles.contains(r#"<w:name w:val="Heading 1 (2)"/>"#));
+    let renamed: Vec<_> = report.renames.iter().map(|r| r.to.as_str()).collect();
+    assert!(renamed.contains(&"ClauseText (2)"), "{renamed:?}");
+    assert!(
+        report
+            .renames
+            .iter()
+            .all(|r| r.input == 2 && r.kind == "style")
+    );
+    let doc = text(&parts, "word/document.xml");
+    let b = &doc[doc.find("Title of B").unwrap()..];
+    assert!(b.contains(r#"<w:pStyle w:val="ClauseText_2"/>"#));
+    assert!(!b.contains(r#"<w:pStyle w:val="ClauseText"/>"#));
+    let a = &doc[..doc.find("Title of B").unwrap()];
+    assert!(a.contains(r#"<w:pStyle w:val="ClauseText"/>"#));
+    assert_eq!(count(&styles, "</w:styles>"), 1);
+}
+
+#[test]
+fn first_mode_takes_the_first_documents_styles() {
+    let (report, parts) = merged_with("first", &["a.docx", "b.docx"], StyleMode::First);
+    assert_eq!(report.renames, []);
+    let doc = text(&parts, "word/document.xml");
+    let b = &doc[doc.find("Title of B").unwrap()..];
+    assert!(b.contains(r#"<w:pStyle w:val="ClauseText"/>"#));
+    assert!(!text(&parts, "word/styles.xml").contains("ClauseText_2"));
 }
