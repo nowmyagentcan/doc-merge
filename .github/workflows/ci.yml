@@ -26,3 +26,48 @@ jobs:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check licenses
+  validity:
+    runs-on: ubuntu-latest
+    env:
+      OUT: ${{ runner.temp }}/out
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: DOC_MERGE_OUT="$OUT" cargo test --locked --test office -- --ignored
+      - name: LibreOffice converts every merged file
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui
+          soffice --headless --convert-to pdf --outdir "$RUNNER_TEMP/pdf" "$OUT"/*
+          for f in "$OUT"/*; do
+            test -s "$RUNNER_TEMP/pdf/$(basename "${f%.*}").pdf"
+          done
+      - name: The Open XML SDK finds nothing in them that the inputs lacked
+        run: |
+          mkdir "$RUNNER_TEMP/check" && cd "$RUNNER_TEMP/check"
+          dotnet new console --force
+          dotnet add package DocumentFormat.OpenXml --version 3.5.1
+          cat > Program.cs <<'CS'
+          using DocumentFormat.OpenXml;
+          using DocumentFormat.OpenXml.Packaging;
+          using DocumentFormat.OpenXml.Validation;
+          var validator = new OpenXmlValidator(FileFormatVersions.Microsoft365);
+          IEnumerable<ValidationErrorInfo> Errors(string path)
+          {
+              using var doc = WordprocessingDocument.Open(path, false);
+              return validator.Validate(doc).ToList();
+          }
+          var known = Directory.GetFiles(args[0], "*.docx").SelectMany(Errors)
+              .Select(e => e.Description).ToHashSet();
+          var failed = false;
+          foreach (var path in Directory.GetFiles(args[1]))
+          {
+              foreach (var e in Errors(path).Where(e => !known.Contains(e.Description)))
+              {
+                  failed = true;
+                  Console.WriteLine($"{Path.GetFileName(path)}: {e.Part?.Uri} {e.Path?.XPath}: {e.Description}");
+              }
+          }
+          return failed ? 1 : 0;
+          CS
+          dotnet run -- "$GITHUB_WORKSPACE/tests/fixtures" "$OUT"
