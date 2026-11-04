@@ -869,9 +869,9 @@ fn the_same_theme_and_palette_keep_their_links() {
 }
 
 /// `theme` as a theme part of the workbook with its colours and fonts.
-fn with_theme(parts: &mut Vec<(String, Vec<u8>)>, dark: &str, minor: &str) {
+fn with_theme(parts: &mut Vec<(String, Vec<u8>)>, dark: &str, accent: &str, minor: &str) {
     let theme = format!(
-        r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C"><a:dk1><a:sysClr val="windowText" lastClr="{dark}"/></a:dk1><a:lt1><a:srgbClr val="FEFEFE"/></a:lt1><a:dk2><a:srgbClr val="010203"/></a:dk2><a:lt2><a:srgbClr val="040506"/></a:lt2><a:accent1><a:srgbClr val="AA0001"/></a:accent1><a:accent2><a:srgbClr val="AA0002"/></a:accent2><a:accent3><a:srgbClr val="AA0003"/></a:accent3><a:accent4><a:srgbClr val="AA0004"/></a:accent4><a:accent5><a:srgbClr val="AA0005"/></a:accent5><a:accent6><a:srgbClr val="AA0006"/></a:accent6><a:hlink><a:srgbClr val="AA0007"/></a:hlink><a:folHlink><a:srgbClr val="AA0008"/></a:folHlink></a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Major Face"/></a:majorFont><a:minorFont><a:latin typeface="{minor}"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
+        r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C"><a:dk1><a:sysClr val="windowText" lastClr="{dark}"/></a:dk1><a:lt1><a:srgbClr val="FEFEFE"/></a:lt1><a:dk2><a:srgbClr val="010203"/></a:dk2><a:lt2><a:srgbClr val="040506"/></a:lt2><a:accent1><a:srgbClr val="{accent}0001"/></a:accent1><a:accent2><a:srgbClr val="{accent}0002"/></a:accent2><a:accent3><a:srgbClr val="{accent}0003"/></a:accent3><a:accent4><a:srgbClr val="{accent}0004"/></a:accent4><a:accent5><a:srgbClr val="{accent}0005"/></a:accent5><a:accent6><a:srgbClr val="{accent}0006"/></a:accent6><a:hlink><a:srgbClr val="{accent}0007"/></a:hlink><a:folHlink><a:srgbClr val="{accent}0008"/></a:folHlink></a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Major Face"/></a:majorFont><a:minorFont><a:latin typeface="{minor}"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
     );
     set(parts, "xl/theme/theme1.xml", theme.as_bytes());
     let types = text(parts, "[Content_Types].xml").replace(
@@ -891,7 +891,7 @@ fn colours_resolve_by_theme_index_with_their_tint() {
     let dir = temp_dir("theme-index");
     let mut a = book(&[("A", "")], None);
     with_styles(&mut a, &plain_styles("0.0", ""));
-    with_theme(&mut a, "000000", "Calibri");
+    with_theme(&mut a, "000000", "BB", "Calibri");
     let colours: String = (0..14)
         .map(|i| {
             format!(
@@ -907,7 +907,7 @@ fn colours_resolve_by_theme_index_with_their_tint() {
     let lists = plain_styles("0.0", dxfs).replace(FONTS_A, &fonts);
     let mut b = book(&[("B", "")], None);
     with_styles(&mut b, &lists);
-    with_theme(&mut b, "111111", "Minor Face");
+    with_theme(&mut b, "111111", "AA", "Minor Face");
     let sheet = format!(
         r#"<worksheet {SML_NS}><sheetPr><tabColor theme="9" tint="0.2"/></sheetPr><sheetData/><conditionalFormatting sqref="A1"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="formula" val="B!$A$1"/><color theme="4"/><color rgb="FF000000"/></colorScale></cfRule></conditionalFormatting></worksheet>"#
     );
@@ -924,13 +924,18 @@ fn colours_resolve_by_theme_index_with_their_tint() {
         "{out}"
     );
     for (i, rgb) in [
-        "FEFEFE", "111111", "040506", "010203", "AA0001", "AA0002", "AA0003", "AA0004", "AA0005",
-        "AA0006", "AA0007", "AA0008",
+        "111111", "AA0001", "AA0002", "AA0003", "AA0004", "AA0005", "AA0006", "AA0007", "AA0008",
     ]
     .iter()
-    .enumerate()
+    .zip([1, 4, 5, 6, 7, 8, 9, 10, 11])
+    .map(|(rgb, i)| (i, rgb))
     {
         let want = format!(r#"<sz val="{}"/><color rgb="FF{rgb}" tint="0.5"/>"#, 10 + i);
+        assert!(out.contains(&want), "{want} in {out}");
+    }
+    // Colours both themes share stay linked, so a table style can still override them.
+    for i in [0, 2, 3] {
+        let want = format!(r#"<sz val="{}"/><color theme="{i}" tint="0.5"/>"#, 10 + i);
         assert!(out.contains(&want), "{want} in {out}");
     }
     // Past the twelve there is nothing to resolve to.

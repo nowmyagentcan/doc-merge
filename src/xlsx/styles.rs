@@ -57,10 +57,26 @@ fn palette(sheet: Option<&Node>) -> Vec<String> {
     list
 }
 
+/// A theme's colours as `RRGGBB`, by theme index.
+fn scheme_colours(theme: &Node) -> Vec<String> {
+    let elements = theme.child(A, "themeElements");
+    let scheme = elements.and_then(|e| e.child(A, "clrScheme"));
+    SCHEME
+        .iter()
+        .map(|name| {
+            let colour = scheme.and_then(|s| s.child(A, name));
+            let value = colour.and_then(|c| c.nodes().next());
+            let rgb = value.and_then(|v| v.attr("", "val").filter(|_| v.local == "srgbClr"));
+            let system = value.and_then(|v| v.attr("", "lastClr"));
+            rgb.or(system).unwrap_or_default().to_string()
+        })
+        .collect()
+}
+
 /// What a workbook's own theme and palette mean, for when the output's are different.
 #[derive(Debug, Default)]
 pub struct Colours {
-    /// `RRGGBB` by theme index, empty when the themes are the same.
+    /// `RRGGBB` by theme index, empty when the themes are the same; an empty entry stays linked.
     theme: Vec<String>,
     /// The major and minor Latin typefaces, when the themes differ.
     fonts: Option<[String; 2]>,
@@ -82,18 +98,15 @@ impl Colours {
             theme.filter(|t| base_theme.map(xml::theme_form) != Some(xml::theme_form(t)))
         {
             let elements = t.child(A, "themeElements");
-            let scheme = elements.and_then(|e| e.child(A, "clrScheme"));
-            colours.theme = SCHEME
-                .iter()
-                .map(|name| {
-                    let colour = scheme.and_then(|s| s.child(A, name));
-                    let value = colour.and_then(|c| c.nodes().next());
-                    let rgb =
-                        value.and_then(|v| v.attr("", "val").filter(|_| v.local == "srgbClr"));
-                    let system = value.and_then(|v| v.attr("", "lastClr"));
-                    rgb.or(system).unwrap_or_default().to_string()
-                })
-                .collect();
+            // A colour both themes share keeps its link: Excel lets a table style override
+            // a linked font colour, but not a literal one.
+            let there = base_theme.map_or(vec![], scheme_colours);
+            colours.theme = scheme_colours(t);
+            for (own, base) in colours.theme.iter_mut().zip(&there) {
+                if own == base {
+                    own.clear();
+                }
+            }
             let face = |family: &str| {
                 let fonts = elements.and_then(|e| e.child(A, "fontScheme"));
                 let font = fonts.and_then(|f| f.child(A, family));
