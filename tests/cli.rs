@@ -861,3 +861,46 @@ fn colour_needs_a_terminal_and_no_no_color() {
     let empty = in_a_terminal(&dir, &format!("NO_COLOR= {exe} a.pptx gone.pptx"), false);
     assert!(empty.contains("\x1b[31m✗"), "{empty:?}");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_with_no_arguments_gets_the_prompt() {
+    use std::io::Write;
+    let dir = folder("prompt", &["a.pptx", "b.pptx"]);
+    let mut session = Command::new("script")
+        .args(["-qec", env!("CARGO_BIN_EXE_doc-merge"), "/dev/null"])
+        .current_dir(&dir)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut typed = session.stdin.take().unwrap();
+    typed
+        .write_all(b"/help\n\"a.pptx\" b.pptx\na.pptx\n/nope\n/quit\n")
+        .unwrap();
+    let out = session.wait_with_output().unwrap();
+    let screen = stdout(&out).replace("\r\n", "\n");
+    for line in [
+        "│ ✻ doc-merge 0.1.0                        │\n",
+        "│   Merge PowerPoint, Excel or Word files. │\n",
+        "  Drop files here or type paths · /help · /quit\n",
+        "  /help    show this\n",
+        "  ✓ merged.pptx  ",
+        "  ✗ Give at least two files to merge (1 found).\n    Type two or more paths on one line.\n",
+        "  ✗ Unknown command '/nope'.\n    Try /help.\n",
+    ] {
+        assert!(screen.contains(line), "{line} in {screen}");
+    }
+    assert!(dir.join("merged.pptx").is_file());
+}
+
+#[test]
+fn no_arguments_without_a_terminal_are_a_usage_error() {
+    let out = bin().stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr(&out),
+        "✗ No files given.\n  Try: doc-merge a.pptx b.pptx -o all.pptx\n"
+    );
+}

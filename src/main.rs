@@ -1,9 +1,10 @@
 //! The command line: `doc-merge [merge] <PATH>... [OPTIONS]`.
 
+mod interactive;
 mod text;
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,6 +160,7 @@ fn catch_interrupts() {
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().collect();
+    let bare = args.len() == 1;
     // Only an exact first argument is a command: `./merge` is a file.
     match args.get(1).and_then(|a| a.to_str()) {
         Some("ui") => return command::<Ui>(&args[1..], "ui"),
@@ -185,7 +187,14 @@ fn main() -> ExitCode {
     let mut code = 0;
     let mut out = Out::new(io::stdout().lock(), Look::stdout());
     let mut err = Out::new(io::stderr(), Look::stderr());
-    match run(&cli, &mut out, &mut err, &mut code) {
+    let done = if bare && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        interactive::run(io::stdin().lock(), &mut out, &mut err, |paths, out, err| {
+            ask(paths, out, err, &mut code)
+        })
+    } else {
+        run(&cli, &mut out, &mut err, &mut code)
+    };
+    match done {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
             drop(out);
             fail(&Error::write_failed("the output stream", &e), false)
@@ -210,6 +219,24 @@ fn command<T: Parser>(args: &[OsString], name: &str) -> ExitCode {
     }
 }
 
+/// One line of interactive mode: merged with the defaults, whatever exit code it earns; only a
+/// Ctrl+C ends the session, with its code.
+fn ask(
+    paths: Vec<PathBuf>,
+    out: &mut Out<impl Write>,
+    err: &mut Out<impl Write>,
+    code: &mut u8,
+) -> io::Result<bool> {
+    let cli = Cli {
+        paths,
+        ..Cli::default()
+    };
+    run(&cli, out, err, code)?;
+    let stopped = STOP.load(Ordering::SeqCst);
+    *code = if stopped { *code } else { 0 };
+    Ok(!stopped)
+}
+
 /// Merges `cli.paths` and prints how it went; `code` is set before anything is printed.
 fn run(
     cli: &Cli,
@@ -227,7 +254,14 @@ fn run(
             _ => StyleMode::Keep,
         },
     };
-    let merged = paths::expand(&cli.paths).and_then(|files| {
+    let expanded = paths::expand(&cli.paths).map_err(|e| match err.prompted {
+        true if e.code == "need_two_files" => Error {
+            hint: Some("Type two or more paths on one line."),
+            ..e
+        },
+        _ => e,
+    });
+    let merged = expanded.and_then(|files| {
         let work = || {
             MERGING.store(true, Ordering::SeqCst);
             let merged = guarded(|| merge(&files, &target, &options, None));
