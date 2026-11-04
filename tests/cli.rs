@@ -847,6 +847,7 @@ fn colour_needs_a_terminal_and_no_no_color() {
         screen.contains("\x1b[31m✗\x1b[0m No file at 'gone.pptx'."),
         "{screen:?}"
     );
+    assert!(!screen.contains("doc-merge 0.1.0"), "no banner: {screen:?}");
     let screen = in_a_terminal(&dir, &format!("{exe} a.pptx b.pptx -o 2.pptx"), true);
     assert!(
         screen.contains("✓ 2.pptx  ") && !screen.contains('\x1b'),

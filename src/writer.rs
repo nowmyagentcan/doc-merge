@@ -630,11 +630,12 @@ struct Counted<'a, W: Write> {
 
 impl<W: Write> Write for Counted<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.n += buf.len() as u64;
+        let written = self.inner.write(buf)?;
+        self.n += written as u64;
         if self.n > MAX_OUTPUT {
             return Err(std::io::Error::other("part over 2 GiB"));
         }
-        self.inner.write(buf)
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -746,6 +747,30 @@ pub fn write(plan: Plan, inputs: &mut [Package], place: &Place) -> Result<(u64, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_part_counts_what_was_taken_not_what_was_offered() {
+        // A deflate writer takes part of a buffer at a time, as this one does.
+        struct Slow(u64);
+        impl Write for Slow {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(10);
+                self.0 += n as u64;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut slow = Slow(0);
+        let mut out = Counted {
+            inner: &mut slow,
+            n: 0,
+        };
+        out.write_all(&[0; 1000]).unwrap();
+        assert_eq!(out.n, 1000);
+        assert_eq!(slow.0, 1000);
+    }
 
     #[test]
     fn names_take_the_lowest_free_number() {
