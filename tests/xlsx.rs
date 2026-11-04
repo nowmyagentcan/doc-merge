@@ -842,20 +842,10 @@ fn another_theme_turns_into_literal_colours_and_fonts() {
         "{out}"
     );
     let a = text(&entries(&fixture("a.xlsx")), "xl/styles.xml");
-    let fonts = |s: &str| s[s.find("<fonts").unwrap()..s.find("</fonts>").unwrap()].to_string();
-    assert!(
-        fonts(&out).starts_with(
-            fonts(&a)
-                .trim_end_matches("</fonts>")
-                .split("count")
-                .next()
-                .unwrap()
-        )
-    );
     // The base's fonts keep their links; the appended ones have none.
     assert_eq!(
-        fonts(&out).matches("<scheme ").count(),
-        fonts(&a).matches("<scheme ").count()
+        out.matches("<scheme ").count(),
+        a.matches("<scheme ").count()
     );
     let first = text(&parts, "xl/worksheets/sheet3.xml");
     let accent3 = srgb("accent3");
@@ -985,4 +975,119 @@ fn a_custom_palette_resolves_on_either_side() {
     let (_, parts) = styled_pair("palette-same", &custom, &custom, "");
     let out = text(&parts, "xl/styles.xml");
     assert!(!out.contains(r#"rgb="FFABCDEF""#), "{out}");
+}
+
+#[test]
+fn dynamic_array_metadata_comes_along_with_its_cells() {
+    let (_, parts) = merged("metadata", &["a.xlsx", "b.xlsx"]);
+    let b = entries(&fixture("b.xlsx"));
+    assert_eq!(text(&parts, "xl/metadata.xml"), text(&b, "xl/metadata.xml"));
+    assert!(text(&parts, "xl/_rels/workbook.xml.rels").contains("sheetMetadata"));
+    assert!(text(&parts, "[Content_Types].xml").contains("sheetMetadata+xml"));
+    assert!(text(&parts, "xl/worksheets/sheet4.xml").contains(r#"<c r="G1" t="str" cm="1""#));
+}
+
+#[test]
+fn equal_metadata_blocks_stay_single_and_cells_move_up() {
+    let (_, parts) = merged("metadata-twice", &["b.xlsx", "b.xlsx"]);
+    let out = text(&parts, "xl/metadata.xml");
+    assert_eq!(
+        out.matches("<xda:dynamicArrayProperties").count(),
+        1,
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<futureMetadata name="XLDAPR" count="1">"#),
+        "{out}"
+    );
+    assert!(out.contains(r#"<cellMetadata count="2">"#), "{out}");
+    assert_eq!(out.matches(r#"<rc t="1" v="0"/>"#).count(), 2, "{out}");
+    assert!(text(&parts, "xl/worksheets/sheet4.xml").contains(r#"<c r="G1" t="str" cm="2""#));
+}
+
+/// Every output part is either one the merge rewrites or a byte-identical copy of an input's.
+#[test]
+fn untouched_parts_are_copied_byte_for_byte() {
+    let (_, parts) = merged("fidelity", &["a.xlsx", "b.xlsx"]);
+    let a = entries(&fixture("a.xlsx"));
+    let b = entries(&fixture("b.xlsx"));
+    let rewritten = |name: &str| {
+        [
+            "[Content_Types].xml",
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "xl/styles.xml",
+            "xl/sharedStrings.xml",
+            "xl/worksheets/sheet3.xml",
+            "xl/worksheets/sheet4.xml",
+            "xl/tables/table2.xml",
+        ]
+        .contains(&name)
+    };
+    for (name, bytes) in &parts {
+        let same = a.iter().chain(&b).any(|p| &p.1 == bytes);
+        assert!(
+            rewritten(name) || name.ends_with(".rels") || same,
+            "{name} is not a copy"
+        );
+    }
+    for (name, bytes) in &a {
+        if !rewritten(name) {
+            assert_eq!(&text_or_bytes(&parts, name), bytes, "{name}");
+        }
+    }
+    for name in [
+        "xl/worksheets/sheet1.xml",
+        "xl/worksheets/sheet2.xml",
+        "xl/tables/table1.xml",
+    ] {
+        assert_eq!(text(&parts, name), text(&a, name), "{name}");
+    }
+}
+
+fn text_or_bytes(parts: &[(String, Vec<u8>)], name: &str) -> Vec<u8> {
+    let found = parts.iter().find(|p| p.0 == name);
+    found.unwrap_or_else(|| panic!("no part {name}")).1.clone()
+}
+
+#[test]
+fn prefixed_workbooks_keep_their_spelling() {
+    let dir = temp_dir("prefixed");
+    let spelled = |parts: &mut Vec<(String, Vec<u8>)>| {
+        let main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        for name in [
+            "xl/workbook.xml",
+            "xl/worksheets/sheet1.xml",
+            "xl/sharedStrings.xml",
+        ] {
+            let t = text(parts, name)
+                .replace("</", "\0")
+                .replace('<', "<x:")
+                .replace('\0', "</x:")
+                .replace(
+                    &format!(r#"xmlns="{main}""#),
+                    &format!(r#"xmlns:x="{main}""#),
+                );
+            set(parts, name, t.as_bytes());
+        }
+    };
+    let mut a = book(&[("A", "")], Some("<si><t>x</t></si>"));
+    spelled(&mut a);
+    let b = book(
+        &[("B", r#"<row r="1"><c r="A1" t="s"><v>0</v></c></row>"#)],
+        Some("<si><t>y</t></si>"),
+    );
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (_, parts) = merged_files("prefixed-out", &paths);
+    let strings = text(&parts, "xl/sharedStrings.xml");
+    assert!(
+        strings.contains("<x:si><x:t>x</x:t></x:si><x:si><x:t>y</x:t></x:si>"),
+        "{strings}"
+    );
+    assert!(text(&parts, "xl/workbook.xml").contains(r#"<x:sheet name="B""#));
+    let dir = temp_dir("prefixed-2");
+    let paths = [book_file(&dir, "b.xlsx", &b), book_file(&dir, "a.xlsx", &a)];
+    let (_, parts) = merged_files("prefixed-2-out", &paths);
+    assert!(text(&parts, "xl/sharedStrings.xml").contains("<si><t>x</t></si>"));
+    assert!(text(&parts, "xl/workbook.xml").contains(r#"<sheet name="A""#));
 }

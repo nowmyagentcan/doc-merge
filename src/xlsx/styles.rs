@@ -178,7 +178,7 @@ fn entries<'a>(sheet: Option<&'a Node>, list: &str) -> Vec<&'a Node> {
     list.iter().flat_map(|n| n.nodes()).collect()
 }
 
-fn form(node: &Node) -> String {
+pub fn form(node: &Node) -> String {
     let mut s = String::new();
     node.canonical(&mut s);
     s

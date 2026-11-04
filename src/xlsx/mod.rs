@@ -14,7 +14,7 @@ use quick_xml::events::{BytesStart, Event};
 use crate::error::{Error, Warning, Warnings, thousands};
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, Rel, resolve};
 use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
-use crate::xml::{self, Attr, Node, Reader, declaration, prefix_of, start_tag};
+use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, start_tag};
 use crate::{Origin, Rename, SheetName};
 
 pub const S: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -23,6 +23,7 @@ const SML: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml."
 const DECLARATION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n";
 const XM: &str = "http://schemas.microsoft.com/office/excel/2006/main";
 const X14: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+const DYNAMIC_ARRAYS: &str = "XLDAPR";
 const MAX_SHEETS: usize = 10_000;
 const NAME_ROUNDS: usize = 8;
 /// Excel's limit, counted in UTF-16 units.
@@ -393,6 +394,134 @@ struct Output {
     styles: styles::Output,
     base_styles: Option<Held>,
     base_theme: Option<Held>,
+    metadata: Metadata,
+}
+
+/// The output's dynamic-array metadata, if any workbook has some.
+#[derive(Default)]
+struct Metadata {
+    /// The base's part with its text.
+    part: Option<(String, String)>,
+    tree: Option<Node>,
+}
+
+impl Metadata {
+    /// Takes in an appended workbook's metadata; returns what its cells' `cm` numbers move by.
+    fn add(&mut self, held: Held) -> u32 {
+        let Some(out) = &mut self.tree else {
+            self.tree = Some(held.tree);
+            return 0;
+        };
+        let mut root = Prefixes::of(&out.attrs);
+        let local = root.merge(&held.tree.attrs);
+        out.attrs = root.attrs;
+        let own = prefix(out).to_string();
+        let adopted = |node: &Node| {
+            let mut n = node.clone();
+            n.walk_mut(&mut |e| {
+                if e.ns == S {
+                    e.name = format!("{own}{}", e.local);
+                }
+            });
+            n.attrs.extend(local.iter().cloned());
+            xml::Child::Node(n)
+        };
+        let type_of = |tree: &Node| {
+            let types = tree.child(S, "metadataTypes");
+            let list = types.iter().flat_map(|t| t.nodes());
+            list.into_iter()
+                .position(|n| n.attr("", "name") == Some(DYNAMIC_ARRAYS))
+        };
+        let wanted = type_of(&held.tree).map(|t| t + 1).unwrap_or(0).to_string();
+        let kind = match type_of(out) {
+            Some(t) => t + 1,
+            None => {
+                let types = out.child_or_insert(S, "metadataTypes", &[]);
+                let source = held.tree.child(S, "metadataTypes").into_iter();
+                let added = source.flat_map(|t| t.nodes());
+                let added = added.filter(|n| n.attr("", "name") == Some(DYNAMIC_ARRAYS));
+                types.children.extend(added.map(&adopted));
+                let n = types.nodes().count();
+                types.set_attr("", "", "count", &n.to_string());
+                n
+            }
+        };
+        let future = held
+            .tree
+            .nodes()
+            .find(|n| n.is(S, "futureMetadata") && n.attr("", "name") == Some(DYNAMIC_ARRAYS));
+        let there = out
+            .nodes_mut()
+            .find(|n| n.is(S, "futureMetadata") && n.attr("", "name") == Some(DYNAMIC_ARRAYS));
+        // Excel refuses a file with two equal blocks here.
+        let mut blocks = vec![];
+        match (there, future) {
+            (Some(there), Some(future)) => {
+                let mut known: HashMap<String, usize> = there
+                    .nodes()
+                    .enumerate()
+                    .map(|(i, n)| (styles::form(n), i))
+                    .collect();
+                for block in future.nodes() {
+                    let next = known.len();
+                    let at = *known.entry(styles::form(block)).or_insert(next);
+                    if at == next {
+                        there.children.push(adopted(block));
+                    }
+                    blocks.push(at);
+                }
+                there.set_attr("", "", "count", &known.len().to_string());
+            }
+            (None, Some(future)) => {
+                let at = out.children.iter().position(
+                    |c| matches!(c, xml::Child::Node(n) if n.ns == S && n.local == "cellMetadata"),
+                );
+                let at = at.unwrap_or(out.children.len());
+                out.children.insert(at, adopted(future));
+                blocks = (0..future.nodes().count()).collect();
+            }
+            _ => {}
+        }
+        let cells = out.child_or_insert(S, "cellMetadata", &["metadataTypes", "futureMetadata"]);
+        let moved = cells.nodes().count() as u32;
+        let source = held.tree.child(S, "cellMetadata").into_iter();
+        for block in source.flat_map(|c| c.nodes()) {
+            let mut block = match adopted(block) {
+                xml::Child::Node(n) => n,
+                xml::Child::Text(_) => unreachable!(),
+            };
+            for rc in block.nodes_mut() {
+                let own_kind = rc.attr("", "t").is_some_and(|t| t == wanted);
+                let v = rc.attr("", "v").and_then(|v| v.parse::<usize>().ok());
+                if let (true, Some(v)) = (own_kind, v.and_then(|v| blocks.get(v))) {
+                    rc.set_attr("", "", "t", &kind.to_string());
+                    rc.set_attr("", "", "v", &v.to_string());
+                }
+            }
+            cells.children.push(xml::Child::Node(block));
+        }
+        let n = cells.nodes().count();
+        cells.set_attr("", "", "count", &n.to_string());
+        moved
+    }
+
+    fn finish(self, plan: &mut Plan, rels: &mut Rels, main: &str) {
+        let Some(tree) = self.tree else {
+            return;
+        };
+        let head = self.part.as_ref().map(|(_, text)| declaration(text));
+        let mut text = head.unwrap_or(DECLARATION.to_string());
+        tree.write(&mut text);
+        match self.part {
+            Some((part, _)) => plan.replace(&part, Body::Data(text.into_bytes())),
+            None => {
+                let part = plan.claim("xl/metadata.xml");
+                plan.type_part(&part, &format!("{SML}sheetMetadata+xml"), false);
+                rels.add(&format!("{REL}sheetMetadata"), relative(main, &part), false);
+                plan.add(part, Body::Data(text.into_bytes()), None);
+            }
+        }
+    }
 }
 
 /// A table part as read.
@@ -497,6 +626,11 @@ impl Output {
         let strings = SharedStrings::new(pkg, book.related(pkg, "sharedStrings")?)?;
         let base_styles = book.held(pkg, "styles")?;
         let base_theme = book.held(pkg, "theme")?;
+        let metadata = book.held(pkg, "sheetMetadata")?;
+        let metadata = metadata.map_or(Metadata::default(), |h| Metadata {
+            part: Some((h.part, h.text)),
+            tree: Some(h.tree),
+        });
         let mut used = HashMap::new();
         for d in defined_names(&book, &pkg.origin)? {
             if d.sheet.is_none() {
@@ -522,6 +656,7 @@ impl Output {
             styles: styles::Output::new(base_styles.as_ref().map(|h| h.tree.clone())),
             base_styles,
             base_theme,
+            metadata,
             book,
         })
     }
@@ -731,8 +866,13 @@ impl Output {
             .styles
             .add(sheet, colours.as_ref(), &origin, &mut found.list)?;
         renames.append(&mut found.list);
+        let cell_metadata = match book.held(&mut inputs[i], "sheetMetadata")? {
+            Some(held) => self.metadata.add(held),
+            None => 0,
+        };
         let maps = Rc::new(Maps {
             strings,
+            cell_metadata,
             styles,
             colours,
             views: self.views,
@@ -851,9 +991,11 @@ impl Output {
             strings,
             styles,
             base_styles,
+            metadata,
             ..
         } = self;
         strings.finish(plan, &mut rels, &book.part, &base.origin)?;
+        metadata.finish(plan, &mut rels, &book.part);
         if let Some(sheet) = styles.finish() {
             let head = base_styles.as_ref().map(|h| declaration(&h.text));
             let mut text = head.unwrap_or(DECLARATION.to_string());
@@ -911,6 +1053,8 @@ impl Found {
 struct Maps {
     /// Shared-string indices.
     strings: Vec<u32>,
+    /// What `cm` numbers move by.
+    cell_metadata: u32,
     styles: styles::Map,
     /// Set when the appended workbook's theme or palette isn't the output's.
     colours: Option<styles::Colours>,
@@ -948,25 +1092,24 @@ impl Patcher<'_> {
     }
 }
 
-/// `e`'s start tag as written, with the attribute `name` set to `value`.
-fn with_attr(
+/// `e`'s start tag as written, with the attributes `set` set.
+fn with_attrs(
     r: &Reader,
     e: &BytesStart,
     empty: bool,
-    name: &str,
-    value: &str,
+    set: &[(&str, u32)],
 ) -> Result<String, Error> {
     let mut s = format!("<{}", e.name().as_ref());
-    let mut set = false;
+    let mut left = set.to_vec();
     for a in e.attributes() {
         let a = a.map_err(|e| r.malformed(&e.to_string()))?;
         let key: &str = a.key.as_ref();
-        let mine = key == name;
-        set |= mine;
-        let kept = if mine { value } else { &a.value };
-        s += &format!(" {key}=\"{}\"", kept.replace('"', "&quot;"));
+        match left.iter().position(|(name, _)| *name == key) {
+            Some(at) => s += &format!(" {key}=\"{}\"", left.swap_remove(at).1),
+            None => s += &format!(" {key}=\"{}\"", a.value.replace('"', "&quot;")),
+        }
     }
-    if !set {
+    for (name, value) in left {
         s += &format!(" {name}=\"{value}\"");
     }
     s += if empty { "/>" } else { ">" };
@@ -1036,20 +1179,25 @@ impl SheetJob<'_> {
                     cell = Some(e.clone());
                     string_cell = false;
                     let mut style = 0;
+                    let mut metadata = None;
                     for a in e.attributes() {
                         let a = a.map_err(|e| r.malformed(&e.to_string()))?;
                         match a.key.as_ref() {
                             "t" => string_cell = a.value == "s",
                             "s" => style = a.value.parse().unwrap_or(u32::MAX),
+                            "cm" => metadata = a.value.parse::<u32>().ok(),
                             _ => {}
                         }
                     }
                     let Some(new) = maps.styles.xf(style) else {
                         return Err(bad_format(style, place(&cell)));
                     };
-                    if new != style {
-                        let tag = with_attr(&r, e, empty, "s", &new.to_string())?;
-                        p.replace(start..end, &tag)?;
+                    let moved = metadata.filter(|_| maps.cell_metadata > 0);
+                    if new != style || moved.is_some() {
+                        let mut set = vec![];
+                        set.extend((new != style).then_some(("s", new)));
+                        set.extend(moved.map(|m| ("cm", m + maps.cell_metadata)));
+                        p.replace(start..end, &with_attrs(&r, e, empty, &set)?)?;
                     }
                 }
                 local @ ("row" | "col") if r.element_ns(e) == S => {
@@ -1059,8 +1207,7 @@ impl SheetJob<'_> {
                             return Err(bad_format(style, self.name.to_string()));
                         };
                         if new != style {
-                            let tag = with_attr(&r, e, empty, name, &new.to_string())?;
-                            p.replace(start..end, &tag)?;
+                            p.replace(start..end, &with_attrs(&r, e, empty, &[(name, new)])?)?;
                         }
                     }
                 }
@@ -1069,7 +1216,7 @@ impl SheetJob<'_> {
                         let Some(new) = maps.styles.dxfs.get(dxf as usize) else {
                             return Err(bad_format(dxf, self.name.to_string()));
                         };
-                        let tag = with_attr(&r, e, empty, "dxfId", &new.to_string())?;
+                        let tag = with_attrs(&r, e, empty, &[("dxfId", *new)])?;
                         p.replace(start..end, &tag)?;
                     }
                 }
