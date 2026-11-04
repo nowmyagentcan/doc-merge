@@ -291,11 +291,8 @@ fn remap(node: &mut Node, attr: &str, map: &[u32], origin: &Origin) -> Result<()
 impl Output {
     /// `sheet` is the base's, if it has one.
     pub fn new(sheet: Option<Node>) -> Self {
-        let sheet = sheet.unwrap_or_else(|| {
-            let mut declaration = Attr::new("xmlns", xml::XMLNS, S);
-            declaration.local.clear();
-            Node::new("styleSheet", S, vec![declaration])
-        });
+        let sheet =
+            sheet.unwrap_or_else(|| Node::new("styleSheet", S, vec![super::main_namespace()]));
         let base = Some(&sheet);
         let formats = number_formats(base);
         let mut builtin = HashMap::new();
@@ -379,11 +376,7 @@ impl Output {
         // An entry as the output writes it.
         let adopt = |node: &Node| {
             let mut n = node.clone();
-            n.walk_mut(&mut |e| {
-                if e.ns == S {
-                    e.name = format!("{prefix}{}", e.local);
-                }
-            });
+            n.spell(S, &prefix);
             n.attrs.extend(local.iter().cloned());
             if let Some(c) = colours {
                 c.resolve_all(&mut n);

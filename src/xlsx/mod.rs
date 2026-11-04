@@ -148,7 +148,23 @@ impl Book {
 
 /// The prefix of an element's name with its colon, or nothing.
 fn prefix(node: &Node) -> &str {
-    &node.name[..node.name.len() - node.local.len()]
+    element_prefix(&node.name)
+}
+
+/// A root element's default namespace declaration for spreadsheet content.
+fn main_namespace() -> Attr {
+    let mut declaration = Attr::new("xmlns", xml::XMLNS, S);
+    declaration.local.clear();
+    declaration
+}
+
+/// Adds a workbook-level part the base doesn't have: `kind` names its relationship type, and
+/// its content type follows from it.
+fn add_part(plan: &mut Plan, rels: &mut Rels, main: &str, name: &str, kind: &str, text: String) {
+    let part = plan.claim(name);
+    plan.type_part(&part, &format!("{SML}{kind}+xml"), false);
+    rels.add(&format!("{REL}{kind}"), relative(main, &part), false);
+    plan.add(part, Body::Data(text.into_bytes()), None);
 }
 
 /// The names of the output's sheets, which differ ignoring case.
@@ -334,18 +350,21 @@ impl SharedStrings {
             }
         };
         let Some(part) = &self.part else {
-            let mut root = vec![Attr::new("xmlns", xml::XMLNS, S)];
-            root[0].local.clear();
+            let mut root = vec![main_namespace()];
             set(&mut root);
             let text = format!(
                 "{DECLARATION}{}{}</sst>",
                 start_tag("sst", &root, false),
                 self.added
             );
-            let part = plan.claim("xl/sharedStrings.xml");
-            plan.type_part(&part, &format!("{SML}sharedStrings+xml"), false);
-            rels.add(&format!("{REL}sharedStrings"), relative(main, &part), false);
-            plan.add(part, Body::Data(text.into_bytes()), None);
+            add_part(
+                plan,
+                rels,
+                main,
+                "xl/sharedStrings.xml",
+                "sharedStrings",
+                text,
+            );
             return Ok(());
         };
         let s = strings(&self.text, part, origin)?;
@@ -418,11 +437,7 @@ impl Metadata {
         let own = prefix(out).to_string();
         let adopted = |node: &Node| {
             let mut n = node.clone();
-            n.walk_mut(&mut |e| {
-                if e.ns == S {
-                    e.name = format!("{own}{}", e.local);
-                }
-            });
+            n.spell(S, &own);
             n.attrs.extend(local.iter().cloned());
             xml::Child::Node(n)
         };
@@ -514,12 +529,7 @@ impl Metadata {
         tree.write(&mut text);
         match self.part {
             Some((part, _)) => plan.replace(&part, Body::Data(text.into_bytes())),
-            None => {
-                let part = plan.claim("xl/metadata.xml");
-                plan.type_part(&part, &format!("{SML}sheetMetadata+xml"), false);
-                rels.add(&format!("{REL}sheetMetadata"), relative(main, &part), false);
-                plan.add(part, Body::Data(text.into_bytes()), None);
-            }
+            None => add_part(plan, rels, main, "xl/metadata.xml", "sheetMetadata", text),
         }
     }
 }
@@ -1002,12 +1012,7 @@ impl Output {
             sheet.write(&mut text);
             match base_styles {
                 Some(h) => plan.replace(&h.part, Body::Data(text.into_bytes())),
-                None => {
-                    let part = plan.claim("xl/styles.xml");
-                    plan.type_part(&part, &format!("{SML}styles+xml"), false);
-                    rels.add(&format!("{REL}styles"), relative(&book.part, &part), false);
-                    plan.add(part, Body::Data(text.into_bytes()), None);
-                }
+                None => add_part(plan, &mut rels, &book.part, "xl/styles.xml", "styles", text),
             }
         }
         let mut text = declaration(&book.text);

@@ -536,6 +536,15 @@ impl Node {
         }
     }
 
+    /// Writes this element and those inside it in namespace `ns` with `prefix` (colon included).
+    pub fn spell(&mut self, ns: &str, prefix: &str) {
+        self.walk_mut(&mut |n| {
+            if n.ns == ns {
+                n.name = format!("{prefix}{}", n.local);
+            }
+        });
+    }
+
     /// Calls `f` on this element and every element inside it, depth first.
     pub fn walk_mut(&mut self, f: &mut impl FnMut(&mut Node)) {
         f(self);
