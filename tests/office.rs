@@ -18,6 +18,9 @@ const MERGES: &[(&str, &[&str], StyleMode)] = &[
     ),
     ("ca.docx", &["c.docx", "a.docx"], StyleMode::Keep),
     ("ba.docx", &["b.docx", "a.docx"], StyleMode::Keep),
+    ("aa.docx", &["a.docx", "a.docx"], StyleMode::Keep),
+    ("bb.docx", &["b.docx", "b.docx"], StyleMode::Keep),
+    ("cab.docx", &["c.docx", "a.docx", "b.docx"], StyleMode::Keep),
 ];
 
 #[test]

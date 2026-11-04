@@ -1146,3 +1146,48 @@ fn defects_a_file_brings_along_dont_stop_the_merge() {
     let ids = values(&text(&parts, "word/document.xml"), "wp:docPr", "id");
     assert_eq!(ids, ["1", "1", "2", "3"], "only the base keeps its repeat");
 }
+
+/// Everything the three documents should still be together; Word's page by page reading of the
+/// same file runs outside the suite on the merges tests/office.rs writes.
+#[test]
+fn the_three_documents_stay_whole_together() {
+    let (report, parts) = merged("whole", &["a.docx", "b.docx", "c.docx"]);
+    let doc = text(&parts, "word/document.xml");
+    let said = words(&doc);
+    for piece in [
+        "Document A",
+        "The end of A.",
+        "Title of B",
+        "Clause B two.",
+        "Document C",
+    ] {
+        assert!(said.contains(piece), "{piece}");
+    }
+    let bookmarks = values(&doc, "w:bookmarkStart", "w:name");
+    assert!(bookmarks.iter().any(|n| n == "Intro_2"), "{bookmarks:?}");
+    let footnotes = text(&parts, "word/footnotes.xml");
+    assert!(
+        footnotes.contains("<a:blip "),
+        "the footnote keeps its picture"
+    );
+    assert!(words(&text(&parts, "word/endnotes.xml")).contains("An endnote of B."));
+    let authors = values(&text(&parts, "word/comments.xml"), "w:comment", "w:author");
+    assert_eq!(authors, ["Author A", "Author B"]);
+    assert!(parts.iter().any(|p| p.0.starts_with("word/charts/chart")));
+    assert!(
+        parts
+            .iter()
+            .any(|p| p.0.starts_with("word/diagrams/drawing"))
+    );
+    let renamed: Vec<_> = report.renames.iter().map(|r| (r.kind, &*r.to)).collect();
+    for wanted in [
+        ("style", "ClauseText (2)"),
+        ("style", "Heading 1 (2)"),
+        ("bookmark", "Intro_2"),
+    ] {
+        assert!(renamed.contains(&wanted), "{renamed:?}");
+    }
+    let reported = codes(&report);
+    assert!(reported.contains(&("toc_needs_update", Some(2))));
+    assert!(reported.contains(&("compat_mode_differs", Some(3))));
+}
