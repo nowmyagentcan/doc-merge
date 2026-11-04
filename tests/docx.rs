@@ -98,6 +98,7 @@ fn untouched_parts_are_copied_byte_for_byte_and_runs_repeat() {
         n == "[Content_Types].xml"
             || n == "word/settings.xml"
             || n == "word/people.xml"
+            || n.starts_with("word/fontTable.xml")
             || n.starts_with("word/comments")
             || n.starts_with("word/document.xml")
             || n == "word/_rels/document.xml.rels"
@@ -200,8 +201,7 @@ fn a_document_keeps_its_defaults_and_theme_under_the_base() {
     assert!(normal.contains(r#"w:ascii="Aptos""#), "{normal}");
     assert!(normal.contains(r#"w:line="278""#), "{normal}");
     assert!(!normal.contains("w:asciiTheme"), "{normal}");
-    let codes: Vec<_> = report.warnings.list().iter().map(|w| w.code).collect();
-    assert_eq!(codes, ["theme_differs"]);
+    assert!(codes(&report).contains(&("theme_differs", Some(2))));
     // Every paragraph of b either names a style or gets b's copied Normal.
     let doc = text(&parts, "word/document.xml");
     let b = &doc[doc.find("Title of B").unwrap()..];
@@ -219,7 +219,7 @@ fn a_document_keeps_its_defaults_and_theme_under_the_base() {
 #[test]
 fn first_mode_folds_nothing_and_keeps_theme_links() {
     let (report, parts) = merged_with("first-look", &["a.docx", "b.docx"], StyleMode::First);
-    assert!(report.warnings.list().is_empty());
+    assert!(!codes(&report).iter().any(|c| c.0 == "theme_differs"));
     assert!(!text(&parts, "word/styles.xml").contains("Normal_2"));
 }
 
@@ -888,4 +888,250 @@ fn a_reply_follows_its_parent_when_ids_change() {
     assert_eq!(ids.len(), 4);
     assert_eq!(parents, [ids[0].clone(), ids[2].clone()]);
     assert_ne!(ids[0], ids[2]);
+}
+
+fn codes(report: &Report) -> Vec<(&'static str, Option<usize>)> {
+    let list = report.warnings.list().iter();
+    list.map(|w| (w.code, w.input)).collect()
+}
+
+#[test]
+fn the_three_documents_report_what_word_has_to_be_told() {
+    let (report, _) = merged("warnings", &["a.docx", "b.docx", "c.docx"]);
+    assert_eq!(
+        codes(&report),
+        [
+            ("theme_differs", Some(2)),
+            ("compat_mode_differs", Some(3)),
+            ("toc_needs_update", Some(2)),
+        ]
+    );
+}
+
+#[test]
+fn the_first_glossary_stays_and_later_ones_go() {
+    let (report, parts) = merged("glossary", &["a.docx", "b.docx", "b.docx"]);
+    let glossaries = parts.iter().filter(|p| p.0 == "word/glossary/document.xml");
+    assert_eq!(glossaries.count(), 1);
+    assert!(text(&parts, "word/_rels/document.xml.rels").contains("glossaryDocument"));
+    assert!(text(&parts, "[Content_Types].xml").contains("document.glossary+xml"));
+    assert!(codes(&report).contains(&("glossary_not_merged", Some(3))));
+    assert!(!codes(&report).contains(&("glossary_not_merged", Some(2))));
+    let (report, _) = merged("glossary-base", &["b.docx", "b.docx"]);
+    assert!(codes(&report).contains(&("glossary_not_merged", Some(2))));
+}
+
+fn settings(inner: &str) -> String {
+    format!(r#"<w:settings xmlns:w="{WORD_NS}">{inner}</w:settings>"#)
+}
+
+#[test]
+fn appended_note_formatting_moves_into_its_sections() {
+    let dir = temp_dir("note-format");
+    let base = settings(r#"<w:footnotePr><w:numFmt w:val="decimal"/></w:footnotePr>"#);
+    let own = settings(
+        r#"<w:footnotePr><w:numFmt w:val="lowerRoman"/><w:footnote w:id="-1"/></w:footnotePr><w:endnotePr><w:pos w:val="sectEnd"/></w:endnotePr>"#,
+    );
+    let extra = [("word/settings.xml", "settings", own.as_str())];
+    let a = word_file(
+        &dir,
+        "a.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &base)],
+    );
+    let body = r#"<w:p><w:pPr><w:sectPr><w:footnotePr><w:numFmt w:val="upperRoman"/></w:footnotePr><w:type w:val="oddPage"/></w:sectPr></w:pPr></w:p><w:p/><w:sectPr><w:pgSz w:w="1"/></w:sectPr>"#;
+    let b = word_file(&dir, "b.docx", body, &extra);
+    let c = word_file(&dir, "c.docx", "<w:p/>", &extra);
+    let (_, parts) = merge_files(&dir, &[a, b, c]);
+    let doc = text(&parts, "word/document.xml");
+    // A section's own stays; the document's goes where there is none, in schema order.
+    assert!(doc.contains(r#"<w:footnotePr><w:numFmt w:val="upperRoman"/></w:footnotePr><w:endnotePr><w:pos w:val="sectEnd"/></w:endnotePr><w:type w:val="oddPage"/>"#));
+    assert!(doc.contains(r#"<w:footnotePr><w:numFmt w:val="lowerRoman"/></w:footnotePr><w:endnotePr><w:pos w:val="sectEnd"/></w:endnotePr><w:pgSz w:w="1"/>"#));
+    assert_eq!(
+        count(&doc, r#"w:val="lowerRoman""#),
+        2,
+        "the third document too"
+    );
+    assert!(!doc.contains("<w:footnote "));
+    assert_eq!(text(&parts, "word/settings.xml"), base);
+}
+
+#[test]
+fn equal_note_formatting_stays_in_the_settings() {
+    let dir = temp_dir("note-format-equal");
+    let both = settings(r#"<w:footnotePr><w:numFmt w:val="lowerRoman"/></w:footnotePr>"#);
+    let extra = [("word/settings.xml", "settings", both.as_str())];
+    let a = word_file(&dir, "a.docx", "<w:p/>", &extra);
+    let b = word_file(&dir, "b.docx", "<w:p/>", &extra);
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    assert!(!text(&parts, "word/document.xml").contains("footnotePr"));
+}
+
+#[test]
+fn a_protected_document_is_reported_and_an_unenforced_one_isnt() {
+    let dir = temp_dir("protection");
+    let a = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    let locked = settings(r#"<w:documentProtection w:edit="readOnly" w:enforcement="1"/>"#);
+    let open = settings(r#"<w:documentProtection w:edit="readOnly" w:enforcement="0"/>"#);
+    let b = word_file(
+        &dir,
+        "b.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &locked)],
+    );
+    let c = word_file(
+        &dir,
+        "c.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &open)],
+    );
+    let (report, parts) = merge_files(&dir, &[a, b, c]);
+    assert_eq!(codes(&report), [("protection_not_kept", Some(2))]);
+    assert!(!parts.iter().any(|p| p.0 == "word/settings.xml"));
+}
+
+#[test]
+fn a_different_layout_mode_warns() {
+    let dir = temp_dir("mode");
+    let mode = |v: u32| {
+        settings(&format!(
+            r#"<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="{v}"/></w:compat>"#
+        ))
+    };
+    let (new, old) = (mode(15), mode(14));
+    let a = word_file(
+        &dir,
+        "a.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &new)],
+    );
+    let b = word_file(
+        &dir,
+        "b.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &new)],
+    );
+    let c = word_file(
+        &dir,
+        "c.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &old)],
+    );
+    let (report, _) = merge_files(&dir, &[a, b, c]);
+    assert_eq!(codes(&report), [("compat_mode_differs", Some(3))]);
+}
+
+#[test]
+fn a_table_of_contents_needs_headings_to_go_stale() {
+    let dir = temp_dir("toc");
+    let toc = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TO</w:instrText></w:r><w:r><w:instrText xml:space="preserve">C \o </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+    let heading = r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:p>"#;
+    let body_text = r#"<w:p><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:p>"#;
+    let simple = r#"<w:p><w:fldSimple w:instr=" TOC "/></w:p>"#;
+    let file = |name: &str, body: &str| word_file(&dir, name, body, &[]);
+    for (first, second, stale) in [
+        (toc, heading, true),
+        (toc, body_text, false),
+        (heading, heading, false),
+        (heading, toc, false),
+        (simple, heading, true),
+    ] {
+        let (report, _) = merge_files(&dir, &[file("a.docx", first), file("b.docx", second)]);
+        let codes = codes(&report);
+        assert_eq!(codes.contains(&("toc_needs_update", Some(2))), stale);
+    }
+    let styled = format!(
+        r#"<w:styles xmlns:w="{WORD_NS}"><w:style w:type="paragraph" w:styleId="Base"><w:name w:val="Base"/><w:pPr><w:outlineLvl w:val="1"/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Sub"><w:name w:val="Sub"/><w:basedOn w:val="Base"/></w:style></w:styles>"#
+    );
+    let uses_it = r#"<w:p><w:pPr><w:pStyle w:val="Sub"/></w:pPr></w:p>"#;
+    let b = word_file(
+        &dir,
+        "c.docx",
+        uses_it,
+        &[("word/styles.xml", "styles", &styled)],
+    );
+    let (report, _) = merge_files(&dir, &[file("a.docx", toc), b]);
+    assert!(codes(&report).contains(&("toc_needs_update", Some(2))));
+}
+
+#[test]
+fn document_level_parts_nobody_points_to_are_reported_by_type() {
+    let dir = temp_dir("dropped");
+    let a = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    let plain = format!(r#"<w:x xmlns:w="{WORD_NS}"/>"#);
+    let extra: [(&str, &str, &str); 3] = [
+        ("word/stylesWithEffects.xml", "stylesWithEffects", &plain),
+        ("word/tasks1.xml", "tasks", &plain),
+        ("word/tasks2.xml", "tasks", &plain),
+    ];
+    let b = word_file(&dir, "b.docx", "<w:p/>", &extra);
+    let (report, parts) = merge_files(&dir, &[a, b]);
+    assert_eq!(codes(&report), [("part_dropped", Some(2))]);
+    assert_eq!(
+        report.warnings.list()[0].message,
+        "b.docx has 1 stylesWithEffects part and 2 tasks parts that the merged file doesn't carry (only the first file's are kept)."
+    );
+    assert!(!parts.iter().any(|p| p.0.contains("tasks")));
+}
+
+#[test]
+fn fonts_join_by_name_with_their_embedded_files() {
+    let dir = temp_dir("fonts");
+    let table = |fonts: &str| {
+        format!(r#"<w:fonts xmlns:w="{WORD_NS}" xmlns:r="{OFFICE_REL}">{fonts}</w:fonts>"#)
+    };
+    let a = word_file(
+        &dir,
+        "a.docx",
+        "<w:p/>",
+        &[(
+            "word/fontTable.xml",
+            "fontTable",
+            &table(r#"<w:font w:name="Calibri"><w:family w:val="swiss"/></w:font>"#),
+        )],
+    );
+    let own = table(
+        r#"<w:font w:name="calibri"><w:family w:val="roman"/></w:font><w:font w:name="Kept"><w:embedRegular r:id="rId1" w:fontKey="{00000000-0000-0000-0000-000000000001}"/></w:font>"#,
+    );
+    let mut parts = word_parts("<w:p/>", &[("word/fontTable.xml", "fontTable", &own)]);
+    let font = format!("{OFFICE_REL}/font");
+    let font_rels = rels(&[("rId1", font.as_str(), "fonts/font1.odttf")]);
+    set(
+        &mut parts,
+        "word/_rels/fontTable.xml.rels",
+        font_rels.as_bytes(),
+    );
+    set(&mut parts, "word/fonts/font1.odttf", b"obfuscated");
+    let kind = "application/vnd.openxmlformats-officedocument.obfuscatedFont";
+    let types = text(&parts, "[Content_Types].xml").replace(
+        "<Override",
+        &format!(r#"<Default Extension="odttf" ContentType="{kind}"/><Override"#),
+    );
+    set(&mut parts, "[Content_Types].xml", types.as_bytes());
+    let b = write(&dir, "b.docx", &build(&parts));
+    let (_, parts) = merge_files(&dir, &[a, b.clone()]);
+    let fonts = text(&parts, "word/fontTable.xml");
+    assert_eq!(values(&fonts, "w:font", "w:name"), ["Calibri", "Kept"]);
+    assert!(
+        fonts.contains(r#"<w:family w:val="swiss"/>"#),
+        "the base's entry wins"
+    );
+    let id = values(&fonts, "w:embedRegular", "r:id").remove(0);
+    let new = text(&parts, "word/_rels/fontTable.xml.rels");
+    assert!(new.contains(&format!("Id=\"{id}\"")) && new.contains("fonts/font1.odttf"));
+    assert_eq!(
+        parts
+            .iter()
+            .find(|p| p.0 == "word/fonts/font1.odttf")
+            .unwrap()
+            .1,
+        b"obfuscated"
+    );
+    assert!(text(&parts, "[Content_Types].xml").contains("odttf"));
+    // A base with no font table gets one.
+    let c = word_file(&dir, "c.docx", "<w:p/>", &[]);
+    let (_, parts) = merge_files(&dir, &[c, b]);
+    let fonts = text(&parts, "word/fontTable.xml");
+    assert!(fonts.ends_with("</w:fonts>"), "{fonts}");
+    assert!(text(&parts, "word/_rels/document.xml.rels").contains("fontTable.xml"));
 }

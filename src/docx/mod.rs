@@ -7,6 +7,7 @@ mod headers;
 mod ids;
 mod notes;
 mod numbering;
+mod settings;
 mod styles;
 
 use std::cell::RefCell;
@@ -25,6 +26,7 @@ use headers::Slot;
 use ids::{Field, Ids, Local, Tally};
 use notes::{KINDS, Notes, Sides};
 use numbering::Lists;
+use settings::{Fonts, Settings};
 use styles::{Sheet, Source, Theme};
 
 pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -103,8 +105,13 @@ struct Merger<'a> {
     plan: Plan,
     main: String,
     rels: Rels,
-    /// Whether each input's settings have even and odd headers on.
-    evens: Vec<bool>,
+    settings: Vec<Settings>,
+    fonts: Fonts,
+    has_glossary: bool,
+    /// Whether the output holds a table of contents.
+    has_toc: bool,
+    /// The first appended document with headings, which a table of contents would list.
+    headings: Option<usize>,
     base_styles: Option<Held>,
     style_root: Prefixes,
     base_defaults: Option<Node>,
@@ -140,12 +147,12 @@ impl<'a> Merger<'a> {
         let plan = Plan::base(&inputs[0], warnings)?;
         let main = inputs[0].main.clone();
         let base_rels = inputs[0].rels_of(&main)?;
-        let mut evens = vec![];
+        let mut settings = vec![];
         for pkg in inputs.iter_mut() {
             let part = pkg.main.clone();
             let rels = pkg.rels_of(&part)?;
-            let settings = held(pkg, &part, &rels, "settings")?;
-            evens.push(settings.is_some_and(|h| headers::even_on(&h.tree)));
+            let held = held(pkg, &part, &rels, "settings")?;
+            settings.push(Settings::new(held.as_ref().map(|h| &h.tree)));
         }
         let base_styles = held(&mut inputs[0], &main, &base_rels, "styles")?;
         let base_sheet = Sheet::new(base_styles.as_ref().map(|h| &h.tree));
@@ -163,7 +170,13 @@ impl<'a> Merger<'a> {
         Ok(Self {
             plan,
             rels: Rels::new(base_rels.clone()),
-            evens,
+            settings,
+            fonts: Fonts::open(&mut inputs[0], &main, &base_rels)?,
+            has_glossary: base_rels
+                .iter()
+                .any(|r| r.kind == format!("{REL}glossaryDocument")),
+            has_toc: false,
+            headings: None,
             style_root: Prefixes::of(base_styles.as_ref().map_or(&[], |h| &h.tree.attrs)),
             base_defaults: base_sheet.defaults.clone(),
             base_p: base_sheet.default_of("paragraph").map(String::from),
@@ -196,7 +209,7 @@ impl<'a> Merger<'a> {
     /// Whether input `i`'s even pages show its default headers, though the output has even
     /// and odd headers on.
     fn needs_twins(&self, i: usize) -> bool {
-        !self.evens[i] && self.evens.iter().any(|&e| e)
+        !self.settings[i].even && self.settings.iter().any(|s| s.even)
     }
 
     fn add_base(&mut self) -> Result<(), Error> {
@@ -213,6 +226,7 @@ impl<'a> Merger<'a> {
         for n in &mut self.notes {
             uses.add(n.scan_base(&origin)?);
         }
+        self.has_toc = uses.toc;
         self.ids = Rc::new(RefCell::new(Ids::base(&uses.tally)));
         self.bookmarks = uses.names.iter().map(|n| n.to_lowercase()).collect();
         self.root = Prefixes::of(&uses.root);
@@ -355,6 +369,12 @@ impl<'a> Merger<'a> {
                 from,
                 to,
             }));
+        self.has_toc |= uses.toc;
+        if self.headings.is_none()
+            && (uses.outline || uses.styles.iter().any(|s| sheet.outlined(s)))
+        {
+            self.headings = Some(i + 1);
+        }
         let mut rw = Rewrite {
             nums: copied.nums,
             names,
@@ -403,6 +423,8 @@ impl<'a> Merger<'a> {
             }
         }
         self.sides.add(&mut self.inputs[i], &own, &comment_paras)?;
+        self.apply_settings(i, &mut rw);
+        self.document_parts(i, &own, &uses)?;
         self.copy_body_rels(i, &own, &uses, &stories, &mut rw)?;
         if twins {
             self.add_twins(i, &own, &uses, &mut rw)?;
@@ -451,6 +473,7 @@ impl<'a> Merger<'a> {
         let parts = Parts {
             main: &main,
             kind: "styles",
+            root: "styles",
         };
         let inserts: [(&[&str], &str); 1] = [(&[], &written(self.out_styles.added()))];
         let base = self.base_styles.as_ref();
@@ -472,6 +495,7 @@ impl<'a> Merger<'a> {
         let parts = Parts {
             main: &main,
             kind: "numbering",
+            root: "numbering",
         };
         let base = self.base_numbering.as_ref();
         registry(
@@ -502,8 +526,9 @@ impl<'a> Merger<'a> {
         }
         self.sides
             .finish(&mut self.plan, &mut self.rels, &main, &origin)?;
-        if self.needs_twins(0) {
-            self.even_setting(&origin)?;
+        self.finish_settings(&origin)?;
+        if let Some(input) = self.headings.filter(|_| self.has_toc) {
+            self.warnings.push(Warning::toc_needs_update(input));
         }
         let root_attrs = self.root.attrs;
         let count = self.inputs.len();
@@ -547,8 +572,9 @@ fn theme(pkg: &mut Package, main: &str, rels: &[Rel]) -> Result<Option<Theme>, E
 /// Which registry part is being written.
 struct Parts<'a> {
     main: &'a str,
-    /// The word its relationship type, file name, content type and root element share.
+    /// The word its relationship type, file name and content type share.
     kind: &'a str,
+    root: &'a str,
 }
 
 /// Writes a registry part with `inserts` (see [`extend`]) when any has content: the base's
@@ -571,7 +597,7 @@ fn registry(
         return Ok(());
     }
     let w = prefix_of(&root.attrs, W).unwrap_or("w");
-    let name = format!("{w}:{}", parts.kind);
+    let name = format!("{w}:{}", parts.root);
     let mut text =
         String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n");
     text += &start_tag(&name, &root.attrs, false);
@@ -752,6 +778,9 @@ struct Uses {
     defaults: Vec<String>,
     /// Which references the first section has: (element name, type).
     first_slots: HashSet<(&'static str, String)>,
+    toc: bool,
+    /// Whether a paragraph sets its own outline level.
+    outline: bool,
 }
 
 impl Uses {
@@ -761,6 +790,7 @@ impl Uses {
         self.nums.extend(other.nums);
         self.names.extend(other.names);
         self.tally.add(other.tally);
+        self.toc |= other.toc;
     }
 }
 
@@ -770,6 +800,7 @@ enum Tag {
     P,
     PPr,
     SectPr,
+    Instr,
     Other,
 }
 
@@ -782,6 +813,7 @@ fn tag(ns: &str, local: &[u8]) -> Tag {
         b"p" => Tag::P,
         b"pPr" => Tag::PPr,
         b"sectPr" => Tag::SectPr,
+        b"instrText" => Tag::Instr,
         _ => Tag::Other,
     }
 }
@@ -798,12 +830,23 @@ fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Er
     let mut seen = HashSet::new();
     let mut stack: Vec<Tag> = vec![];
     let mut body_sect = false;
+    let mut instr: Option<String> = None;
+    let is_toc = |s: &str| {
+        let name = s.split_whitespace().next();
+        name.is_some_and(|n| n.eq_ignore_ascii_case("TOC"))
+    };
     loop {
         let event = r.event()?;
         let e = match &event {
             Event::Start(e) | Event::Empty(e) => e,
             Event::End(_) => {
                 stack.pop();
+                continue;
+            }
+            Event::Text(t) => {
+                if stack.last() == Some(&Tag::Instr) {
+                    instr.get_or_insert_default().push_str(&t.xml10_content());
+                }
                 continue;
             }
             Event::Eof => break,
@@ -841,6 +884,20 @@ fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Er
             .see(r.element_ns(e), e.local_name().as_ref(), &attrs);
         uses.paras
             .extend(attrs.iter().filter_map(ids::paragraph_id));
+        if r.element_ns(e) == W {
+            match e.local_name().as_ref() {
+                "fldChar" => uses.toc |= instr.take().is_some_and(|s| is_toc(&s)),
+                "fldSimple" => {
+                    let a = attrs.iter().find(|a| a.ns == W && a.local == "instr");
+                    uses.toc |= a.is_some_and(|a| is_toc(&a.value));
+                }
+                "outlineLvl" => {
+                    let a = attrs.iter().find(|a| a.ns == W && a.local == "val");
+                    uses.outline |= a.is_some_and(|a| a.value != "9");
+                }
+                _ => {}
+            }
+        }
         let reference = headers::reference(r.element_ns(e), e.local_name().as_ref());
         if let Some(local) = reference.filter(|_| stack.last() == Some(&Tag::SectPr)) {
             let kind = attrs.iter().find(|a| a.ns == W && a.local == "type");
@@ -906,6 +963,8 @@ struct Rewrite {
     twins: HashMap<String, String>,
     /// What the first section gets for the slots it leaves open.
     fill: Vec<Slot>,
+    /// What every section with none gets as its `w:footnotePr` and `w:endnotePr`.
+    note_format: [Option<String>; 2],
 }
 
 impl Rewrite {

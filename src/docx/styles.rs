@@ -98,6 +98,21 @@ impl Sheet {
             .map(id_of)
     }
 
+    /// Whether a style gives its paragraphs an outline level, itself or through `basedOn`.
+    pub fn outlined(&self, id: &str) -> bool {
+        let mut seen = HashSet::new();
+        let mut at = Some(id);
+        while let Some(id) = at.filter(|id| seen.insert(*id)) {
+            let Some(s) = self.get(id) else { break };
+            let level = s.child(W, "pPr").and_then(|p| p.child(W, "outlineLvl"));
+            if let Some(level) = level {
+                return val(level) != Some("9");
+            }
+            at = reference(s, "basedOn");
+        }
+        false
+    }
+
     /// `seeds` and every style they reach through `basedOn`, `link` and `next`, and through
     /// what `numbering` says a style's list reaches.
     pub fn closure(

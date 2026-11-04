@@ -154,6 +154,7 @@ impl Notes {
         let parts = Parts {
             main,
             kind: self.kind,
+            root: self.kind,
         };
         let inserts: [(&[&str], &str); 1] = [(&[], &self.added)];
         registry(

@@ -4,62 +4,11 @@
 
 use quick_xml::events::{BytesStart, Event};
 
-use super::{
-    Merger, Parts, Place, REL, Rewrite, Uses, W, WML, Walk, registry, relative, start, story,
-};
-use crate::Origin;
+use super::{Merger, Place, REL, Rewrite, Uses, W, WML, Walk, relative, start, story};
 use crate::error::Error;
 use crate::package::{MAX_PARSED, RELS_TYPE, Rel, rels_name, resolve};
 use crate::writer::{Body, R, rels_xml};
-use crate::xml::{Attr, Node, Reader, XMLNS, declaration, start_tag};
-
-/// What comes before `w:evenAndOddHeaders` in `w:settings`.
-const BEFORE_EVEN: [&str; 38] = [
-    "writeProtection",
-    "view",
-    "zoom",
-    "removePersonalInformation",
-    "removeDateAndTime",
-    "doNotDisplayPageBoundaries",
-    "displayBackgroundShape",
-    "printPostScriptOverText",
-    "printFractionalCharacterWidth",
-    "printFormsData",
-    "embedTrueTypeFonts",
-    "embedSystemFonts",
-    "saveSubsetFonts",
-    "saveFormsData",
-    "mirrorMargins",
-    "alignBordersAndEdges",
-    "bordersDoNotSurroundHeader",
-    "bordersDoNotSurroundFooter",
-    "gutterAtTop",
-    "hideSpellingErrors",
-    "hideGrammaticalErrors",
-    "activeWritingStyle",
-    "proofState",
-    "formsDesign",
-    "attachedTemplate",
-    "linkStyles",
-    "stylePaneFormatFilter",
-    "stylePaneSortMethod",
-    "documentType",
-    "mailMerge",
-    "revisionView",
-    "trackRevisions",
-    "doNotTrackMoves",
-    "doNotTrackFormatting",
-    "documentProtection",
-    "autoFormatOverride",
-    "styleLockTheme",
-    "styleLockQFSet",
-];
-
-pub fn even_on(settings: &Node) -> bool {
-    settings
-        .child(W, "evenAndOddHeaders")
-        .is_some_and(|n| !matches!(n.attr(W, "val"), Some("0" | "false" | "off")))
-}
+use crate::xml::{Attr, Reader, XMLNS, start_tag};
 
 /// The element's name when it is a header or footer reference.
 pub fn reference(ns: &str, local: &str) -> Option<&'static str> {
@@ -93,25 +42,33 @@ fn slot_tag(rw: &Rewrite, slot: &Slot) -> String {
     start_tag(&format!("{w}:{}", slot.reference), &attrs, true)
 }
 
-/// What a section gets besides its own children.
+/// The references a section gets besides its own.
 fn added(rw: &Rewrite, first: bool) -> String {
     let slots = rw.fill.iter().filter(|_| first);
     slots.map(|s| slot_tag(rw, s)).collect()
 }
 
+fn format_of(rw: &Rewrite, k: usize) -> &[u8] {
+    rw.note_format[k].as_deref().unwrap_or_default().as_bytes()
+}
+
 /// The section break of a document that has none.
 pub fn missing_section(rw: &Rewrite, first: bool) -> Vec<u8> {
     let (w, more) = (&rw.w, added(rw, first));
-    if more.is_empty() {
+    let notes = [format_of(rw, 0), format_of(rw, 1)].concat();
+    if more.is_empty() && notes.is_empty() {
         return format!("<{w}:sectPr/>").into_bytes();
     }
-    format!("<{w}:sectPr>{more}</{w}:sectPr>").into_bytes()
+    let open = format!("<{w}:sectPr>{more}").into_bytes();
+    [open, notes, format!("</{w}:sectPr>").into_bytes()].concat()
 }
 
 /// Where a section's children go, in the order they are written.
 const REFERENCES: usize = 0;
-const REST: usize = 1;
-const LEFT_OUT: usize = 2;
+const FOOTNOTES: usize = 1;
+const ENDNOTES: usize = 2;
+const REST: usize = 3;
+const LEFT_OUT: usize = 4;
 
 /// For a reference of a document whose even references go: whether this is one, and the twin
 /// a default one is followed by.
@@ -131,7 +88,8 @@ fn twin_of(rw: &Rewrite, reference: &'static str, attrs: &[Attr]) -> (bool, Opti
 }
 
 /// Writes a whole section break: its references first (with `twin` on, an even one left out and
-/// each default one followed by its twin), then what the section gets, then the rest.
+/// each default one followed by its twin), then what the section gets, the document's note
+/// formatting where the section has none, then the rest.
 pub fn section<'a>(
     r: &mut Reader<'a>,
     e: &BytesStart<'a>,
@@ -143,11 +101,11 @@ pub fn section<'a>(
 ) -> Result<(), Error> {
     let first = std::mem::take(&mut walk.first_sect);
     let more = added(rw, first);
-    if empty && more.is_empty() {
+    if empty && more.is_empty() && rw.note_format == [None, None] {
         return start(r, e, true, rw, place, walk, buf);
     }
     start(r, e, false, rw, place, walk, buf)?;
-    let mut pieces: [Vec<u8>; 3] = Default::default();
+    let mut pieces: [Vec<u8>; 5] = Default::default();
     let depth = r.depth();
     let mut at = REST;
     while r.depth() >= depth && !empty {
@@ -158,7 +116,11 @@ pub fn section<'a>(
                 let child = r.depth() == depth + usize::from(!empty);
                 let mut twin = None;
                 if child {
-                    at = REST;
+                    at = match c.local_name().as_ref() {
+                        "footnotePr" => FOOTNOTES,
+                        "endnotePr" => ENDNOTES,
+                        _ => REST,
+                    };
                     if let Some(reference) = reference(r.element_ns(c), c.local_name().as_ref()) {
                         at = REFERENCES;
                         if rw.twin {
@@ -181,9 +143,13 @@ pub fn section<'a>(
             _ => super::put(&mut pieces[at], &event),
         }
     }
-    let [references, rest, _] = pieces;
+    let [references, footnotes, endnotes, rest, _] = pieces;
     buf.extend(references);
     buf.extend(more.as_bytes());
+    for (own, k) in [(footnotes, 0), (endnotes, 1)] {
+        let format = format_of(rw, k);
+        buf.extend(if own.is_empty() { format } else { &own });
+    }
     buf.extend(rest);
     buf.extend(format!("</{}>", e.name().as_ref()).as_bytes());
     Ok(())
@@ -281,37 +247,5 @@ impl Merger<'_> {
                 });
             }
         }
-    }
-
-    /// Turns even and odd headers on in the base's settings.
-    pub(super) fn even_setting(&mut self, origin: &Origin) -> Result<(), Error> {
-        let main = self.main.clone();
-        let own = self.inputs[0].rels_of(&main)?;
-        let Some(mut h) = super::held(&mut self.inputs[0], &main, &own, "settings")? else {
-            let w = crate::xml::prefix_of(&self.root.attrs, W).unwrap_or("w");
-            let setting = format!("<{w}:evenAndOddHeaders/>");
-            let parts = Parts {
-                main: &main,
-                kind: "settings",
-            };
-            let inserts: [(&[&str], &str); 1] = [(&[], &setting)];
-            return registry(
-                &mut self.plan,
-                &mut self.rels,
-                &parts,
-                None,
-                &self.root,
-                &inserts,
-                origin,
-            );
-        };
-        h.tree
-            .child_or_insert(W, "evenAndOddHeaders", &BEFORE_EVEN)
-            .attrs
-            .clear();
-        let mut out = declaration(&h.text);
-        h.tree.write(&mut out);
-        self.plan.replace(&h.part, Body::Data(out.into_bytes()));
-        Ok(())
     }
 }

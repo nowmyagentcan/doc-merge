@@ -91,9 +91,8 @@ impl Settings {
             even: child("evenAndOddHeaders").is_some_and(|n| on(n, "val")),
             mode: mode.unwrap_or(OLDEST_MODE).to_string(),
             protected: child("writeProtection").is_some()
-                || child("documentProtection").is_some_and(|n| {
-                    n.attr(W, "enforcement").is_some() && on(n, "enforcement")
-                }),
+                || child("documentProtection")
+                    .is_some_and(|n| n.attr(W, "enforcement").is_some() && on(n, "enforcement")),
             notes: ["footnotePr", "endnotePr"].map(|l| tree.and_then(|t| note_format(t, l))),
         }
     }
@@ -108,9 +107,9 @@ impl Settings {
             s
         };
         [0, 1].map(|k| {
-            let mut n = self.notes[k].clone().filter(|_| {
-                form(&self.notes[k]) != form(&base.notes[k])
-            })?;
+            let mut n = self.notes[k]
+                .clone()
+                .filter(|_| form(&self.notes[k]) != form(&base.notes[k]))?;
             n.spell(W, &format!("{w}:"));
             let mut out = String::new();
             n.write(&mut out);
@@ -178,7 +177,8 @@ impl Fonts {
             for embed in n.nodes_mut() {
                 for a in embed.attrs.iter_mut().filter(|a| is_rid(a)) {
                     let Some(r) = table_rels.iter().find(|r| r.id == a.value) else {
-                        let why = format!("{} points to a missing relationship {}", h.part, a.value);
+                        let why =
+                            format!("{} points to a missing relationship {}", h.part, a.value);
                         return Err(inputs[i].origin.bad(&why));
                     };
                     let part = &self.part;
@@ -302,7 +302,8 @@ impl Merger<'_> {
     pub(super) fn finish_settings(&mut self, origin: &Origin) -> Result<(), Error> {
         let main = self.main.clone();
         let (plan, rels) = (&mut self.plan, &mut self.rels);
-        self.fonts.finish(plan, rels, &self.inputs[0], &main, origin)?;
+        self.fonts
+            .finish(plan, rels, &self.inputs[0], &main, origin)?;
         if !self.needs_twins(0) {
             return Ok(());
         }
