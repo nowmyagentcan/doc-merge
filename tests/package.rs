@@ -33,6 +33,38 @@ fn docx() -> Vec<(String, Vec<u8>)> {
     minimal("docx", &[])
 }
 
+/// Turns the end of a ZIP into the ZIP64 form, declaring `count` entries there.
+fn with_zip64_end(zip: &mut Vec<u8>, count: u64) {
+    let end = zip.len() - 22;
+    let record = zip[end..].to_vec();
+    let [cd_size, cd_at] =
+        [12, 16].map(|i| u64::from(u32::from_le_bytes(record[i..i + 4].try_into().unwrap())));
+    zip.truncate(end);
+    zip.extend(b"PK\x06\x06");
+    zip.extend(44u64.to_le_bytes());
+    zip.extend([45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for field in [count, count, cd_size, cd_at] {
+        zip.extend(field.to_le_bytes());
+    }
+    zip.extend(b"PK\x06\x07\0\0\0\0");
+    zip.extend((end as u64).to_le_bytes());
+    zip.extend(1u32.to_le_bytes());
+    zip.extend(end_record(0xFFFF, u32::MAX, u32::MAX));
+}
+
+#[test]
+fn a_zip64_end_record_gives_the_real_count() {
+    let mut bytes = build(&docx());
+    let count = u16::from_le_bytes(
+        bytes[bytes.len() - 12..bytes.len() - 10]
+            .try_into()
+            .unwrap(),
+    );
+    with_zip64_end(&mut bytes, count.into());
+    let p = write(&temp_dir("zip64"), "in.docx", &bytes);
+    assert_eq!(open(&p).unwrap().kind, Kind::Docx);
+}
+
 #[test]
 fn every_kind_is_read_from_the_package() {
     let dir = temp_dir("kinds");
@@ -330,6 +362,15 @@ fn sizes_are_capped_before_and_while_reading() {
         .map(|i| raw(&format!("x/{i}.png"), b""))
         .collect();
     let e = refused("entries", &raw_zip(&many));
+    assert_eq!(
+        e.message,
+        "The entry count of 'in.docx' is over the limit: 10,001 (at most 10,000)."
+    );
+
+    // A ZIP64 record's count counts, whatever the end record says.
+    let mut hostile = build(&docx());
+    with_zip64_end(&mut hostile, 10_001);
+    let e = refused("entries-64", &hostile);
     assert_eq!(
         e.message,
         "The entry count of 'in.docx' is over the limit: 10,001 (at most 10,000)."

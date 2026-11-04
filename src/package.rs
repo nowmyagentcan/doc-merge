@@ -358,14 +358,9 @@ impl Package {
         match declared_entries(&mut file, meta.len()) {
             None => return Err(at(Error::not_office_file(name))),
             Some(n) if n > MAX_ENTRIES => {
-                let n = if n == 0xFFFF {
-                    "65,535 or more".into()
-                } else {
-                    thousands(n)
-                };
                 return Err(at(Error::limit_exceeded(
                     &format!("The entry count of '{name}'"),
-                    &n,
+                    &thousands(n),
                     "10,000",
                 )));
             }
@@ -518,15 +513,21 @@ impl Package {
             return Err(self.origin.bad(&format!("part {part} is missing")));
         };
         if e.size > cap {
-            let what = format!("Part {} of '{}'", e.name, self.origin.name);
-            return Err(Error::limit_exceeded(&what, &mib(e.size), &mib(cap)).at(self.origin.input));
+            return Err(too_big(&e.name, &self.origin, e.size, &mib(cap)));
         }
         self.origin.run.inflate(e.size)?;
         let larger = || {
             self.origin
                 .bad(&format!("part {} is larger than its header says", e.name))
         };
-        let mut bytes = Vec::with_capacity(e.size as usize);
+        // Deflate can't grow data more than 1,032 times, so a size that lies reserves nothing.
+        let expected = e
+            .size
+            .min(e.compressed.saturating_mul(1032).saturating_add(64));
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(expected as usize)
+            .map_err(|_| too_big(&e.name, &self.origin, e.size, "the memory free"))?;
         let read = self
             .zip
             .by_index(e.index)
@@ -566,6 +567,11 @@ impl Package {
     }
 }
 
+fn too_big(part: &str, origin: &Origin, size: u64, limit: &str) -> Error {
+    let what = format!("Part {part} of '{}'", origin.name);
+    Error::limit_exceeded(&what, &mib(size), limit).at(origin.input)
+}
+
 /// Whether a part belongs to a digital signature.
 pub fn is_signature(part: &str) -> bool {
     part.len() > 15 && part[..15].eq_ignore_ascii_case("_xmlsignatures/")
@@ -584,10 +590,13 @@ fn allowed_name(part: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
-/// The entry count the end-of-central-directory record declares, read before the directory
-/// itself so a hostile count is refused without parsing it; none when there is no record.
+/// The entry count the end-of-central-directory record or the ZIP64 record after it declares,
+/// read before the directory itself so a hostile count is refused without parsing it; none
+/// when there is no record to read it from.
 fn declared_entries(file: &mut File, len: u64) -> Option<u64> {
-    let tail = len.min(22 + 0xFFFF);
+    const LOCATOR: usize = 20;
+    const ZIP64_END: usize = 56;
+    let tail = len.min(22 + 0xFFFF + (LOCATOR + ZIP64_END) as u64);
     file.seek(SeekFrom::Start(len - tail)).ok()?;
     let mut b = vec![0; tail as usize];
     file.read_exact(&mut b).ok()?;
@@ -595,7 +604,25 @@ fn declared_entries(file: &mut File, len: u64) -> Option<u64> {
         .windows(4)
         .rposition(|w| w == b"PK\x05\x06")
         .filter(|p| p + 22 <= b.len())?;
-    Some(u64::from(u16::from_le_bytes([b[p + 10], b[p + 11]])))
+    let locator = p
+        .checked_sub(LOCATOR)
+        .filter(|l| b[*l..].starts_with(b"PK\x06\x07"));
+    let Some(locator) = locator else {
+        return Some(u64::from(u16::from_le_bytes([b[p + 10], b[p + 11]])));
+    };
+    // Where the locator says, or just before it when bytes were added in front of the ZIP.
+    let mut record = [0; ZIP64_END];
+    let at = u64::from_le_bytes(b[locator + 8..locator + 16].try_into().ok()?);
+    let read = file.seek(SeekFrom::Start(at)).is_ok() && file.read_exact(&mut record).is_ok();
+    if !(read && record.starts_with(b"PK\x06\x06")) {
+        record = b
+            .get(locator.checked_sub(ZIP64_END)?..locator)?
+            .try_into()
+            .ok()?;
+    }
+    record
+        .starts_with(b"PK\x06\x06")
+        .then(|| u64::from_le_bytes(record[32..40].try_into().unwrap()))
 }
 
 #[cfg(test)]
