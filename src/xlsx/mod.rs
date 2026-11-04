@@ -128,7 +128,12 @@ impl Book {
 
     /// A part this workbook relates to, read whole.
     fn held(&self, pkg: &mut Package, kind: &str) -> Result<Option<Held>, Error> {
-        let Some(part) = self.related(pkg, kind)? else {
+        self.held_type(pkg, &format!("{REL}{kind}"))
+    }
+
+    /// The part this workbook relates to by a full relationship type, read whole.
+    fn held_type(&self, pkg: &mut Package, kind: &str) -> Result<Option<Held>, Error> {
+        let Some(part) = self.related_type(pkg, kind)? else {
             return Ok(None);
         };
         let text = pkg.text(&part, MAX_PARSED)?;
@@ -138,10 +143,13 @@ impl Book {
 
     /// The part this workbook relates to by a relationship type.
     fn related(&self, pkg: &Package, kind: &str) -> Result<Option<String>, Error> {
-        let wanted = format!("{REL}{kind}");
+        self.related_type(pkg, &format!("{REL}{kind}"))
+    }
+
+    fn related_type(&self, pkg: &Package, kind: &str) -> Result<Option<String>, Error> {
         self.rels
             .iter()
-            .find(|r| r.kind == wanted && !r.external)
+            .find(|r| r.kind == kind && !r.external)
             .map(|r| target(pkg, &self.part, r))
             .transpose()
     }
@@ -159,13 +167,35 @@ fn main_namespace() -> Attr {
     declaration
 }
 
-/// Adds a workbook-level part the base doesn't have: `kind` names its relationship type, and
-/// its content type follows from it.
-fn add_part(plan: &mut Plan, rels: &mut Rels, main: &str, name: &str, kind: &str, text: String) {
+/// Adds a workbook-level part the base doesn't have.
+fn new_part(
+    plan: &mut Plan,
+    rels: &mut Rels,
+    main: &str,
+    name: &str,
+    rel: &str,
+    content_type: &str,
+    text: String,
+) {
     let part = plan.claim(name);
-    plan.type_part(&part, &format!("{SML}{kind}+xml"), false);
-    rels.add(&format!("{REL}{kind}"), relative(main, &part), false);
+    plan.type_part(&part, content_type, false);
+    rels.add(rel, relative(main, &part), false);
     plan.add(part, Body::Data(text.into_bytes()), None);
+}
+
+/// [`new_part`] for a standard kind, whose name gives both types.
+fn add_part(plan: &mut Plan, rels: &mut Rels, main: &str, name: &str, kind: &str, text: String) {
+    let (rel, content_type) = (format!("{REL}{kind}"), format!("{SML}{kind}+xml"));
+    new_part(plan, rels, main, name, &rel, &content_type, text);
+}
+
+/// An element of an appended part, ready for the output's: elements in `ns` take the prefix
+/// `own`, and it declares the prefixes the output binds differently (`local`).
+fn adopt(node: &Node, ns: &str, own: &str, local: &[Attr]) -> Node {
+    let mut node = node.clone();
+    node.spell(ns, own);
+    node.attrs.extend(local.iter().cloned());
+    node
 }
 
 /// The names of the output's sheets, which differ ignoring case.
@@ -416,6 +446,7 @@ struct Output {
     base_theme: Option<Held>,
     metadata: Metadata,
     taken: drawings::Taken,
+    persons: drawings::Persons,
 }
 
 /// The output's dynamic-array metadata, if any workbook has some.
@@ -437,12 +468,7 @@ impl Metadata {
         let local = root.merge(&held.tree.attrs);
         out.attrs = root.attrs;
         let own = prefix(out).to_string();
-        let adopted = |node: &Node| {
-            let mut n = node.clone();
-            n.spell(S, &own);
-            n.attrs.extend(local.iter().cloned());
-            xml::Child::Node(n)
-        };
+        let adopted = |node: &Node| xml::Child::Node(adopt(node, S, &own, &local));
         let type_of = |tree: &Node| {
             let types = tree.child(S, "metadataTypes");
             let list = types.iter().flat_map(|t| t.nodes());
@@ -503,10 +529,7 @@ impl Metadata {
         let moved = cells.nodes().count() as u32;
         let source = held.tree.child(S, "cellMetadata").into_iter();
         for block in source.flat_map(|c| c.nodes()) {
-            let mut block = match adopted(block) {
-                xml::Child::Node(n) => n,
-                xml::Child::Text(_) => unreachable!(),
-            };
+            let mut block = adopt(block, S, &own, &local);
             for rc in block.nodes_mut() {
                 let own_kind = rc.attr("", "t").is_some_and(|t| t == wanted);
                 let v = rc.attr("", "v").and_then(|v| v.parse::<usize>().ok());
@@ -652,6 +675,7 @@ impl Output {
             }
         }
         let taken = drawings::Taken::of(pkg)?;
+        let persons = drawings::Persons::of(&book, pkg)?;
         let mut next_table_id = 1;
         for t in tables(pkg)? {
             used.insert(t.name.to_lowercase(), None);
@@ -673,6 +697,7 @@ impl Output {
             base_theme,
             metadata,
             taken,
+            persons,
             book,
         })
     }
@@ -886,6 +911,7 @@ impl Output {
             Some(held) => self.metadata.add(held),
             None => 0,
         };
+        self.persons.add(&book, &mut inputs[i])?;
         let mut copied = vec![];
         let mut moved = vec![];
         for s in &book.sheets {
@@ -1015,10 +1041,12 @@ impl Output {
             styles,
             base_styles,
             metadata,
+            persons,
             ..
         } = self;
         strings.finish(plan, &mut rels, &book.part, &base.origin)?;
         metadata.finish(plan, &mut rels, &book.part);
+        persons.finish(plan, &mut rels, &book.part);
         if let Some(sheet) = styles.finish() {
             let head = base_styles.as_ref().map(|h| declaration(&h.text));
             let mut text = head.unwrap_or(DECLARATION.to_string());

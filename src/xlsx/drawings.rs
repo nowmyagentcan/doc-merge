@@ -1,20 +1,21 @@
 //! Excel: what a sheet brings along that points back at it or at the workbook: drawings,
-//! charts and form controls.
+//! charts, form controls, notes and threaded comments, and the people who wrote them.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::rc::Rc;
 
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 
-use super::{Maps, Patcher, io, parts_of, unreadable};
+use super::{Book, Maps, Patcher, adopt, element_prefix, io, new_part, parts_of, unreadable};
 use crate::Origin;
 use crate::error::Error;
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, resolve};
-use crate::writer::{Body, Plan};
-use crate::xml::{self, Reader, start_tag};
+use crate::writer::{Body, Plan, Rels};
+use crate::xml::{self, Child, Node, Prefixes, Reader, declaration, start_tag};
 
 const VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
 const DRAWING: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
@@ -23,6 +24,11 @@ const CHART_SHAPES: &str =
 const CHART: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
 const CHART_EX: &str = "application/vnd.ms-office.chartex+xml";
 const CONTROL: &str = "application/vnd.ms-excel.controlproperties+xml";
+const NOTES: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
+const THREADS: &str = "application/vnd.ms-excel.threadedcomments+xml";
+const PEOPLE: &str = "application/vnd.ms-excel.person+xml";
+const PERSON_REL: &str = "http://schemas.microsoft.com/office/2017/10/relationships/person";
+const THREADS_NS: &str = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments";
 /// The namespaces whose `f` elements hold a chart's formulas.
 const CHART_NS: [&str; 3] = [
     "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -37,6 +43,8 @@ const BLOCK: u32 = 1024;
 pub struct Taken {
     /// VML id blocks.
     blocks: HashSet<u32>,
+    /// Threaded comment and mention ids, without braces, in upper case.
+    threads: HashSet<String>,
 }
 
 /// What one appended sheet's own parts turned into.
@@ -46,6 +54,8 @@ pub struct Moved {
     parts: Vec<String>,
     /// VML id blocks, old to new.
     blocks: HashMap<u32, u32>,
+    /// Threaded comment and mention ids that would repeat, old to new, spelled as in `Taken`.
+    threads: HashMap<String, String>,
 }
 
 impl Moved {
@@ -80,6 +90,48 @@ fn reached(pkg: &mut Package, sheet: &str) -> Result<Vec<String>, Error> {
         }
     }
     Ok(found)
+}
+
+/// The comment and mention ids of a threaded comments part, spelled as in [`Taken`].
+fn thread_ids(text: &str, part: &str, origin: &Origin) -> Result<Vec<String>, Error> {
+    let mut r = Reader::new(text, part, origin);
+    let mut ids = vec![];
+    loop {
+        let event = r.event()?;
+        let (Event::Start(e) | Event::Empty(e)) = &event else {
+            if matches!(event, Event::Eof) {
+                return Ok(ids);
+            }
+            continue;
+        };
+        let wanted = match e.local_name().as_ref() {
+            "threadedComment" => "id",
+            "mention" => "mentionId",
+            _ => continue,
+        };
+        let attrs = r.attrs(e)?;
+        let id = attrs.iter().find(|a| a.ns.is_empty() && a.local == wanted);
+        let id = id.map(|a| a.value.trim_matches(['{', '}']).to_ascii_uppercase());
+        ids.extend(id);
+    }
+}
+
+/// A GUID without braces that depends only on `seed`, so two runs write the same file.
+fn guid(seed: impl Hash) -> String {
+    let half = |n: u8| {
+        let mut h = DefaultHasher::new();
+        (n, &seed).hash(&mut h);
+        h.finish()
+    };
+    let (a, b) = (half(0), half(1));
+    format!(
+        "{:08X}-{:04X}-4{:03X}-{:04X}-{:012X}",
+        a >> 32,
+        (a >> 16) & 0xFFFF,
+        a & 0xFFF,
+        (b >> 48) & 0x3FFF | 0x8000,
+        b & 0xFFFF_FFFF_FFFF
+    )
 }
 
 /// The text of `data="…"` in the attributes of an `o:idmap`, and where it stands.
@@ -118,36 +170,134 @@ impl Taken {
             let bytes = pkg.read(&part, MAX_PARSED)?;
             blocks.extend(blocks_of(&String::from_utf8_lossy(&bytes)));
         }
-        Ok(Self { blocks })
+        let mut threads = HashSet::new();
+        for part in parts_of(pkg, THREADS) {
+            let text = pkg.text(&part, MAX_PARSED)?;
+            threads.extend(thread_ids(&text, &part, &pkg.origin)?);
+        }
+        Ok(Self { blocks, threads })
     }
 
     /// Settles what the parts sheet `sheet` reaches turn into. A VML block stays when no VML
-    /// part in the output uses it.
+    /// part in the output uses it, and so does a threaded comment id: Excel refuses a workbook
+    /// with one twice.
     pub fn add(&mut self, pkg: &mut Package, sheet: &str) -> Result<Moved, Error> {
         let mut moved = Moved {
             parts: reached(pkg, sheet)?,
             ..Moved::default()
         };
         for part in &moved.parts {
-            if pkg.types.of(part) != Some(VML) {
-                continue;
-            }
-            for old in blocks_of(&pkg.text(part, MAX_PARSED)?) {
-                if moved.blocks.contains_key(&old) {
-                    continue;
+            match pkg.types.of(part) {
+                Some(VML) => {
+                    for old in blocks_of(&pkg.text(part, MAX_PARSED)?) {
+                        moved.blocks.entry(old).or_insert_with(|| self.block(old));
+                    }
                 }
-                let new = if self.blocks.insert(old) {
-                    old
-                } else {
-                    let free = (1..).find(|b| !self.blocks.contains(b));
-                    let free = free.expect("a free block");
-                    self.blocks.insert(free);
-                    free
-                };
-                moved.blocks.insert(old, new);
+                Some(THREADS) => {
+                    let text = pkg.text(part, MAX_PARSED)?;
+                    for old in thread_ids(&text, part, &pkg.origin)? {
+                        if !self.threads.insert(old.clone()) {
+                            let new = self.thread(pkg.origin.input, &old);
+                            moved.threads.insert(old, new);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Ok(moved)
+    }
+
+    /// `old`, or the lowest block no VML part uses when one does.
+    fn block(&mut self, old: u32) -> u32 {
+        if self.blocks.insert(old) {
+            return old;
+        }
+        let free = (1..).find(|b| !self.blocks.contains(b));
+        let free = free.expect("a free block");
+        self.blocks.insert(free);
+        free
+    }
+
+    /// An id for a thread whose id `old` is taken.
+    fn thread(&mut self, input: usize, old: &str) -> String {
+        let free = (0u32..).find_map(|attempt| {
+            let new = guid((input, old, attempt));
+            self.threads.insert(new.clone()).then_some(new)
+        });
+        free.expect("a free id")
+    }
+}
+
+/// The output's people: the base's, then those of appended workbooks with an id it lacks.
+#[derive(Default)]
+pub struct Persons {
+    /// The base's part with its text.
+    part: Option<(String, String)>,
+    tree: Option<Node>,
+    known: HashSet<String>,
+    changed: bool,
+}
+
+fn person_id(person: &Node) -> String {
+    person
+        .attr("", "id")
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
+
+impl Persons {
+    pub fn of(book: &Book, pkg: &mut Package) -> Result<Self, Error> {
+        let Some(held) = book.held_type(pkg, PERSON_REL)? else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            known: held.tree.nodes().map(person_id).collect(),
+            part: Some((held.part, held.text)),
+            tree: Some(held.tree),
+            changed: false,
+        })
+    }
+
+    /// Takes in an appended workbook's people.
+    pub fn add(&mut self, book: &Book, pkg: &mut Package) -> Result<(), Error> {
+        let Some(held) = book.held_type(pkg, PERSON_REL)? else {
+            return Ok(());
+        };
+        let Some(out) = &mut self.tree else {
+            self.known = held.tree.nodes().map(person_id).collect();
+            self.tree = Some(held.tree);
+            self.changed = true;
+            return Ok(());
+        };
+        let mut root = Prefixes::of(&out.attrs);
+        let local = root.merge(&held.tree.attrs);
+        out.attrs = root.attrs;
+        let own = element_prefix(&out.name).to_string();
+        for person in held.tree.nodes() {
+            if self.known.insert(person_id(person)) {
+                let person = adopt(person, THREADS_NS, &own, &local);
+                out.children.push(Child::Node(person));
+                self.changed = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self, plan: &mut Plan, rels: &mut Rels, main: &str) {
+        let Some(tree) = self.tree.filter(|_| self.changed) else {
+            return;
+        };
+        let head = self.part.as_ref().map(|(_, text)| declaration(text));
+        let mut text = head.unwrap_or(super::DECLARATION.to_string());
+        tree.write(&mut text);
+        match self.part {
+            Some((part, _)) => plan.replace(&part, Body::Data(text.into_bytes())),
+            None => {
+                let name = "xl/persons/person.xml";
+                new_part(plan, rels, main, name, PERSON_REL, PEOPLE, text);
+            }
+        }
     }
 }
 
@@ -162,12 +312,17 @@ pub fn rewrite(plan: &mut Plan, inputs: &[Package], i: usize, index: usize, maps
         let wanted = match kind {
             VML | DRAWING => formulas || shapes,
             CHART | CHART_EX | CHART_SHAPES | CONTROL => formulas,
+            NOTES | THREADS => !moved.threads.is_empty(),
             _ => false,
         };
         let Some(copied) = plan.copied(i, part).filter(|_| wanted).map(str::to_string) else {
             continue;
         };
-        let vml = kind == VML;
+        let edit: Option<Edit> = match kind {
+            VML => Some(|job, text| job.vml(text)),
+            NOTES | THREADS => Some(|job, text| job.threads(text)),
+            _ => None,
+        };
         let maps = maps.clone();
         let source = part.clone();
         plan.replace(
@@ -181,15 +336,17 @@ pub fn rewrite(plan: &mut Plan, inputs: &[Package], i: usize, index: usize, maps
                     part: &source,
                     origin: &origin,
                 };
-                if vml {
-                    out.write_all(job.vml(&text)?.as_bytes()).map_err(io)
-                } else {
-                    job.xml(&text, out)
+                match edit {
+                    Some(edit) => out.write_all(edit(&job, &text)?.as_bytes()).map_err(io),
+                    None => job.xml(&text, out),
                 }
             })),
         );
     }
 }
+
+/// A rewrite of a whole part as text.
+type Edit = fn(&Job, &str) -> Result<String, Error>;
 
 /// `text` with what follows each `needle`, up to where `stop` holds, replaced by what `new`
 /// gives, if anything.
@@ -331,6 +488,20 @@ impl Job<'_> {
                 _ => {}
             }
         }
+    }
+
+    /// A notes or threaded comments part with its repeated thread ids replaced: a note holds
+    /// its thread's id as `tc={id}` author and `xr:uid`.
+    fn threads(&self, text: &str) -> Result<String, Error> {
+        edit_after(
+            text,
+            "{",
+            |c| !(c.is_ascii_hexdigit() || c == '-'),
+            &mut |id| {
+                let new = self.moved().threads.get(&id.to_ascii_uppercase());
+                Ok(new.cloned())
+            },
+        )
     }
 
     /// A VML part with its shape ids and formulas followed. VML is edited as text: Excel

@@ -10,6 +10,9 @@ const MERGES: &[(&str, &[&str], StyleMode)] = &[
     ("ab.xlsx", &["a.xlsx", "b.xlsx"], StyleMode::Keep),
     ("abb.xlsx", &["a.xlsx", "b.xlsx", "b.xlsx"], StyleMode::Keep),
     ("bb.xlsx", &["b.xlsx", "b.xlsx"], StyleMode::Keep),
+    ("aa.xlsx", &["a.xlsx", "a.xlsx"], StyleMode::Keep),
+    ("ba.xlsx", &["b.xlsx", "a.xlsx"], StyleMode::Keep),
+    ("pa.xlsx", &["p.xlsx", "a.xlsx"], StyleMode::Keep),
     ("abc.docx", &["a.docx", "b.docx", "c.docx"], StyleMode::Keep),
     (
         "abc-first.docx",

@@ -1269,3 +1269,128 @@ fn a_chart_formula_that_can_t_be_read_is_refused() {
     assert!(e.message.contains("xl/charts/chart1.xml"), "{}", e.message);
     assert!(!out.exists());
 }
+
+const TC_NS: &str =
+    r#"xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments""#;
+
+/// A one-sheet workbook with a threaded comments part and a people part.
+fn threaded_book(comments: &str, people: &str) -> Vec<(String, Vec<u8>)> {
+    let mut parts = book(&[("Sheet1", "")], None);
+    with_sheet_part(
+        &mut parts,
+        "xl/threadedComments/threadedComment1.xml",
+        "application/vnd.ms-excel.threadedcomments+xml",
+        "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment",
+        &format!("<ThreadedComments {TC_NS}>{comments}</ThreadedComments>"),
+        "",
+    );
+    let body = format!("<personList {TC_NS}>{people}</personList>");
+    set(&mut parts, "xl/persons/person.xml", body.as_bytes());
+    let types = text(&parts, "[Content_Types].xml").replace(
+        "</Types>",
+        r#"<Override PartName="/xl/persons/person.xml" ContentType="application/vnd.ms-excel.person+xml"/></Types>"#,
+    );
+    set(&mut parts, "[Content_Types].xml", types.as_bytes());
+    let list = text(&parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        r#"<Relationship Id="rId80" Type="http://schemas.microsoft.com/office/2017/10/relationships/person" Target="persons/person.xml"/></Relationships>"#,
+    );
+    set(&mut parts, "xl/_rels/workbook.xml.rels", list.as_bytes());
+    parts
+}
+
+fn attribute_values<'t>(xml: &'t str, name: &str) -> Vec<&'t str> {
+    let needle = format!(r#" {name}=""#);
+    let values = xml.split(&needle).skip(1);
+    values.map(|v| v.split('"').next().unwrap()).collect()
+}
+
+#[test]
+fn a_thread_id_never_repeats_and_its_note_follows() {
+    let (_, parts) = merged("threads", &["a.xlsx", "a.xlsx"]);
+    let old = "{20C5690B-56D9-4D68-ACC2-B4FD8C765770}";
+    let copy = text(&parts, "xl/threadedComments/threadedComment2.xml");
+    let id = attribute_values(&copy, "id")[0];
+    assert_ne!(id, old);
+    assert_eq!(id.len(), old.len());
+    let people = text(&parts, "xl/persons/person.xml");
+    assert!(people.contains(attribute_values(&copy, "personId")[0]));
+    assert_eq!(people.matches("<person ").count(), 1, "{people}");
+    let notes = text(&parts, "xl/comments2.xml");
+    assert!(
+        notes.contains(&format!("<author>tc={id}</author>")),
+        "{notes}"
+    );
+    assert!(notes.contains(&format!(r#"xr:uid="{id}""#)), "{notes}");
+    assert!(!notes.contains(old), "{notes}");
+    assert!(
+        notes.contains("{83544F41-E56B-4473-BDD1-C62981D4A83B}"),
+        "{notes}"
+    );
+    let base = entries(&fixture("a.xlsx"));
+    for part in [
+        "xl/comments1.xml",
+        "xl/threadedComments/threadedComment1.xml",
+    ] {
+        assert_eq!(text(&parts, part), text(&base, part), "{part}");
+    }
+}
+
+#[test]
+fn a_base_with_no_people_gets_them() {
+    let (_, parts) = merged("people", &["b.xlsx", "a.xlsx"]);
+    let a = entries(&fixture("a.xlsx"));
+    assert_eq!(
+        text(&parts, "xl/persons/person.xml"),
+        text(&a, "xl/persons/person.xml")
+    );
+    let list = text(&parts, "xl/_rels/workbook.xml.rels");
+    assert!(list.contains("2017/10/relationships/person"), "{list}");
+    let types = text(&parts, "[Content_Types].xml");
+    assert!(
+        types.contains(r#"PartName="/xl/persons/person.xml""#),
+        "{types}"
+    );
+    assert!(
+        types.contains("application/vnd.ms-excel.person+xml"),
+        "{types}"
+    );
+    let copy = text(&parts, "xl/threadedComments/threadedComment1.xml");
+    assert_eq!(copy, text(&a, "xl/threadedComments/threadedComment1.xml"));
+}
+
+#[test]
+fn people_merge_by_id_and_replies_keep_their_parent() {
+    let dir = temp_dir("people-merge");
+    let (one, two) = (
+        "{11111111-1111-4111-8111-111111111111}",
+        "{22222222-2222-4222-8222-222222222222}",
+    );
+    let thread = "{AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA}";
+    let reply = "{BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB}";
+    let person = |id: &str, name: &str| {
+        format!(r#"<person displayName="{name}" id="{id}" userId="{name}" providerId="None"/>"#)
+    };
+    let comment = format!(
+        r#"<threadedComment ref="A1" personId="{one}" id="{thread}"><text>Hi</text></threadedComment><threadedComment ref="A1" personId="{two}" id="{reply}" parentId="{thread}"><text>Hi {{there}}</text><mentions><mention mentionpersonId="{one}" mentionId="{reply}" startIndex="0" length="2"/></mentions></threadedComment>"#
+    );
+    let base = threaded_book(&comment, &person(one, "First"));
+    let other = threaded_book(&comment, &(person(one, "Renamed") + &person(two, "Second")));
+    let paths = [
+        book_file(&dir, "base.xlsx", &base),
+        book_file(&dir, "other.xlsx", &other),
+    ];
+    let (_, parts) = merged_files("people-merge-out", &paths);
+    let people = text(&parts, "xl/persons/person.xml");
+    assert_eq!(
+        attribute_values(&people, "displayName"),
+        ["First", "Second"]
+    );
+    let copy = text(&parts, "xl/threadedComments/threadedComment2.xml");
+    let ids = attribute_values(&copy, "id");
+    assert!(!ids.contains(&thread) && !ids.contains(&reply), "{copy}");
+    assert_eq!(attribute_values(&copy, "parentId"), [ids[0]]);
+    assert_eq!(attribute_values(&copy, "mentionId"), [ids[1]]);
+    assert_eq!(attribute_values(&copy, "personId"), [one, two]);
+    assert!(copy.contains("Hi {there}"), "{copy}");
+}
