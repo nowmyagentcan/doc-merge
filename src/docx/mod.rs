@@ -23,7 +23,7 @@ use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, sta
 use crate::{Origin, Rename, StyleMode};
 use headers::Slot;
 use ids::{Field, Ids, Local, Tally};
-use notes::{KINDS, Notes};
+use notes::{KINDS, Notes, Sides};
 use numbering::Lists;
 use styles::{Sheet, Source, Theme};
 
@@ -52,7 +52,19 @@ struct Held {
 }
 
 fn held(pkg: &mut Package, main: &str, rels: &[Rel], kind: &str) -> Result<Option<Held>, Error> {
-    let wanted = format!("{REL}{kind}");
+    let large = KINDS.iter().any(|k| k.0 == kind);
+    let cap = if large { MAX_STREAMED } else { MAX_PARSED };
+    held_by(pkg, main, rels, &format!("{REL}{kind}"), cap)
+}
+
+/// The part with relationship type `wanted`.
+fn held_by(
+    pkg: &mut Package,
+    main: &str,
+    rels: &[Rel],
+    wanted: &str,
+    cap: u64,
+) -> Result<Option<Held>, Error> {
     let Some(r) = rels.iter().find(|r| r.kind == wanted && !r.external) else {
         return Ok(None);
     };
@@ -62,8 +74,7 @@ fn held(pkg: &mut Package, main: &str, rels: &[Rel], kind: &str) -> Result<Optio
             .origin
             .bad(&format!("{main} points to a missing part {}", r.target)));
     };
-    let large = KINDS.iter().any(|k| k.0 == kind);
-    let text = pkg.text(&part, if large { MAX_STREAMED } else { MAX_PARSED })?;
+    let text = pkg.text(&part, cap)?;
     let tree = xml::tree(&text, &part, &pkg.origin)?;
     Ok(Some(Held { part, text, tree }))
 }
@@ -113,6 +124,7 @@ struct Merger<'a> {
     /// Paragraph ids of the main part.
     paras: HashSet<u32>,
     notes: Vec<Notes>,
+    sides: Sides,
     root: Prefixes,
     docs: Vec<Rewrite>,
     sections: Vec<usize>,
@@ -147,6 +159,7 @@ impl<'a> Merger<'a> {
         for kind in KINDS {
             notes.push(Notes::open(&mut inputs[0], &main, &base_rels, kind)?);
         }
+        let sides = Sides::open(&mut inputs[0], &main, &base_rels)?;
         Ok(Self {
             plan,
             rels: Rels::new(base_rels.clone()),
@@ -168,6 +181,7 @@ impl<'a> Merger<'a> {
             bookmarks: HashSet::new(),
             paras: HashSet::new(),
             notes,
+            sides,
             root: Prefixes::default(),
             docs: vec![],
             sections: vec![],
@@ -380,11 +394,15 @@ impl<'a> Merger<'a> {
         {
             s.attrs.extend(local.iter().cloned());
         }
+        let mut comment_paras = HashMap::new();
         for (k, h) in doc_notes.iter().enumerate() {
             if let Some(h) = h {
-                rw.notes[k] = self.notes[k].add(&mut self.plan, self.inputs, i, h, &mut rw)?;
+                let (ids, paras) = self.notes[k].add(&mut self.plan, self.inputs, i, h, &mut rw)?;
+                rw.notes[k] = ids;
+                comment_paras = paras;
             }
         }
+        self.sides.add(&mut self.inputs[i], &own, &comment_paras)?;
         self.copy_body_rels(i, &own, &uses, &stories, &mut rw)?;
         if twins {
             self.add_twins(i, &own, &uses, &mut rw)?;
@@ -482,6 +500,8 @@ impl<'a> Merger<'a> {
                 &origin,
             )?;
         }
+        self.sides
+            .finish(&mut self.plan, &mut self.rels, &main, &origin)?;
         if self.needs_twins(0) {
             self.even_setting(&origin)?;
         }

@@ -97,6 +97,8 @@ fn untouched_parts_are_copied_byte_for_byte_and_runs_repeat() {
     let rewritten = |n: &str| {
         n == "[Content_Types].xml"
             || n == "word/settings.xml"
+            || n == "word/people.xml"
+            || n.starts_with("word/comments")
             || n.starts_with("word/document.xml")
             || n == "word/_rels/document.xml.rels"
             || n.starts_with("word/styles.xml")
@@ -756,4 +758,134 @@ fn a_twin_shares_no_bookmark_or_drawing_id_with_its_part() {
     }
     assert_eq!(drawings, ["3", "4"]);
     assert_eq!(marks, 1);
+}
+
+#[test]
+fn comment_threads_join_the_outputs_parts() {
+    let (_, parts) = merged("threads", &["a.docx", "b.docx"]);
+    let paras = |part: &str, element: &str, attr: &str| values(&text(&parts, part), element, attr);
+    assert_eq!(
+        paras("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
+        ["43C80516", "1201BCCF"].map(String::from).to_vec()
+    );
+    let ids = paras(
+        "word/commentsIds.xml",
+        "w16cid:commentId",
+        "w16cid:durableId",
+    );
+    assert_eq!(
+        ids,
+        paras(
+            "word/commentsExtensible.xml",
+            "w16cex:commentExtensible",
+            "w16cex:durableId"
+        )
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        paras("word/people.xml", "w15:person", "w15:author"),
+        ["Author A", "Author B"]
+    );
+}
+
+#[test]
+fn the_same_comments_twice_keep_their_threads_apart() {
+    let (_, parts) = merged("threads-twice", &["a.docx", "a.docx"]);
+    let comments = text(&parts, "word/comments.xml");
+    let in_comments = values(&comments, "w:p", "w14:paraId");
+    assert_eq!(in_comments.len(), 2);
+    assert_ne!(in_comments[0], in_comments[1]);
+    let extended = text(&parts, "word/commentsExtended.xml");
+    assert_eq!(
+        values(&extended, "w15:commentEx", "w15:paraId"),
+        in_comments
+    );
+    let in_ids = text(&parts, "word/commentsIds.xml");
+    assert_eq!(
+        values(&in_ids, "w16cid:commentId", "w16cid:paraId"),
+        in_comments
+    );
+    let durable = values(&in_ids, "w16cid:commentId", "w16cid:durableId");
+    assert_ne!(durable[0], durable[1]);
+    let extensible = text(&parts, "word/commentsExtensible.xml");
+    assert_eq!(
+        values(&extensible, "w16cex:commentExtensible", "w16cex:durableId"),
+        durable
+    );
+    let people = text(&parts, "word/people.xml");
+    assert_eq!(values(&people, "w15:person", "w15:author"), ["Author A"]);
+}
+
+#[test]
+fn a_base_without_comments_gets_the_parts_beside_them() {
+    let (_, parts) = merged("threads-new", &["c.docx", "b.docx", "a.docx"]);
+    let extended = text(&parts, "word/commentsExtended.xml");
+    assert_eq!(count(&extended, "<w15:commentEx "), 2);
+    assert!(extended.starts_with("<?xml") && extended.ends_with("</w15:commentsEx>"));
+    let rels = text(&parts, "word/_rels/document.xml.rels");
+    let types = text(&parts, "[Content_Types].xml");
+    for (part, kind) in [
+        ("commentsExtended", "2011/relationships/commentsExtended"),
+        ("commentsIds", "2016/09/relationships/commentsIds"),
+        (
+            "commentsExtensible",
+            "2018/08/relationships/commentsExtensible",
+        ),
+        ("people", "2011/relationships/people"),
+    ] {
+        assert!(rels.contains(kind), "{part}");
+        assert!(types.contains(&format!("/word/{part}.xml")), "{part}");
+    }
+    let people = text(&parts, "word/people.xml");
+    assert_eq!(
+        values(&people, "w15:person", "w15:author"),
+        ["Author B", "Author A"]
+    );
+}
+
+#[test]
+fn a_reply_follows_its_parent_when_ids_change() {
+    let dir = temp_dir("reply");
+    let w14 = "http://schemas.microsoft.com/office/word/2010/wordml";
+    let w15 = "http://schemas.microsoft.com/office/word/2012/wordml";
+    let comments = format!(
+        r#"<w:comments xmlns:w="{WORD_NS}" xmlns:w14="{w14}"><w:comment w:id="0" w:author="X"><w:p w14:paraId="0000000A"/></w:comment><w:comment w:id="1" w:author="X"><w:p w14:paraId="0000000B"/></w:comment></w:comments>"#
+    );
+    let extended = format!(
+        r#"<w15:commentsEx xmlns:w15="{w15}"><w15:commentEx w15:paraId="0000000A" w15:done="0"/><w15:commentEx w15:paraId="0000000B" w15:paraIdParent="0000000A" w15:done="0"/></w15:commentsEx>"#
+    );
+    let refs = r#"<w:p><w:r><w:commentReference w:id="0"/></w:r><w:r><w:commentReference w:id="1"/></w:r></w:p>"#;
+    let file = |name: &str| {
+        let mut parts = word_parts(refs, &[("word/comments.xml", "comments", &comments)]);
+        let kind =
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml";
+        let mut types = text(&parts, "[Content_Types].xml");
+        types = types.replace(
+            "</Types>",
+            &format!(
+                r#"<Override PartName="/word/commentsExtended.xml" ContentType="{kind}"/></Types>"#
+            ),
+        );
+        set(&mut parts, "[Content_Types].xml", types.as_bytes());
+        set(&mut parts, "word/commentsExtended.xml", extended.as_bytes());
+        let rel = format!("{OFFICE_REL}/comments");
+        let side = "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+        let main_rels = rels(&[
+            ("rId1", rel.as_str(), "comments.xml"),
+            ("rId2", side, "commentsExtended.xml"),
+        ]);
+        set(
+            &mut parts,
+            "word/_rels/document.xml.rels",
+            main_rels.as_bytes(),
+        );
+        write(&dir, name, &build(&parts))
+    };
+    let (_, parts) = merge_files(&dir, &[file("a.docx"), file("b.docx")]);
+    let out = text(&parts, "word/commentsExtended.xml");
+    let ids = values(&out, "w15:commentEx", "w15:paraId");
+    let parents = values(&out, "w15:commentEx", "w15:paraIdParent");
+    assert_eq!(ids.len(), 4);
+    assert_eq!(parents, [ids[0].clone(), ids[2].clone()]);
+    assert_ne!(ids[0], ids[2]);
 }
