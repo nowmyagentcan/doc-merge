@@ -5,6 +5,7 @@
 pub mod docx;
 pub mod error;
 pub mod package;
+pub mod paths;
 pub mod pptx;
 pub mod writer;
 pub mod xlsx;
