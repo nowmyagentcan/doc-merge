@@ -14,20 +14,29 @@ pub mod xml;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
-use error::{Error, Warnings};
+use error::{Error, Warnings, mib};
 use package::{Family, Kind, Package};
+use paths::Target;
 
-/// Opens every input in order, then checks that they are all of one family.
-pub fn open_inputs(paths: &[PathBuf], run: &Rc<Run>) -> Result<Vec<Package>, Error> {
-    let pkgs = paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| Package::open(p, i + 1, run))
-        .collect::<Result<Vec<_>, _>>()?;
+/// Set on Ctrl+C: a run under way ends at its next look at the clock, removing its temp file.
+pub static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Opens the inputs after `first`, the first of `paths`, in order, then checks that they are
+/// all of one family.
+pub fn open_inputs(
+    first: Package,
+    paths: &[PathBuf],
+    run: &Rc<Run>,
+) -> Result<Vec<Package>, Error> {
+    let mut pkgs = vec![first];
+    for (i, p) in paths.iter().enumerate().skip(1) {
+        pkgs.push(Package::open(p, i + 1, run)?);
+    }
     let mut counts = [0; 3];
     for p in &pkgs {
         counts[p.kind.family() as usize] += 1;
@@ -40,6 +49,8 @@ pub fn open_inputs(paths: &[PathBuf], run: &Rc<Run>) -> Result<Vec<Package>, Err
 
 /// The most bytes one run inflates, over all its inputs.
 pub const MAX_INFLATED: u64 = 4 << 30;
+/// The largest size of all the inputs of a run together.
+pub const MAX_INPUTS: u64 = 2 << 30;
 
 /// What one merge may still spend: bytes to inflate and time.
 #[derive(Debug)]
@@ -75,6 +86,9 @@ impl Run {
     }
 
     pub fn on_time(&self) -> Result<(), Error> {
+        if STOP.load(Ordering::Relaxed) {
+            return Err(Error::stopped());
+        }
         match self.deadline {
             Some(d) if Instant::now() >= d => Err(Error::timeout()),
             _ => Ok(()),
@@ -107,9 +121,15 @@ impl Origin {
     }
 }
 
+/// A path as text in JSON, also when it isn't valid Unicode.
+fn lossy<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&path.to_string_lossy())
+}
+
 /// The merged file.
 #[derive(Debug, Serialize)]
 pub struct Output {
+    #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
     pub kind: Kind,
     pub bytes: u64,
@@ -118,6 +138,7 @@ pub struct Output {
 /// One input and where its content landed.
 #[derive(Debug, Serialize)]
 pub struct Input {
+    #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
     pub kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +183,9 @@ pub struct Report {
     pub renames_omitted: usize,
     pub warnings: Warnings,
     pub elapsed_ms: u64,
+    /// How long each step took, in milliseconds, for `--debug`.
+    #[serde(skip)]
+    pub steps: [(&'static str, u64); 3],
 }
 
 /// How clashing Word styles are settled.
@@ -179,16 +203,27 @@ pub struct Options {
     pub styles: StyleMode,
 }
 
-/// Merges `paths` (the first is the base) into a new file at `output`.
+/// Merges `paths` (at least one; the first is the base) into a new file where `target` says.
+/// The first file settles what kind the output is, so a wrong `-o` is found before a refusal
+/// of a later file, as its exit code is higher.
 pub fn merge(
     paths: &[PathBuf],
-    output: &Path,
+    target: &Target,
     options: &Options,
     deadline: Option<Instant>,
 ) -> Result<Report, Error> {
     let started = Instant::now();
+    let total = paths.iter().flat_map(std::fs::metadata).map(|m| m.len());
+    let total: u64 = total.sum();
+    if total > MAX_INPUTS {
+        let what = "The total size of the files";
+        return Err(Error::limit_exceeded(what, &mib(total), &mib(MAX_INPUTS)));
+    }
     let run = Run::new(deadline);
-    let mut inputs = open_inputs(paths, &run)?;
+    let first = Package::open(&paths[0], 1, &run)?;
+    let place = target.place(paths, first.kind.family())?;
+    let mut inputs = open_inputs(first, paths, &run)?;
+    let opened = Instant::now();
     let mut warnings = Warnings::default();
     let family = inputs[0].kind.family();
     let mut listed: Vec<Input> = inputs
@@ -232,12 +267,16 @@ pub fn merge(
             (m.plan, m.renames)
         }
     };
-    let bytes = writer::write(plan, &mut inputs, output)?;
+    let planned = Instant::now();
+    let (bytes, output) = writer::write(plan, &mut inputs, &place)?;
+    let done = Instant::now();
+    let ms = |from: Instant, to: Instant| (to - from).as_millis() as u64;
+    renames.sort_by_key(|r| r.input);
     let renames_omitted = renames.len().saturating_sub(MAX_RENAMES);
     renames.truncate(MAX_RENAMES);
     Ok(Report {
         output: Output {
-            path: std::path::absolute(output).unwrap_or_else(|_| output.into()),
+            path: std::path::absolute(&output).unwrap_or(output),
             kind: family.output(),
             bytes,
         },
@@ -245,6 +284,11 @@ pub fn merge(
         renames,
         renames_omitted,
         warnings,
-        elapsed_ms: started.elapsed().as_millis() as u64,
+        elapsed_ms: ms(started, done),
+        steps: [
+            ("open", ms(started, opened)),
+            ("plan", ms(opened, planned)),
+            ("write", ms(planned, done)),
+        ],
     })
 }

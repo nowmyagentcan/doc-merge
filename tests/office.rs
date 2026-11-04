@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use doc_merge::paths::Target;
 use doc_merge::{Options, StyleMode, merge};
 
 const MERGES: &[(&str, &[&str], StyleMode)] = &[
@@ -41,6 +42,11 @@ fn write_merged_fixtures() {
         let _ = std::fs::remove_file(&target);
         let paths: Vec<PathBuf> = inputs.iter().map(|i| fixtures.join(i)).collect();
         let options = Options { styles: *styles };
+        let output = Some(target);
+        let target = Target {
+            output,
+            overwrite: true,
+        };
         merge(&paths, &target, &options, None).unwrap();
     }
 }

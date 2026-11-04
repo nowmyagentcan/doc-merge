@@ -3,7 +3,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use doc_merge::{Options, Report, StyleMode, merge};
+use doc_merge::{Options, Report, StyleMode};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

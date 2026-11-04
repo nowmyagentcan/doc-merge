@@ -92,6 +92,15 @@ impl Kind {
 }
 
 impl Family {
+    /// The extension of the family's merged files.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Family::Word => "docx",
+            Family::PowerPoint => "pptx",
+            Family::Excel => "xlsx",
+        }
+    }
+
     /// The kind every merged output of this family is.
     pub fn output(self) -> Kind {
         match self {

@@ -211,6 +211,11 @@ impl Error {
         new("timeout", 3, "Stopped after 600 s.".into(), Some(hint))
     }
 
+    /// A Ctrl+C ended the run.
+    pub fn stopped() -> Self {
+        new("stopped", 130, "Stopped.".into(), None)
+    }
+
     pub fn port_in_use(port: u16) -> Self {
         let m = format!("Port {port} is in use.");
         new("port_in_use", 3, m, Some("Use --port 0 for a free port."))

@@ -4,9 +4,9 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,6 +20,7 @@ use crate::package::{
     self, CONTENT_TYPES, ContentTypes, MAX_PARSED, Package, RELS_TYPE, ROOT_RELS, Rel,
     SIGNATURE_ORIGIN, is_signature, parse_rels, rels_name, resolve, unescape,
 };
+use crate::paths::Place;
 use crate::xml::Reader;
 
 /// Output entries and the output itself stay under 2 GiB (no ZIP64 is written).
@@ -591,6 +592,28 @@ pub fn check(plan: &Plan, inputs: &mut [Package]) -> Result<(), Error> {
 /// A temp file beside the output, removed unless it was renamed into place.
 struct Temp(Option<PathBuf>);
 
+impl Temp {
+    /// Gives the finished file its name. Without `replace` a file that took the name meanwhile
+    /// stays: a hard link fails on a taken name where a rename would replace it, and the temp
+    /// name then goes on drop. A file system without hard links falls back on a look first.
+    fn publish(&mut self, path: &Path, replace: bool) -> io::Result<()> {
+        let from = self.0.as_ref().expect("published once");
+        if !replace {
+            match fs::hard_link(from, path) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(e),
+                Err(_) if fs::symlink_metadata(path).is_ok() => {
+                    return Err(ErrorKind::AlreadyExists.into());
+                }
+                Err(_) => {}
+            }
+        }
+        fs::rename(from, path)?;
+        self.0 = None;
+        Ok(())
+    }
+}
+
 impl Drop for Temp {
     fn drop(&mut self) {
         if let Some(p) = &self.0 {
@@ -623,20 +646,17 @@ fn too_big(what: &str, n: u64) -> Error {
     Error::limit_exceeded(what, &mib(n), "2,047 MiB")
 }
 
-/// Checks the plan, writes it to a temp file in `path`'s folder and renames that into place.
-/// Returns the output's size.
-pub fn write(plan: Plan, inputs: &mut [Package], path: &Path) -> Result<u64, Error> {
+/// Checks the plan, writes it to a temp file in `place`'s folder and renames that into place.
+/// Returns the output's size and path.
+pub fn write(plan: Plan, inputs: &mut [Package], place: &Place) -> Result<(u64, PathBuf), Error> {
     check(&plan, inputs)?;
-    let shown = path.to_string_lossy();
-    let failed = |e: std::io::Error| Error::write_failed(&shown, &e);
+    let dir = place.dir();
+    let shown = dir.to_string_lossy();
+    let failed = |e: io::Error| Error::write_failed(&shown, &e);
     static N: AtomicUsize = AtomicUsize::new(0);
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    fs::create_dir_all(dir).map_err(failed)?;
     let temp_path = dir.join(format!(
-        ".{file_name}.{}-{}.tmp",
+        ".doc-merge-{}-{}.tmp",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
@@ -706,12 +726,16 @@ pub fn write(plan: Plan, inputs: &mut [Package], path: &Path) -> Result<u64, Err
     if size > MAX_OUTPUT {
         return Err(too_big("The merged file", size));
     }
-    let temp_path = temp.0.take().unwrap();
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        temp.0 = Some(temp_path);
-        return Err(failed(e));
+    let mut taken = None;
+    for path in place.paths() {
+        match temp.publish(&path, place.replaces()) {
+            Ok(()) => return Ok((size, path)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => taken = Some(path),
+            Err(e) => return Err(Error::write_failed(&path.to_string_lossy(), &e)),
+        }
     }
-    Ok(size)
+    let taken = taken.unwrap_or_default();
+    Err(Error::output_exists(&taken.to_string_lossy()))
 }
 
 #[cfg(test)]

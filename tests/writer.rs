@@ -7,10 +7,20 @@ use common::*;
 use doc_merge::Run;
 use doc_merge::error::{Error, Warnings};
 use doc_merge::package::{Package, Rel, resolve};
+use doc_merge::paths::Place;
 use doc_merge::writer::{self, Body, Plan};
 use quick_xml::events::{BytesStart, BytesText, Event};
 
 const PNG: &str = "image/png";
+
+/// Writes `plan` to exactly `path` and returns the file's size.
+fn write_to(plan: Plan, inputs: &mut [Package], path: &Path) -> Result<u64, Error> {
+    let place = Place::File {
+        path: path.into(),
+        replace: true,
+    };
+    writer::write(plan, inputs, &place).map(|(size, _)| size)
+}
 
 /// A Word package with a picture, properties and a part the main part points at.
 fn word_with_parts() -> Vec<(String, Vec<u8>)> {
@@ -54,7 +64,7 @@ fn the_base_is_copied_as_stored_in_its_order() {
     let a = write(&dir, "a.docx", &bytes);
     let (plan, mut inputs, warnings) = base_plan(&a);
     let out = dir.join("out.docx");
-    let size = writer::write(plan, &mut inputs, &out).unwrap();
+    let size = write_to(plan, &mut inputs, &out).unwrap();
     assert!(warnings.list().is_empty());
 
     let written = std::fs::read(&out).unwrap();
@@ -93,7 +103,7 @@ fn templates_and_shows_become_documents() {
         let a = write(&dir, &format!("a.{kind}"), &build(&minimal(kind, &[])));
         let (plan, mut inputs, _) = base_plan(&a);
         let out = dir.join(format!("out-{kind}.{to}"));
-        writer::write(plan, &mut inputs, &out).unwrap();
+        write_to(plan, &mut inputs, &out).unwrap();
         let reopened = Package::open(&out, 1, &Run::new(None)).unwrap();
         assert_eq!(format!("{:?}", reopened.kind).to_lowercase(), to, "{kind}");
         let ct = text(&entries(&out), "[Content_Types].xml");
@@ -137,7 +147,7 @@ fn signatures_are_left_out() {
     let a = write(&dir, "s.docx", &build(&parts));
     let (plan, mut inputs, warnings) = base_plan(&a);
     let out = dir.join("out.docx");
-    writer::write(plan, &mut inputs, &out).unwrap();
+    write_to(plan, &mut inputs, &out).unwrap();
     let got = entries(&out);
     assert!(got.iter().all(|e| !e.0.starts_with("_xmlsignatures")));
     assert!(!text(&got, "_rels/.rels").contains("digital-signature"));
@@ -171,7 +181,7 @@ fn new_and_rewritten_parts_are_deflated_with_their_dates() {
     let doc = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><a:blip xmlns:a="urn:a" r:embed="rId1"/></w:body></w:document>"#;
     plan.replace("word/document.xml", Body::Data(doc.to_vec()));
     let out = dir.join("out.docx");
-    writer::write(plan, &mut inputs, &out).unwrap();
+    write_to(plan, &mut inputs, &out).unwrap();
 
     let got = stored(&out);
     let time = |n: &str| got.iter().find(|e| e.0 == n).unwrap().2;
@@ -195,6 +205,57 @@ fn new_and_rewritten_parts_are_deflated_with_their_dates() {
 }
 
 #[test]
+fn a_file_that_appears_meanwhile_is_never_replaced() {
+    let dir = temp_dir("appears");
+    let a = write(&dir, "a.docx", &build(&minimal("docx", &[])));
+    let (plan, mut inputs, _) = base_plan(&a);
+    let path = write(&dir, "out.docx", b"theirs");
+    let place = Place::File {
+        path: path.clone(),
+        replace: false,
+    };
+    let e = writer::write(plan, &mut inputs, &place).unwrap_err();
+    assert_eq!(e.code, "output_exists");
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+    assert_eq!(files_in(&dir), 2, "no temp file is left");
+
+    let free = Place::Free {
+        dir: dir.clone(),
+        ext: "docx",
+    };
+    write(&dir, "merged.docx", b"theirs");
+    let (plan, mut inputs, _) = base_plan(&a);
+    let (_, path) = writer::write(plan, &mut inputs, &free).unwrap();
+    assert_eq!(path, dir.join("merged-2.docx"));
+    assert_eq!(std::fs::read(dir.join("merged.docx")).unwrap(), b"theirs");
+    assert_eq!(files_in(&dir), 4, "no temp file is left");
+
+    for n in 3..=999 {
+        write(&dir, &format!("merged-{n}.docx"), b"");
+    }
+    let (plan, mut inputs, _) = base_plan(&a);
+    let e = writer::write(plan, &mut inputs, &free).unwrap_err();
+    assert_eq!(e.code, "output_exists");
+    assert!(e.message.contains("merged-999.docx"), "{}", e.message);
+    assert_eq!(files_in(&dir), 1001, "no temp file is left");
+}
+
+#[test]
+fn a_new_folder_is_made_for_a_free_name() {
+    let dir = temp_dir("new-folder");
+    let a = write(&dir, "a.docx", &build(&minimal("docx", &[])));
+    let (plan, mut inputs, _) = base_plan(&a);
+    let new = dir.join("x").join("y");
+    let place = Place::Free {
+        dir: new.clone(),
+        ext: "docx",
+    };
+    let (_, path) = writer::write(plan, &mut inputs, &place).unwrap();
+    assert_eq!(path, new.join("merged.docx"));
+    assert!(path.is_file());
+}
+
+#[test]
 fn two_runs_give_the_same_bytes() {
     let dir = temp_dir("twice");
     let a = write(&dir, "a.dotx", &build(&minimal("dotx", &[])));
@@ -205,7 +266,7 @@ fn two_runs_give_the_same_bytes() {
         plan.type_part(&n, "application/xml", true);
         plan.add(n, Body::Data(b"<a/>".to_vec()), None);
         let out = dir.join(format!("out{i}.docx"));
-        writer::write(plan, &mut inputs, &out).unwrap();
+        write_to(plan, &mut inputs, &out).unwrap();
         outs.push(std::fs::read(out).unwrap());
     }
     assert_eq!(outs[0], outs[1]);
@@ -244,7 +305,7 @@ fn inconsistent_plans_fail_as_internal_with_no_output() {
         let (mut plan, mut inputs, _) = base_plan(&a);
         break_it(&mut plan);
         let out = dir.join("out.docx");
-        let e = writer::write(plan, &mut inputs, &out).unwrap_err();
+        let e = write_to(plan, &mut inputs, &out).unwrap_err();
         assert_eq!(e.code, "internal", "{want}");
         assert!(e.message.contains(want), "{want}: {}", e.message);
         assert!(!out.exists());
@@ -262,7 +323,7 @@ fn output_entries_stay_under_2_gib() {
         .size = Some(3 << 30);
     let a = write(&dir, "a.docx", &raw_zip(&list));
     let (plan, mut inputs, _) = base_plan(&a);
-    let e = writer::write(plan, &mut inputs, &dir.join("out.docx")).unwrap_err();
+    let e = write_to(plan, &mut inputs, &dir.join("out.docx")).unwrap_err();
     assert_eq!(e.code, "limit_exceeded");
     assert_eq!(
         e.message,
@@ -430,7 +491,7 @@ fn copy_appended(
         let target = resolve("word/document.xml", &r.target).unwrap();
         names.push(plan.copy_graph(&mut inputs, 1, &target, &handled)?);
     }
-    writer::write(plan, &mut inputs, out)?;
+    write_to(plan, &mut inputs, out)?;
     Ok(names)
 }
 

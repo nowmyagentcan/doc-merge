@@ -358,6 +358,20 @@ fn sizes_are_capped_before_and_while_reading() {
         "'huge.pptx' is over the limit: 513 MiB (at most 512 MiB)."
     );
 
+    let target = doc_merge::paths::Target::default();
+    let big = write(&dir, "big.docx", b"");
+    std::fs::File::options()
+        .write(true)
+        .open(&big)
+        .unwrap()
+        .set_len(500 << 20)
+        .unwrap();
+    let e = doc_merge::merge(&vec![big; 5], &target, &Default::default(), None).unwrap_err();
+    assert_eq!(
+        e.message,
+        "The total size of the files is over the limit: 2,500 MiB (at most 2,048 MiB)."
+    );
+
     let many: Vec<Raw> = (0..10_001)
         .map(|i| raw(&format!("x/{i}.png"), b""))
         .collect();
@@ -426,8 +440,10 @@ fn inputs_must_share_a_family() {
         .iter()
         .map(|k| write(&dir, &format!("f.{k}"), &build(&minimal(k, &[]))))
         .collect();
-    assert_eq!(open_inputs(&paths[..2], &Run::new(None)).unwrap().len(), 2);
-    let e = open_inputs(&paths, &Run::new(None)).unwrap_err();
+    let run = Run::new(None);
+    let first = || Package::open(&paths[0], 1, &run).unwrap();
+    assert_eq!(open_inputs(first(), &paths[..2], &run).unwrap().len(), 2);
+    let e = open_inputs(first(), &paths, &run).unwrap_err();
     assert_eq!(e.code, "mixed_formats");
     assert_eq!(
         e.message,

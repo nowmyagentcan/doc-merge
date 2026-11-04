@@ -1,16 +1,113 @@
-//! From arguments to input files: folders and patterns expanded in place, in natural order.
+//! From arguments to input files, with folders and patterns expanded in place in natural
+//! order, and from `-o` to where the merged file goes.
 
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, thousands};
+use crate::package::Family;
 
 /// The most files one run merges.
 pub const MAX_FILES: usize = 500;
 
 const EXTENSIONS: [&str; 7] = ["docx", "dotx", "pptx", "potx", "ppsx", "xlsx", "xltx"];
 const OUTPUT_EXTENSIONS: [&str; 3] = ["docx", "pptx", "xlsx"];
+
+/// What was asked of the output: `-o` and `--overwrite`.
+#[derive(Debug, Clone, Default)]
+pub struct Target {
+    pub output: Option<PathBuf>,
+    pub overwrite: bool,
+}
+
+/// Where a merge may write, decided before it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Place {
+    /// This path; a file there is replaced only with `replace`.
+    File { path: PathBuf, replace: bool },
+    /// The first free name of `merged.<ext>`, `merged-2.<ext>` … `merged-999.<ext>` in `dir`.
+    Free { dir: PathBuf, ext: &'static str },
+}
+
+impl Place {
+    pub fn dir(&self) -> &Path {
+        match self {
+            Place::File { path, .. } => folder_of(path),
+            Place::Free { dir, .. } => dir,
+        }
+    }
+
+    pub fn replaces(&self) -> bool {
+        matches!(self, Place::File { replace: true, .. })
+    }
+
+    /// The paths to try, in order.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        match self {
+            Place::File { path, .. } => vec![path.clone()],
+            Place::Free { dir, ext } => std::iter::once(format!("merged.{ext}"))
+                .chain((2..=999).map(|n| format!("merged-{n}.{ext}")))
+                .map(|name| dir.join(name))
+                .collect(),
+        }
+    }
+}
+
+fn folder_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Whether two paths are the same file; a path that doesn't exist is no file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) {
+            return (a.dev(), a.ino()) == (b.dev(), b.ino());
+        }
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+impl Target {
+    /// Where merging `inputs` into a file of `family` writes; no folder is looked at beyond
+    /// what the checks need, so a free name is found only when the file is ready.
+    pub fn place(&self, inputs: &[PathBuf], family: Family) -> Result<Place, Error> {
+        let ext = family.extension();
+        let Some(output) = &self.output else {
+            let dir = folder_of(&inputs[0]).to_path_buf();
+            return Ok(Place::Free { dir, ext });
+        };
+        let shown = output.to_string_lossy();
+        if output.is_dir() || shown.ends_with(['/', '\\']) {
+            let dir = match cfg!(windows) {
+                true => output.clone(),
+                false => PathBuf::from(shown.trim_end_matches('\\')),
+            };
+            return Ok(Place::Free { dir, ext });
+        }
+        if !output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+        {
+            let stem = output.file_stem().unwrap_or_default().to_string_lossy();
+            return Err(Error::bad_extension(ext, &stem));
+        }
+        if inputs.iter().any(|i| same_file(i, output)) {
+            return Err(Error::output_is_input(&shown));
+        }
+        if !self.overwrite && fs::symlink_metadata(output).is_ok() {
+            return Err(Error::output_exists(&shown));
+        }
+        Ok(Place::File {
+            path: output.clone(),
+            replace: self.overwrite,
+        })
+    }
+}
 
 /// The files `args` name, in order. A folder gives its top-level Office files, and an argument
 /// that doesn't exist with `*` or `?` in its last component gives the ones in its folder that
@@ -157,6 +254,94 @@ mod tests {
     fn names(files: &[PathBuf]) -> Vec<String> {
         let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
         files.iter().map(name).collect()
+    }
+
+    fn place(output: Option<&Path>, overwrite: bool, inputs: &[PathBuf]) -> Result<Place, Error> {
+        let target = Target {
+            output: output.map(Path::to_path_buf),
+            overwrite,
+        };
+        target.place(inputs, Family::PowerPoint)
+    }
+
+    #[test]
+    fn without_o_the_file_goes_beside_the_first_input() {
+        let free = |dir: &str| Place::Free {
+            dir: dir.into(),
+            ext: "pptx",
+        };
+        let input = Path::new("work").join("a.pptx");
+        assert_eq!(place(None, false, &[input]), Ok(free("work")));
+        let input = PathBuf::from("a.pptx");
+        let place = place(None, true, &[input]).unwrap();
+        assert_eq!(place, free("."));
+        assert!(!place.replaces());
+        let names = place.paths();
+        assert_eq!(
+            (names.len(), names[0].clone(), names[1].clone()),
+            (
+                999,
+                Path::new(".").join("merged.pptx"),
+                Path::new(".").join("merged-2.pptx")
+            )
+        );
+        assert_eq!(names[998], Path::new(".").join("merged-999.pptx"));
+    }
+
+    #[test]
+    fn o_names_a_folder_or_a_file_of_the_right_kind() {
+        let dir = folder("target", &["a.pptx", "taken.pptx"]);
+        let free = |dir: &Path| Place::Free {
+            dir: dir.into(),
+            ext: "pptx",
+        };
+        let inputs = [dir.join("a.pptx")];
+        assert_eq!(place(Some(&dir), true, &inputs), Ok(free(&dir)));
+        // A folder whose name looks like a file is still a folder.
+        let named = dir.join("sub.pptx");
+        assert_eq!(place(Some(&named), false, &inputs), Ok(free(&named)));
+        let new = PathBuf::from(format!("{}/new/", dir.display()));
+        assert_eq!(place(Some(&new), false, &inputs), Ok(free(&new)));
+
+        let path = dir.join("out.PPTX");
+        let replace = false;
+        assert_eq!(
+            place(Some(&path), false, &inputs),
+            Ok(Place::File { path, replace })
+        );
+        for (name, message) in [
+            ("all.docx", "The output is a .pptx file; name it all.pptx."),
+            ("all.potx", "The output is a .pptx file; name it all.pptx."),
+            ("all", "The output is a .pptx file; name it all.pptx."),
+        ] {
+            let e = place(Some(&dir.join(name)), true, &inputs).unwrap_err();
+            assert_eq!((e.code, e.exit), ("bad_extension", 2));
+            assert_eq!(e.message, message);
+        }
+    }
+
+    #[test]
+    fn a_taken_output_needs_overwrite_and_an_input_never_is_one() {
+        let dir = folder("taken", &["a.pptx", "taken.pptx"]);
+        let inputs = [dir.join("a.pptx")];
+        let path = dir.join("taken.pptx");
+        let e = place(Some(&path), false, &inputs).unwrap_err();
+        assert_eq!((e.code, e.exit), ("output_exists", 1));
+        assert_eq!(e.message, format!("{} already exists.", path.display()));
+        let replace = true;
+        assert_eq!(
+            place(Some(&path), true, &inputs),
+            Ok(Place::File {
+                path: path.clone(),
+                replace
+            })
+        );
+        for overwrite in [false, true] {
+            // The same file by another path.
+            let other = dir.join("sub.pptx").join("..").join("a.pptx");
+            let e = place(Some(&other), overwrite, &inputs).unwrap_err();
+            assert_eq!((e.code, e.exit), ("output_is_input", 1));
+        }
     }
 
     #[test]

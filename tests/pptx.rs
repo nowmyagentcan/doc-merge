@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use doc_merge::{Options, Report, merge};
+use doc_merge::{Options, Report};
 
 type Parts = Vec<(String, Vec<u8>)>;
 

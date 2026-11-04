@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use doc_merge::xlsx::a1::tokens;
-use doc_merge::{Options, Report, merge};
+use doc_merge::{Options, Report};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -5,7 +5,11 @@
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
+use doc_merge::error::Error;
+use doc_merge::paths::Target;
+use doc_merge::{Options, Report};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -25,6 +29,20 @@ pub fn temp_dir(test: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Merges `paths` into exactly `output`.
+pub fn merge(
+    paths: &[PathBuf],
+    output: &Path,
+    options: &Options,
+    deadline: Option<Instant>,
+) -> Result<Report, Error> {
+    let target = Target {
+        output: Some(output.into()),
+        overwrite: true,
+    };
+    doc_merge::merge(paths, &target, options, deadline)
 }
 
 pub fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
