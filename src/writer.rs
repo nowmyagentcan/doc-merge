@@ -65,7 +65,7 @@ pub struct Plan {
 type Stored = (String, usize, usize);
 
 /// Media parts over this size are never compared for sharing.
-const MAX_SHARED: u64 = 64 << 20;
+pub const MAX_SHARED: u64 = 64 << 20;
 
 fn is_media(part: &str, content_type: &str) -> bool {
     part.to_ascii_lowercase().contains("/media/")
@@ -474,7 +474,7 @@ fn source_of(rels: &str) -> Option<String> {
     })
 }
 
-fn is_xml(content_type: &str) -> bool {
+pub fn is_xml(content_type: &str) -> bool {
     content_type.ends_with("+xml") || content_type.ends_with("/xml")
 }
 

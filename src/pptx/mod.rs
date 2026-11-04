@@ -2,6 +2,8 @@
 //! Slides and what hangs off them are copied as stored; only the main part and its
 //! relationships are rebuilt.
 
+mod masters;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::Rename;
@@ -9,6 +11,7 @@ use crate::error::{Error, Warnings, thousands};
 use crate::package::{MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve};
 use crate::writer::{Body, Part, Plan, R, Rels, planned_text, relative, rels_part};
 use crate::xml::{self, Attr, Child, Node, XMLNS, declaration, prefix_of};
+use masters::{Design, Units};
 
 pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
@@ -33,6 +36,8 @@ const ORDER: [&str; 15] = [
 ];
 const MASTER_IDS: (u32, u32) = (1 << 31, u32::MAX);
 const SLIDE_IDS: (u32, u32) = (256, (1 << 31) - 1);
+/// A deck that doesn't say its slide size has this one.
+const DEFAULT_SIZE: (u64, u64) = (9_144_000, 6_858_000);
 
 /// What a merge of decks gives besides the plan.
 pub struct Merged {
@@ -57,6 +62,11 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
     }
     let mut plan = Plan::base(&inputs[0], warnings)?;
     let mut out = Output::new(&decks[0], &inputs[0]);
+    for master in &decks[0].masters {
+        let design = Design::of(&mut inputs[0], master)?;
+        let (part, layouts) = (master.part.clone(), master.layouts.clone());
+        out.units.add(decks[0].size, design, 0, part, layouts);
+    }
     for (i, deck) in decks.iter().enumerate().skip(1) {
         out.append(&mut plan, inputs, i, deck)?;
     }
@@ -76,12 +86,19 @@ struct Slide {
     id: u32,
 }
 
+/// A slide master and its layouts, in their order.
+struct Master {
+    part: String,
+    layouts: Vec<String>,
+}
+
 /// What the main part of a deck says.
 struct Deck {
     declaration: String,
     root: Node,
     rels: Vec<Rel>,
-    masters: Vec<String>,
+    size: (u64, u64),
+    masters: Vec<Master>,
     /// Of masters and layouts.
     master_ids: Vec<u32>,
     notes_master: Option<String>,
@@ -127,8 +144,15 @@ impl Deck {
             let master = part(pkg, n)?;
             let text = pkg.text(&master, MAX_PARSED)?;
             let tree = xml::tree(&text, &master, &pkg.origin)?;
+            let own = pkg.rels_of(&master)?;
             master_ids.extend(ids(&tree, "sldLayoutIdLst"));
-            masters.push(master);
+            let layouts = listed(&tree, "sldLayoutIdLst")
+                .map(|n| target(pkg, &master, &own, n.attr(R, "id").unwrap_or("")))
+                .collect::<Result<_, _>>()?;
+            masters.push(Master {
+                part: master,
+                layouts,
+            });
         }
         let notes_master = listed(&root, "notesMasterIdLst").next();
         let notes_master = notes_master.map(|n| part(pkg, n)).transpose()?;
@@ -149,8 +173,14 @@ impl Deck {
             };
             slides.push(Slide { part: slide, id });
         }
+        let size = slide_size(&root).ok_or_else(|| {
+            pkg.origin.bad(&format!(
+                "{main} has a slide size that isn't a positive number"
+            ))
+        })?;
         Ok(Self {
             declaration: declaration(&text),
+            size,
             root,
             rels,
             masters,
@@ -165,6 +195,15 @@ impl Deck {
         let slides = self.slides.iter().map(|s| s.id);
         defects(self.master_ids.iter().copied(), MASTER_IDS) + defects(slides, SLIDE_IDS)
     }
+}
+
+/// A deck's slide size; none when it can't be read.
+fn slide_size(root: &Node) -> Option<(u64, u64)> {
+    let Some(n) = root.child(P, "sldSz") else {
+        return Some(DEFAULT_SIZE);
+    };
+    let side = |name: &str| n.attr("", name)?.parse().ok().filter(|v| *v > 0);
+    Some((side("cx")?, side("cy")?))
 }
 
 /// The ids of the entries of list `list`.
@@ -252,6 +291,7 @@ struct Output {
     master_ids: Ids,
     slide_ids: Ids,
     notes_master: Option<String>,
+    units: Units,
 }
 
 impl Output {
@@ -264,6 +304,7 @@ impl Output {
             master_ids: Ids::new(deck.master_ids.iter().copied(), MASTER_IDS),
             slide_ids: Ids::new(deck.slides.iter().map(|s| s.id), SLIDE_IDS),
             notes_master: deck.notes_master.clone(),
+            units: Units::default(),
         }
     }
 
@@ -281,17 +322,17 @@ impl Output {
         list(&mut self.root, of).children.push(Child::Node(entry));
     }
 
-    /// Copies a master with its layouts, theme and pictures under new ids.
+    /// Copies a master with its layouts, theme and pictures under new ids; returns its name.
     fn add_master(
         &mut self,
         plan: &mut Plan,
         inputs: &mut [Package],
         i: usize,
-        master: &str,
-    ) -> Result<(), Error> {
-        let name = plan.copy_graph(inputs, i, master, &|_, _| None)?;
-        let text = inputs[i].text(master, MAX_PARSED)?;
-        let mut tree = xml::tree(&text, master, &inputs[i].origin)?;
+        master: &Master,
+    ) -> Result<String, Error> {
+        let name = plan.copy_graph(inputs, i, &master.part, &|_, _| None)?;
+        let text = inputs[i].text(&master.part, MAX_PARSED)?;
+        let mut tree = xml::tree(&text, &master.part, &inputs[i].origin)?;
         let id = self.master_ids.take();
         if let Some(layouts) = tree.child_mut(P, "sldLayoutIdLst") {
             for n in layouts.nodes_mut() {
@@ -306,7 +347,34 @@ impl Output {
             "slideMaster",
             &name,
         );
-        Ok(())
+        Ok(name)
+    }
+
+    /// Shares each of a deck's masters that the output already holds and copies the others;
+    /// returns where the shared parts of the deck went.
+    fn add_masters(
+        &mut self,
+        plan: &mut Plan,
+        inputs: &mut [Package],
+        i: usize,
+        deck: &Deck,
+    ) -> Result<HashMap<String, String>, Error> {
+        let mut shared = HashMap::new();
+        for master in &deck.masters {
+            let design = Design::of(&mut inputs[i], master)?;
+            if let Some(unit) = self.units.find(deck.size, &design, i, inputs)? {
+                shared.insert(master.part.to_ascii_lowercase(), unit.master.clone());
+                for (ours, theirs) in master.layouts.iter().zip(&unit.layouts) {
+                    shared.insert(ours.to_ascii_lowercase(), theirs.clone());
+                }
+                continue;
+            }
+            let name = self.add_master(plan, inputs, i, master)?;
+            let copied = master.layouts.iter().filter_map(|l| plan.copied(i, l));
+            let layouts = copied.map(String::from).collect();
+            self.units.add(deck.size, design, i, name, layouts);
+        }
+        Ok(shared)
     }
 
     fn append(
@@ -327,11 +395,13 @@ impl Output {
             );
             self.notes_master = Some(name);
         }
-        for master in &deck.masters {
-            self.add_master(plan, inputs, i, master)?;
-        }
+        let shared = self.add_masters(plan, inputs, i, deck)?;
         let notes = self.notes_master.clone();
-        let mapped = |r: &Rel, _: &str| notes.clone().filter(|_| kind(r) == "notesMaster");
+        let mapped = |r: &Rel, target: &str| match kind(r) {
+            "notesMaster" => notes.clone(),
+            "slideLayout" | "slideMaster" => shared.get(&target.to_ascii_lowercase()).cloned(),
+            _ => None,
+        };
         for slide in &deck.slides {
             let name = plan.copy_graph(inputs, i, &slide.part, &mapped)?;
             let id = self.slide_ids.take();

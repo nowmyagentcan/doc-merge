@@ -77,6 +77,11 @@ fn slides(parts: &Parts) -> Vec<String> {
         .collect()
 }
 
+fn rels_of(part: &str) -> String {
+    let (dir, file) = part.rsplit_once('/').unwrap();
+    format!("{dir}/_rels/{file}.rels")
+}
+
 /// What a slide's title says.
 fn said(parts: &Parts, slide: &str) -> String {
     let xml = text(parts, slide);
@@ -372,6 +377,159 @@ fn a_slide_without_a_layout_is_damaged() {
     let paths = [
         file(&dir, "a.pptx", &deck(1, WIDE)),
         file(&dir, "b.pptx", &broken),
+    ];
+    let e = merge(&paths, &dir.join("o.pptx"), &Options::default(), None).unwrap_err();
+    assert_eq!((e.code, e.input), ("bad_package", Some(2)));
+}
+
+/// The masters a merged deck ends up with, by file: how many of each kind of part.
+fn counts(parts: &Parts) -> (usize, usize, usize) {
+    (
+        names(parts, "ppt/slideMasters/slideMaster").len(),
+        names(parts, "ppt/slideLayouts/slideLayout").len(),
+        names(parts, "ppt/theme/theme").len(),
+    )
+}
+
+fn replace(parts: &mut Parts, name: &str, from: &str, to: &str) {
+    let xml = text(parts, name);
+    assert!(xml.contains(from), "{from} not in {name}");
+    set(parts, name, xml.replace(from, to).as_bytes());
+}
+
+/// Gives the layout a picture.
+fn with_picture(parts: &mut Parts, bytes: &[u8]) {
+    let layout = "ppt/slideLayouts/_rels/slideLayout1.xml.rels";
+    let picture = format!(
+        r#"<Relationship Id="rId7" Type="{R}/image" Target="../media/image1.png"/></Relationships>"#
+    );
+    replace(parts, layout, "</Relationships>", &picture);
+    set(parts, "ppt/media/image1.png", bytes);
+}
+
+fn two_decks(test: &str, first: &Parts, second: &Parts) -> (Report, Parts) {
+    let dir = temp_dir(test);
+    let paths = [file(&dir, "a.pptx", first), file(&dir, "b.pptx", second)];
+    merged_files(&format!("{test}-out"), &paths)
+}
+
+#[test]
+fn decks_of_one_template_share_their_master() {
+    let (_, parts) = merged("share", &["a.pptx", "b.pptx", "c.pptx"]);
+    // a's master and b's are one; c has its own. Each design has a theme, the notes master another.
+    assert_eq!(counts(&parts), (2, 22, 3));
+    let order = slides(&parts);
+    let layout_of = |slide: &str| {
+        let rels = text(&parts, &rels_of(slide));
+        let tag = rels
+            .split("<Relationship ")
+            .find(|t| t.contains("/slideLayout\""))
+            .unwrap();
+        let at = tag.find("slideLayouts/").unwrap();
+        tag[at..at + tag[at..].find('"').unwrap()].to_string()
+    };
+    assert_eq!(layout_of(&order[4]), "slideLayouts/slideLayout1.xml");
+    assert_eq!(
+        layout_of(&order[6]),
+        layout_of(&order[3]),
+        "b's and a's picture layouts"
+    );
+    let c = layout_of(&order[7]);
+    let number: usize = c["slideLayouts/slideLayout".len()..]
+        .trim_end_matches(".xml")
+        .parse()
+        .unwrap();
+    assert!(number > 11, "c keeps a layout of its own: {c}");
+}
+
+#[test]
+fn a_deck_merged_with_itself_keeps_one_master() {
+    let (_, parts) = merged("itself", &["c.pptx", "c.pptx"]);
+    assert_eq!(counts(&parts), (1, 11, 2));
+    assert_eq!(slides(&parts).len(), 6);
+}
+
+#[test]
+fn spelling_does_not_tell_masters_apart() {
+    let first = deck(1, WIDE);
+    let mut second = deck(1, WIDE);
+    // Another relationship id, another layout id, an edit marker and other prefixes on the theme.
+    let master = "ppt/slideMasters/slideMaster1.xml";
+    replace(
+        &mut second,
+        master,
+        r#"id="2147483649" r:id="rId1""#,
+        r#"id="2147483700" r:id="rId5""#,
+    );
+    replace(
+        &mut second,
+        master,
+        r#"<a:rPr sz="2000"/>"#,
+        r#"<a:rPr sz="2000" dirty="0"/>"#,
+    );
+    let rels = "ppt/slideMasters/_rels/slideMaster1.xml.rels";
+    replace(&mut second, rels, r#"Id="rId1""#, r#"Id="rId5""#);
+    let theme = "ppt/theme/theme1.xml";
+    let xml = text(&second, theme)
+        .replace("a:", "d:")
+        .replace("xmlns:a", "xmlns:d");
+    set(&mut second, theme, xml.as_bytes());
+    let (_, parts) = two_decks("spelling", &first, &second);
+    assert_eq!(counts(&parts), (1, 1, 1));
+}
+
+#[test]
+fn any_difference_in_the_design_keeps_both_masters() {
+    let first = deck(1, WIDE);
+    let changes = [
+        ("ppt/slideMasters/slideMaster1.xml", "Master", "Other"),
+        ("ppt/slideLayouts/slideLayout1.xml", "Layout", "Other"),
+        ("ppt/theme/theme1.xml", r#"name="T""#, r#"name="U""#),
+    ];
+    for (part, from, to) in changes {
+        let mut second = deck(1, WIDE);
+        replace(&mut second, part, from, to);
+        let (_, parts) = two_decks("differ", &first, &second);
+        assert_eq!(counts(&parts), (2, 2, 2), "{part}");
+    }
+}
+
+#[test]
+fn another_slide_size_keeps_both_masters() {
+    let (_, parts) = two_decks("sizes", &deck(1, WIDE), &deck(1, (9_144_000, 6_858_000)));
+    assert_eq!(counts(&parts).0, 2);
+}
+
+#[test]
+fn pictures_of_a_design_are_compared_by_their_bytes() {
+    let picture = b"first picture bytes";
+    let mut first = deck(1, WIDE);
+    with_picture(&mut first, picture);
+    let mut same = deck(1, WIDE);
+    with_picture(&mut same, picture);
+    let (_, parts) = two_decks("pictures", &first, &same);
+    assert_eq!(counts(&parts), (1, 1, 1));
+
+    let head = b"other picture b";
+    let mut forged = head.to_vec();
+    forged.extend(forge_crc(head, crc32(picture)));
+    assert_eq!(
+        (forged.len(), crc32(&forged)),
+        (picture.len(), crc32(picture))
+    );
+    let mut other = deck(1, WIDE);
+    with_picture(&mut other, &forged);
+    let (_, parts) = two_decks("forged", &first, &other);
+    assert_eq!(counts(&parts).0, 2, "equal size and CRC, other bytes");
+}
+
+#[test]
+fn a_bad_slide_size_is_damaged() {
+    let dir = temp_dir("size");
+    let bad = deck(1, (0, 6_858_000));
+    let paths = [
+        file(&dir, "a.pptx", &deck(1, WIDE)),
+        file(&dir, "b.pptx", &bad),
     ];
     let e = merge(&paths, &dir.join("o.pptx"), &Options::default(), None).unwrap_err();
     assert_eq!((e.code, e.input), ("bad_package", Some(2)));
