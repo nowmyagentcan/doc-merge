@@ -1090,3 +1090,26 @@ fn a_data_store_reached_from_a_slide_comes_with_a_free_id() {
     assert_eq!(second.len(), 1);
     assert_ne!(first, second);
 }
+
+#[test]
+fn part_names_with_spaces_are_followed_and_kept_escaped() {
+    let mut first = deck(1, WIDE);
+    let picture = format!(
+        r#"<Relationship Id="rId7" Type="{R}/image" Target="../media/my%20pic.png"/></Relationships>"#
+    );
+    let rels = "ppt/slides/_rels/slide1.xml.rels";
+    replace(&mut first, rels, "</Relationships>", &picture);
+    set(&mut first, "ppt/media/my pic.png", b"picture");
+    let mut second = first.clone();
+    replace(
+        &mut second,
+        "ppt/media/my pic.png",
+        "picture",
+        "other bytes",
+    );
+    let (_, parts) = two_decks("spaces", &first, &second);
+    assert!(parts.iter().any(|p| p.0 == "ppt/media/my pic.png"));
+    assert!(parts.iter().any(|p| p.0 == "ppt/media/my pic1.png"));
+    let copy = rels_of(&slides(&parts)[1]);
+    assert!(text(&parts, &copy).contains("../media/my%20pic1.png"));
+}

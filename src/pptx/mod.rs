@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::Rename;
 use crate::error::{Error, Warning, Warnings, thousands};
-use crate::package::{Entry, MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve};
+use crate::package::{Entry, MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve, unescape};
 use crate::writer::{Body, Part, Plan, R, Rels, guid, planned_text, relative, rels_part};
 use crate::xml::{self, A, Attr, Child, Node, Prefixes, XMLNS, declaration, prefix_of};
 use masters::{Design, Fit, Units, ratio};
@@ -1169,7 +1169,8 @@ fn check(plan: &Plan, inputs: &mut [Package], allowed: usize) -> Result<(), Erro
         .collect();
     let (origin, main) = (inputs[0].origin.clone(), inputs[0].main.clone());
     let mut text = |name: &str| -> Result<String, Error> {
-        let part = parts.get(&name.to_ascii_lowercase());
+        let get = |n: &str| parts.get(&n.to_ascii_lowercase());
+        let part = get(name).or_else(|| get(&unescape(name)?));
         let text = part.map(|p| planned_text(p, inputs)).transpose()?.flatten();
         text.ok_or_else(|| Error::internal(&format!("part {name} is missing")))
     };

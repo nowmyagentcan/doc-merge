@@ -18,7 +18,7 @@ use zip::{CompressionMethod, DateTime, System, ZipWriter};
 use crate::error::{Error, Warning, Warnings, mib};
 use crate::package::{
     self, CONTENT_TYPES, ContentTypes, MAX_PARSED, Package, RELS_TYPE, ROOT_RELS, Rel,
-    SIGNATURE_ORIGIN, is_signature, parse_rels, rels_name, resolve,
+    SIGNATURE_ORIGIN, is_signature, parse_rels, rels_name, resolve, unescape,
 };
 use crate::xml::Reader;
 
@@ -547,8 +547,9 @@ pub fn check(plan: &Plan, inputs: &mut [Package]) -> Result<(), Error> {
         };
         let rels = parse_rels(&text, &p.name, &inputs[0].origin)?;
         for r in rels.iter().filter(|r| !r.external) {
+            let known = |t: &str| names.contains(&t.to_ascii_lowercase());
             let target = resolve(&source, &r.target);
-            if !target.is_some_and(|t| names.contains(&t.to_ascii_lowercase())) {
+            if !target.is_some_and(|t| known(&t) || unescape(&t).is_some_and(|u| known(&u))) {
                 return internal(format!("{} points to a missing part {}", p.name, r.target));
             }
         }

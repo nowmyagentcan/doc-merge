@@ -224,7 +224,7 @@ pub fn resolve(source: &str, target: &str) -> Option<String> {
 }
 
 /// `%XX` escapes decoded, when they make valid UTF-8.
-fn unescape(s: &str) -> Option<String> {
+pub fn unescape(s: &str) -> Option<String> {
     if !s.contains('%') {
         return None;
     }
