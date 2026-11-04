@@ -1,9 +1,9 @@
-//! The binary: commands, paths, output files, JSON and exit codes.
+//! The binary: commands, paths, output files, text and JSON, exit codes and closed streams.
 
 mod common;
 
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use common::{build, end_record, minimal, raw, raw_zip, set, temp_dir, write};
 use serde_json::Value;
@@ -685,4 +685,179 @@ fn ctrl_c_stops_a_merge_and_leaves_no_temp_file() {
     );
     assert_eq!(merge.wait().unwrap().code(), Some(130));
     assert_eq!(names_in(&dir), ["a.xlsx", "big.xlsx"]);
+}
+
+#[test]
+fn text_output_is_plain_lines_without_a_terminal() {
+    let dir = folder("text", &["a.pptx", "c.pptx", "a.xlsx", "b.xlsx"]);
+    let out = bin()
+        .current_dir(&dir)
+        .args(["a.pptx", "c.pptx", "-o", "all.pptx"])
+        .env_remove("NO_COLOR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(stderr(&out), "");
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(
+        lines[0].starts_with("✓ all.pptx  7 slides from 2 files  "),
+        "{text}"
+    );
+    assert_eq!(
+        lines[1],
+        "  renamed  custom show Short → Short (2)  (c.pptx)"
+    );
+    assert_eq!(
+        lines[2],
+        "! Slides from c.pptx (4:3) were scaled to fit the 16:9 slide size and centred."
+    );
+
+    // A path outside the current folder stays whole.
+    let elsewhere = temp_dir("elsewhere");
+    let target = std::path::absolute(elsewhere.join("x.xlsx")).unwrap();
+    let out = run_in(&dir, &["a.xlsx", "b.xlsx", "-o", target.to_str().unwrap()]);
+    let first = format!("✓ {}  4 sheets from 2 files  ", target.display());
+    assert!(stdout(&out).starts_with(&first), "{}", stdout(&out));
+}
+
+#[test]
+fn names_print_safely_and_json_keeps_them() {
+    let dir = folder("names", &["a.pptx", "b.pptx"]);
+    let name = "a\u{202E}x.pptx";
+    std::fs::rename(dir.join("a.pptx"), dir.join(name)).unwrap();
+    let out = run_in(&dir, &[name, "b.pptx", "-o", "t\u{2066}.pptx"]);
+    let text = stdout(&out);
+    assert!(text.starts_with("✓ t<U+2066>.pptx  "), "{text}");
+    let out = run_in(&dir, &[name, "gone.pptx", "--json"]);
+    assert_eq!(json(&out)["error"]["input"], 2);
+    let out = run_in(&dir, &[name, name, "--json"]);
+    let input = json(&out)["inputs"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(input.ends_with(name), "{input}");
+
+    write(&dir, "note\u{202E}.txt", b"text");
+    let out = run_in(&dir, &["note\u{202E}.txt", name]);
+    assert!(
+        stderr(&out).starts_with("✗ 'note<U+202E>.txt' isn't"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_isnt_unicode_merges_and_prints() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = folder("bytes", &["a.pptx"]);
+    let bytes = OsStr::from_bytes(b"caf\xE9\x1b.pptx");
+    std::fs::copy(dir.join("a.pptx"), dir.join(bytes)).unwrap();
+    let args = [OsStr::new("a.pptx"), bytes, OsStr::new("--json")];
+    let out = bin().current_dir(&dir).args(args).output().unwrap();
+    let path = json(&out)["inputs"][1]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(path.ends_with("caf\u{FFFD}\u{1b}.pptx"), "{path}");
+    let out = bin()
+        .current_dir(&dir)
+        .args([bytes, OsStr::new("gone")])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&out).contains("No file at 'gone'"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Runs with stdout or stderr a pipe whose reading end is already closed.
+fn closed(dir: &Path, args: &[&str], stdout: bool) -> Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut c = bin();
+    c.current_dir(dir).args(args);
+    if stdout {
+        c.stdout(writer).stderr(Stdio::piped());
+    } else {
+        c.stderr(writer).stdout(Stdio::piped());
+    }
+    c.output().unwrap()
+}
+
+#[test]
+fn a_closed_stream_ends_quietly_with_the_code_earned() {
+    let dir = folder("closed", &["a.pptx", "b.pptx", "c.xlsx", "a.xlsx"]);
+    let cases: [(&[&str], i32); 6] = [
+        (&["a.pptx", "b.pptx", "-o", "1.pptx", "--overwrite"], 0),
+        (
+            &["a.pptx", "b.pptx", "-o", "1.pptx", "--overwrite", "--json"],
+            0,
+        ),
+        (&["a.pptx", "gone.pptx"], 1),
+        (&["a.xlsx", "c.xlsx", "--json"], 1),
+        (&["a.pptx", "--x"], 2),
+        (&["--help"], 0),
+    ];
+    for (args, code) in cases {
+        for extra in [&[][..], &["--debug"][..]] {
+            let args = [args, extra].concat();
+            for on_stdout in [true, false] {
+                let out = closed(&dir, &args, on_stdout);
+                assert_eq!(out.status.code(), Some(code), "{args:?} {on_stdout}");
+                let left = [stderr(&out), stdout(&out)].concat();
+                assert!(!left.contains("panicked"), "{left}");
+            }
+        }
+    }
+    let out = closed(&dir, &["a.pptx", "b.pptx", "-o", "2.pptx"], true);
+    assert!(out.status.success());
+    assert!(dir.join("2.pptx").is_file(), "the work still gets done");
+}
+
+#[cfg(target_os = "linux")]
+fn in_a_terminal(dir: &Path, line: &str, no_color: bool) -> String {
+    let mut c = Command::new("script");
+    c.args(["-qec", line, "/dev/null"]).current_dir(dir);
+    if no_color {
+        c.env("NO_COLOR", "1");
+    } else {
+        c.env_remove("NO_COLOR");
+    }
+    let out = c.stdin(Stdio::null()).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn colour_needs_a_terminal_and_no_no_color() {
+    let dir = folder("colour", &["a.pptx", "b.pptx"]);
+    let exe = env!("CARGO_BIN_EXE_doc-merge");
+    let screen = in_a_terminal(&dir, &format!("{exe} a.pptx b.pptx -o 1.pptx"), false);
+    assert!(
+        screen.contains("\x1b[32m✓\x1b[0m \x1b[1m1.pptx\x1b[0m"),
+        "{screen:?}"
+    );
+    let screen = in_a_terminal(&dir, &format!("{exe} a.pptx gone.pptx"), false);
+    assert!(
+        screen.contains("\x1b[31m✗\x1b[0m No file at 'gone.pptx'."),
+        "{screen:?}"
+    );
+    let screen = in_a_terminal(&dir, &format!("{exe} a.pptx b.pptx -o 2.pptx"), true);
+    assert!(
+        screen.contains("✓ 2.pptx  ") && !screen.contains('\x1b'),
+        "{screen:?}"
+    );
+    let screen = in_a_terminal(
+        &dir,
+        &format!("{exe} a.pptx b.pptx -o 3.pptx --json"),
+        false,
+    );
+    assert!(!screen.contains('\x1b'), "{screen:?}");
+    let empty = in_a_terminal(&dir, &format!("NO_COLOR= {exe} a.pptx gone.pptx"), false);
+    assert!(empty.contains("\x1b[31m✗"), "{empty:?}");
 }

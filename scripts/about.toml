@@ -3,3 +3,12 @@ accepted = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "BSD-2-Clause", 
 targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 ignore-build-dependencies = true
 private = { ignore = true }
+
+# The windows crates indent their licence text, so it isn't recognised without help.
+[windows-sys.clarify]
+license = "MIT"
+files = [{ path = "license-mit", checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383" }]
+
+[windows-link.clarify]
+license = "MIT"
+files = [{ path = "license-mit", checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383" }]

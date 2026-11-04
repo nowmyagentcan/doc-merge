@@ -1,5 +1,7 @@
 //! The command line: `doc-merge [merge] <PATH>... [OPTIONS]`.
 
+mod text;
+
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ use doc_merge::error::Error;
 use doc_merge::paths::{self, Target};
 use doc_merge::{Options, Report, STOP, StyleMode, guarded, merge};
 use serde::Serialize;
+use text::{Look, Out, safe};
 
 /// `doc-merge ui`
 #[derive(Parser)]
@@ -180,8 +183,11 @@ fn main() -> ExitCode {
     }
     catch_interrupts();
     let mut code = 0;
-    match run(&cli, &mut io::stdout().lock(), &mut io::stderr(), &mut code) {
+    let mut out = Out::new(io::stdout().lock(), Look::stdout());
+    let mut err = Out::new(io::stderr(), Look::stderr());
+    match run(&cli, &mut out, &mut err, &mut code) {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
+            drop(out);
             fail(&Error::write_failed("the output stream", &e), false)
         }
         // A reader that hung up ends the run quietly with the code earned so far.
@@ -205,7 +211,12 @@ fn command<T: Parser>(args: &[OsString], name: &str) -> ExitCode {
 }
 
 /// Merges `cli.paths` and prints how it went; `code` is set before anything is printed.
-fn run(cli: &Cli, out: &mut impl Write, err: &mut impl Write, code: &mut u8) -> io::Result<()> {
+fn run(
+    cli: &Cli,
+    out: &mut Out<impl Write>,
+    err: &mut Out<impl Write>,
+    code: &mut u8,
+) -> io::Result<()> {
     let target = Target {
         output: cli.output.clone(),
         overwrite: cli.overwrite,
@@ -217,20 +228,27 @@ fn run(cli: &Cli, out: &mut impl Write, err: &mut impl Write, code: &mut u8) -> 
         },
     };
     let merged = paths::expand(&cli.paths).and_then(|files| {
-        MERGING.store(true, Ordering::SeqCst);
-        let merged = guarded(|| merge(&files, &target, &options, None));
-        MERGING.store(false, Ordering::SeqCst);
-        merged
+        let work = || {
+            MERGING.store(true, Ordering::SeqCst);
+            let merged = guarded(|| merge(&files, &target, &options, None));
+            MERGING.store(false, Ordering::SeqCst);
+            merged
+        };
+        if cli.json {
+            return work();
+        }
+        let dots = err.look.pick("…", "...");
+        text::spin(err, &format!("Merging {} files{dots}", files.len()), work)
     });
     *code = merged.as_ref().err().map_or(0, |e| e.exit);
     if cli.debug {
-        debug(err, &merged)?;
+        debug(&mut err.w, &merged)?;
     }
     match merged {
-        Ok(report) if cli.json => print_json(out, &report),
-        Ok(report) => writeln!(out, "✓ {}", report.output.path.display()),
-        Err(e) if cli.json => print_json(out, &Failed { error: &e }),
-        Err(e) => print_error(err, &e),
+        Ok(report) if cli.json => print_json(&mut out.w, &report),
+        Ok(report) => text::report(out, &report),
+        Err(e) if cli.json => print_json(&mut out.w, &Failed { error: &e }),
+        Err(e) => text::error(err, &e),
     }
 }
 
@@ -244,7 +262,7 @@ fn debug(err: &mut impl Write, merged: &Result<Report, Error>) -> io::Result<()>
         }
         Err(e) => {
             if let Some(cause) = &e.cause {
-                writeln!(err, "debug: {}: {cause}", e.code)?;
+                writeln!(err, "debug: {}: {}", e.code, safe(cause))?;
             }
         }
     }
@@ -262,19 +280,11 @@ fn print_json(out: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     out.flush()
 }
 
-fn print_error(err: &mut impl Write, e: &Error) -> io::Result<()> {
-    writeln!(err, "✗ {}", e.message)?;
-    match e.hint {
-        Some(hint) => writeln!(err, "  {hint}"),
-        None => Ok(()),
-    }
-}
-
 /// A clap error as our usage error: `Unknown option --x.` or clap's own sentence.
 fn usage(e: &clap::Error) -> Error {
     let message = match (e.kind(), e.get(ContextKind::InvalidArg)) {
         (ErrorKind::UnknownArgument, Some(ContextValue::String(arg))) => {
-            format!("Unknown option {arg}.")
+            format!("Unknown option {}.", safe(arg))
         }
         _ => {
             let text = e.render().to_string();
@@ -282,7 +292,7 @@ fn usage(e: &clap::Error) -> Error {
             let line = line.strip_prefix("error: ").unwrap_or(line);
             let mut chars = line.chars();
             let first = chars.next().map(|c| c.to_uppercase().to_string());
-            format!("{}{}.", first.unwrap_or_default(), chars.as_str())
+            format!("{}{}.", first.unwrap_or_default(), safe(chars.as_str()))
         }
     };
     Error::usage(message)
@@ -293,7 +303,7 @@ fn fail(e: &Error, json: bool) -> ExitCode {
     let _ = if json {
         print_json(&mut io::stdout(), &Failed { error: e })
     } else {
-        print_error(&mut io::stderr(), e)
+        text::error(&mut Out::new(io::stderr(), Look::stderr()), e)
     };
     ExitCode::from(e.exit)
 }
