@@ -242,3 +242,251 @@ fn appended_sheets_drop_their_selection_and_view() {
     let out = text(&parts, "xl/worksheets/sheet2.xml");
     assert!(out.contains("<sheetView workbookViewId=\"0\"/>"), "{out}");
 }
+
+#[test]
+fn formulas_follow_the_renames_everywhere() {
+    let (report, parts) = merged("formulas", &["a.xlsx", "b.xlsx"]);
+    let kinds: Vec<(&str, &str)> = report
+        .renames
+        .iter()
+        .map(|r| (r.kind, r.to.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("sheet", "Summary (2)"),
+            ("table", "Sales_2"),
+            ("defined_name", "Total_2")
+        ]
+    );
+    let detail = text(&parts, "xl/worksheets/sheet4.xml");
+    for f in [
+        "<f>'Summary (2)'!B2</f>",
+        "<f>SUM(Sales_2[Amount])</f>",
+        "<f>Total_2*2</f>",
+        "<f>SUM('Summary (2):Detail'!A1)</f>",
+        "<f>Local+1</f>",
+        "<f>Sales_2[[#This Row],[Amount]]*2</f>",
+        "<f>SUBTOTAL(109,Sales_2[Double])</f>",
+        "_xlfn._xlws.FILTER(Sales_2[Item],Sales_2[Amount]&gt;2)</f>",
+        "<xm:f>B4&gt;'Summary (2)'!$A$1/5</xm:f>",
+        "<xm:f>'Summary (2)'!$A$1:$A$3</xm:f>",
+        "<xm:f>Detail!B4:B6</xm:f>",
+        r#"location="'Summary (2)'!A1""#,
+    ] {
+        assert!(detail.contains(f), "{f} in {detail}");
+    }
+    let workbook = text(&parts, "xl/workbook.xml");
+    let names = elements(&workbook, "definedName");
+    assert!(names.contains(&"Detail!$B$4".to_string()), "{names:?}");
+    assert!(workbook.contains(r#"<definedName name="Total_2">Detail!$B$4</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="Total">Summary!$B$2</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="Local" localSheetId="3">'Summary (2)'!$A$2<"#));
+    assert!(workbook.contains(
+        r#"<definedName name="_xlnm.Print_Area" localSheetId="2">'Summary (2)'!$A$1:$B$3<"#
+    ));
+    let table = text(&parts, "xl/tables/table2.xml");
+    assert!(table.contains(r#" id="2""#), "{table}");
+    assert!(table.contains(r#"name="Sales_2" displayName="Sales_2""#));
+    assert!(table.contains(
+        "<calculatedColumnFormula>Sales_2[[#This Row],[Amount]]*2</calculatedColumnFormula>"
+    ));
+}
+
+#[test]
+fn external_links_are_added_after_the_output_s() {
+    let (_, parts) = merged("links", &["b.xlsx", "b.xlsx"]);
+    let workbook = text(&parts, "xl/workbook.xml");
+    assert_eq!(workbook.matches("<externalReference ").count(), 2);
+    let first = text(&parts, "xl/worksheets/sheet2.xml");
+    assert!(first.contains("<f>[1]Sheet1!$A$1</f>"));
+    let second = text(&parts, "xl/worksheets/sheet4.xml");
+    assert!(second.contains("<f>[2]Sheet1!$A$1</f>"));
+    assert!(
+        parts
+            .iter()
+            .any(|p| p.0 == "xl/externalLinks/externalLink2.xml")
+    );
+}
+
+/// A workbook with sheet `A` of `cells` and `definedNames` content.
+fn named_book(cells: &str, names: &str) -> Vec<(String, Vec<u8>)> {
+    let mut parts = book(&[("A", cells), ("Other", "")], None);
+    let workbook = text(&parts, "xl/workbook.xml").replace(
+        "</sheets>",
+        &format!("</sheets><definedNames>{names}</definedNames>"),
+    );
+    set(&mut parts, "xl/workbook.xml", workbook.as_bytes());
+    parts
+}
+
+#[test]
+fn equal_names_are_shared_and_others_renamed() {
+    let dir = temp_dir("share");
+    let a = named_book(
+        "",
+        r#"<definedName name="Rate">0.2</definedName><definedName name="Top">A!$A$1</definedName><definedName name="Uses">Rate*2</definedName>"#,
+    );
+    let b = named_book(
+        r#"<row r="1"><c r="A1"><f>Rate+Top+Uses+Only+Local</f></c></row>"#,
+        r#"<definedName name="rate">0.2</definedName><definedName name="Top">A!$A$1</definedName><definedName name="Only">1</definedName><definedName name="Local" localSheetId="0">Rate</definedName><definedName name="Uses">Rate*2</definedName>"#,
+    );
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (report, parts) = merged_files("share-out", &paths);
+    let workbook = text(&parts, "xl/workbook.xml");
+    // Top now reads 'A (2)'!$A$1, so it differs; Rate and Uses stay equal and are shared.
+    assert_eq!(workbook.matches("name=\"Top").count(), 2);
+    assert!(workbook.contains(r#"<definedName name="Top_2">'A (2)'!$A$1</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="Only">1</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="Local" localSheetId="2">Rate</definedName>"#));
+    assert_eq!(workbook.to_lowercase().matches("name=\"rate\"").count(), 1);
+    assert_eq!(workbook.matches("name=\"Uses\"").count(), 1);
+    let sheet = text(&parts, "xl/worksheets/sheet3.xml");
+    assert!(
+        sheet.contains("<f>Rate+Top_2+Uses+Only+Local</f>"),
+        "{sheet}"
+    );
+    let names: Vec<&str> = report
+        .renames
+        .iter()
+        .filter(|r| r.kind == "defined_name")
+        .map(|r| r.to.as_str())
+        .collect();
+    assert_eq!(names, ["Top_2"]);
+}
+
+#[test]
+fn a_name_stops_being_equal_when_a_name_it_uses_is_renamed() {
+    let dir = temp_dir("chain");
+    let a = named_book(
+        "",
+        r#"<definedName name="One">Two</definedName><definedName name="Two">Three</definedName><definedName name="Three">1</definedName>"#,
+    );
+    let b = named_book(
+        "",
+        r#"<definedName name="One">Two</definedName><definedName name="Two">Three</definedName><definedName name="Three">2</definedName>"#,
+    );
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (_, parts) = merged_files("chain-out", &paths);
+    let workbook = text(&parts, "xl/workbook.xml");
+    assert!(workbook.contains(r#"<definedName name="Three_2">2</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="Two_2">Three_2</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="One_2">Two_2</definedName>"#));
+}
+
+#[test]
+fn a_sheet_scope_name_hides_a_renamed_workbook_name() {
+    let dir = temp_dir("hidden");
+    let a = named_book("", r#"<definedName name="Total">1</definedName>"#);
+    let b = book(
+        &[
+            ("B1", r#"<row r="1"><c r="A1"><f>Total</f></c></row>"#),
+            ("B2", r#"<row r="1"><c r="A1"><f>Total</f></c></row>"#),
+        ],
+        None,
+    );
+    let mut b = b;
+    let workbook = text(&b, "xl/workbook.xml").replace(
+        "</sheets>",
+        r#"</sheets><definedNames><definedName name="Total">2</definedName><definedName name="Total" localSheetId="1">3</definedName></definedNames>"#,
+    );
+    set(&mut b, "xl/workbook.xml", workbook.as_bytes());
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (_, parts) = merged_files("hidden-out", &paths);
+    assert!(text(&parts, "xl/worksheets/sheet3.xml").contains("<f>Total_2</f>"));
+    assert!(text(&parts, "xl/worksheets/sheet4.xml").contains("<f>Total</f>"));
+}
+
+/// A table part `name` (id 1) on the first sheet of a workbook.
+fn with_table(parts: &mut Vec<(String, Vec<u8>)>, name: &str) {
+    let table = format!(
+        r#"<table {SML_NS} id="1" name="{name}" displayName="{name}" ref="A1:A2"><autoFilter ref="A1:A2"/><tableColumns count="1"><tableColumn id="1" name="X"/></tableColumns></table>"#
+    );
+    set(&mut *parts, "xl/tables/table1.xml", table.as_bytes());
+    let types = text(parts, "[Content_Types].xml").replace(
+        "</Types>",
+        &format!(
+            r#"<Override PartName="/xl/tables/table1.xml" ContentType="{SML}table+xml"/></Types>"#
+        ),
+    );
+    set(parts, "[Content_Types].xml", types.as_bytes());
+    let table_rel = format!("{REL}table");
+    let rels = rels(&[("rId1", table_rel.as_str(), "../tables/table1.xml")]);
+    set(
+        parts,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        rels.as_bytes(),
+    );
+    let sheet = text(parts, "xl/worksheets/sheet1.xml").replace(
+        "</worksheet>",
+        r#"<tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>"#,
+    );
+    set(parts, "xl/worksheets/sheet1.xml", sheet.as_bytes());
+}
+
+#[test]
+fn tables_and_names_share_one_namespace() {
+    let dir = temp_dir("namespace");
+    let mut a = named_book("", r#"<definedName name="Rates">1</definedName>"#);
+    with_table(&mut a, "People");
+    // b's table clashes with a's name, b's name with a's table.
+    let mut b = named_book("", r#"<definedName name="People">People+1</definedName>"#);
+    with_table(&mut b, "Rates");
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (report, parts) = merged_files("namespace-out", &paths);
+    let renamed: Vec<(&str, &str)> = report
+        .renames
+        .iter()
+        .filter(|r| r.kind != "sheet")
+        .map(|r| (r.kind, r.to.as_str()))
+        .collect();
+    assert_eq!(
+        renamed,
+        [("table", "Rates_2"), ("defined_name", "People_2")]
+    );
+    let table = text(&parts, "xl/tables/table2.xml");
+    assert!(
+        table.contains(r#"id="2" name="Rates_2" displayName="Rates_2""#),
+        "{table}"
+    );
+    let workbook = text(&parts, "xl/workbook.xml");
+    assert!(workbook.contains(r#"<definedName name="People_2">People_2+1</definedName>"#));
+}
+
+#[test]
+fn a_new_name_avoids_the_names_of_its_own_workbook() {
+    let dir = temp_dir("own");
+    let a = named_book("", r#"<definedName name="N">1</definedName>"#);
+    let b = named_book(
+        "",
+        r#"<definedName name="N">2</definedName><definedName name="N_2">3</definedName>"#,
+    );
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (_, parts) = merged_files("own-out", &paths);
+    let workbook = text(&parts, "xl/workbook.xml");
+    assert!(workbook.contains(r#"<definedName name="N_3">2</definedName>"#));
+    assert!(workbook.contains(r#"<definedName name="N_2">3</definedName>"#));
+}
+
+#[test]
+fn a_formula_that_can_t_be_read_is_refused_by_cell() {
+    let dir = temp_dir("unreadable");
+    let a = book(&[("A", "")], None);
+    let b = book(
+        &[("B", r#"<row r="4"><c r="C4"><f>SUM("open</f></c></row>"#)],
+        None,
+    );
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let e = merge(&paths, &dir.join("out.xlsx"), &Options::default(), None).unwrap_err();
+    assert_eq!(e.code, "unsupported_variant");
+    assert_eq!(
+        e.message,
+        "'b.xlsx' has a formula it can't read (B!C4), which doc-merge can't merge yet."
+    );
+    assert_eq!(e.input, Some(2));
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        2,
+        "nothing written"
+    );
+}

@@ -454,6 +454,17 @@ impl Node {
         self.ns == ns && self.local == local
     }
 
+    /// The text directly inside this element.
+    pub fn text(&self) -> String {
+        let mut text = String::new();
+        for c in &self.children {
+            if let Child::Text(t) = c {
+                text.push_str(t);
+            }
+        }
+        text
+    }
+
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
         self.children.iter().filter_map(|c| match c {
             Child::Node(n) => Some(n),
@@ -553,7 +564,7 @@ impl Node {
     }
 }
 
-fn escape_text(s: &str) -> Cow<'_, str> {
+pub fn escape_text(s: &str) -> Cow<'_, str> {
     if s.contains(['<', '&', '>']) {
         Cow::Owned(
             s.replace('&', "&amp;")

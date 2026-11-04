@@ -264,6 +264,12 @@ impl Plan {
         Ok(name)
     }
 
+    /// Where part `part` of `inputs[input]` was copied to, if it was.
+    pub fn copied(&self, input: usize, part: &str) -> Option<&str> {
+        let key = (input, part.to_ascii_lowercase());
+        self.copies.get(&key).map(String::as_str)
+    }
+
     /// The output name for part `part` of `inputs[input]`, and whether it is a new copy (not
     /// a part copied before, nor an equal media part already in the output).
     fn place(
