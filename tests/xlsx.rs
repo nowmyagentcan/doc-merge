@@ -1670,3 +1670,20 @@ fn a_pivot_in_the_base_stays_as_it_is() {
         assert_eq!(&text_or_bytes(&parts, &part.0), &part.1, "{}", part.0);
     }
 }
+
+#[test]
+fn a_cell_with_metadata_its_workbook_lacks_is_damage() {
+    let dir = temp_dir("stray-metadata");
+    let cell = r#"<row r="1"><c r="A1" cm="1"><v>1</v></c></row>"#;
+    let held = book_file(&dir, "held.xlsx", &book(&[("Sheet1", cell)], None));
+    let plain = book_file(&dir, "plain.xlsx", &book(&[("Plain", "")], None));
+    let out = dir.join("out.xlsx");
+    let e = merge(&[plain, held], &out, &Options::default(), None).unwrap_err();
+    assert_eq!((e.code, e.input), ("bad_package", Some(2)));
+    assert!(
+        e.message.contains("Sheet1!A1 uses metadata 1"),
+        "{}",
+        e.message
+    );
+    assert!(!out.exists());
+}

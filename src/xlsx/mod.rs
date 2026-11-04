@@ -7,6 +7,7 @@ mod refuse;
 mod styles;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -455,6 +456,50 @@ struct Output {
     metadata: Metadata,
     taken: drawings::Taken,
     persons: drawings::Persons,
+    /// The output's table ids and lower-case names.
+    table_ids: Vec<String>,
+    table_names: Vec<String>,
+    /// The defects the base came with, which aren't this merge's to answer for.
+    defects: usize,
+    totals: Rc<Cell<Totals>>,
+}
+
+/// The sizes of the output's lists, known once every workbook is in, for checking streamed
+/// sheets against.
+#[derive(Clone, Copy, Default)]
+struct Totals {
+    formats: u32,
+    strings: u32,
+    cell_metadata: u32,
+}
+
+/// How many of `values` repeat an earlier one.
+fn repeats(values: &[String]) -> usize {
+    values.len() - values.iter().collect::<HashSet<_>>().len()
+}
+
+/// Repeated sheet names and ids, and sheet-scope names past the last sheet.
+fn sheet_defects(workbook: &Node) -> usize {
+    let sheets: Vec<&Node> = workbook
+        .child(S, "sheets")
+        .iter()
+        .flat_map(|n| n.nodes())
+        .collect();
+    let values = |name: &str| -> Vec<String> {
+        let found = sheets.iter().map(|s| s.attr("", name).unwrap_or_default());
+        found.map(str::to_lowercase).collect()
+    };
+    let names = workbook.child(S, "definedNames");
+    let scopes = names.iter().flat_map(|n| n.nodes());
+    let scopes = scopes.filter_map(|n| n.attr("", "localSheetId")?.parse::<usize>().ok());
+    let beyond = scopes.filter(|s| *s >= sheets.len()).count();
+    repeats(&values("name")) + repeats(&values("sheetId")) + beyond
+}
+
+/// How many entries the list `name` of a part holds.
+fn list_len(part: Option<&Node>, name: &str) -> u32 {
+    let list = part.and_then(|p| p.child(S, name));
+    list.map_or(0, |l| l.nodes().count() as u32)
 }
 
 /// The output's dynamic-array metadata, if any workbook has some.
@@ -690,11 +735,15 @@ impl Output {
         let taken = drawings::Taken::of(pkg)?;
         let persons = drawings::Persons::of(&book, pkg)?;
         let mut next_table_id = 1;
+        let (mut table_ids, mut table_names) = (vec![], vec![]);
         for t in tables(pkg)? {
             used.insert(t.name.to_lowercase(), None);
-            let id = t.tree.attr("", "id").and_then(|v| v.parse::<u64>().ok());
-            next_table_id = next_table_id.max(id.unwrap_or(0) + 1);
+            let id = t.tree.attr("", "id").unwrap_or_default();
+            next_table_id = next_table_id.max(id.parse::<u64>().unwrap_or(0) + 1);
+            table_ids.push(id.to_string());
+            table_names.push(t.name.to_lowercase());
         }
+        let defects = sheet_defects(&book.tree) + repeats(&table_ids) + repeats(&table_names);
         Ok(Self {
             rels: Rels::new(book.rels.clone()),
             names,
@@ -711,6 +760,10 @@ impl Output {
             metadata,
             taken,
             persons,
+            table_ids,
+            table_names,
+            defects,
+            totals: Rc::default(),
             book,
         })
     }
@@ -924,10 +977,9 @@ impl Output {
             .styles
             .add(sheet, colours.as_ref(), &origin, &mut found.list)?;
         renames.append(&mut found.list);
-        let cell_metadata = match book.held(&mut inputs[i], "sheetMetadata")? {
-            Some(held) => self.metadata.add(held),
-            None => 0,
-        };
+        let held = book.held(&mut inputs[i], "sheetMetadata")?;
+        let own_metadata = list_len(held.as_ref().map(|h| &h.tree), "cellMetadata");
+        let cell_metadata = held.map_or(0, |held| self.metadata.add(held));
         self.persons.add(&book, &mut inputs[i])?;
         let mut copied = vec![];
         let mut moved = vec![];
@@ -938,6 +990,8 @@ impl Output {
         let maps = Rc::new(Maps {
             strings,
             cell_metadata,
+            own_metadata,
+            totals: self.totals.clone(),
             styles,
             colours,
             views: self.views,
@@ -994,11 +1048,14 @@ impl Output {
             ..
         } = t;
         tree.set_attr("", "", "id", &self.next_table_id.to_string());
+        self.table_ids.push(self.next_table_id.to_string());
         self.next_table_id += 1;
-        if let Some(new) = maps.renames.names.get(&name.to_lowercase()) {
+        let new = maps.renames.names.get(&name.to_lowercase());
+        if let Some(new) = new {
             tree.set_attr("", "", "name", new);
             tree.set_attr("", "", "displayName", new);
         }
+        self.table_names.push(new.unwrap_or(&name).to_lowercase());
         let none = HashSet::new();
         let mut unreadable_formula = false;
         let mut bad_format = None;
@@ -1051,6 +1108,12 @@ impl Output {
     }
 
     fn finish(self, plan: &mut Plan, base: &Package) -> Result<(), Error> {
+        let defects =
+            sheet_defects(&self.book.tree) + repeats(&self.table_ids) + repeats(&self.table_names);
+        if defects > self.defects {
+            let detail = "a sheet or table id or name repeats, or a name's sheet is missing";
+            return Err(Error::internal(detail));
+        }
         let Self {
             book,
             mut rels,
@@ -1059,6 +1122,7 @@ impl Output {
             base_styles,
             metadata,
             persons,
+            totals,
             ..
         } = self;
         // Excel rebuilds the calculation chain on load; the base's lists no appended cell.
@@ -1066,10 +1130,19 @@ impl Output {
             plan.remove(&part);
         }
         rels.list.retain(|r| r.kind != format!("{REL}calcChain"));
+        let merged_styles = styles.finish();
+        let sheet = merged_styles
+            .as_ref()
+            .or(base_styles.as_ref().map(|h| &h.tree));
+        totals.set(Totals {
+            formats: list_len(sheet, "cellXfs"),
+            strings: strings.items,
+            cell_metadata: list_len(metadata.tree.as_ref(), "cellMetadata"),
+        });
         strings.finish(plan, &mut rels, &book.part, &base.origin)?;
         metadata.finish(plan, &mut rels, &book.part);
         persons.finish(plan, &mut rels, &book.part);
-        if let Some(sheet) = styles.finish() {
+        if let Some(sheet) = merged_styles {
             let head = base_styles.as_ref().map(|h| declaration(&h.text));
             let mut text = head.unwrap_or(DECLARATION.to_string());
             sheet.write(&mut text);
@@ -1121,8 +1194,10 @@ impl Found {
 struct Maps {
     /// Shared-string indices.
     strings: Vec<u32>,
-    /// What `cm` numbers move by.
+    /// What `cm` numbers move by, and the highest one the workbook can use.
     cell_metadata: u32,
+    own_metadata: u32,
+    totals: Rc<Cell<Totals>>,
     styles: styles::Map,
     /// Set when the appended workbook's theme or palette isn't the output's.
     colours: Option<styles::Colours>,
@@ -1227,6 +1302,10 @@ impl SheetJob<'_> {
         let bad_format = |n: u32, place: String| {
             origin.bad(&format!("{place} uses format {n}, which isn't defined"))
         };
+        let totals = maps.totals.get();
+        let beyond = |what: &str, place: String| {
+            Error::internal(&format!("{place} points past the output's {what}"))
+        };
         let place = |cell: &Range<usize>| {
             let tag = &text[cell.clone()];
             match tag.split_once(" r=\"").and_then(|t| t.1.split_once('"')) {
@@ -1272,6 +1351,19 @@ impl SheetJob<'_> {
                     let Some(new) = maps.styles.xf(style) else {
                         return Err(bad_format(style, place(&cell)));
                     };
+                    if new != 0 && new >= totals.formats {
+                        return Err(beyond("cell formats", place(&cell)));
+                    }
+                    if let Some(m) = metadata {
+                        if m > maps.own_metadata {
+                            let why =
+                                format!("{} uses metadata {m}, which isn't defined", place(&cell));
+                            return Err(origin.bad(&why));
+                        }
+                        if m + maps.cell_metadata > totals.cell_metadata {
+                            return Err(beyond("cell metadata", place(&cell)));
+                        }
+                    }
                     let moved = metadata.filter(|_| maps.cell_metadata > 0);
                     // Most cells only change their format: just its digits are replaced.
                     let digits = text[start..end].find(" s=\"").map(|at| start + at + 4);
@@ -1319,6 +1411,9 @@ impl SheetJob<'_> {
                         let why = format!("{} uses a shared string it doesn't have", place(&cell));
                         return Err(origin.bad(&why));
                     };
+                    if *new >= totals.strings {
+                        return Err(beyond("shared strings", place(&cell)));
+                    }
                     p.replace(span, &new.to_string())?;
                 }
                 "f" | "formula" | "formula1" | "formula2" if !empty => {
@@ -1408,5 +1503,30 @@ impl SheetJob<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defects(xml: &str) -> usize {
+        let text = format!(r#"<workbook xmlns="{S}">{xml}</workbook>"#);
+        sheet_defects(&xml::tree(&text, "w", &Origin::test("w")).unwrap())
+    }
+
+    #[test]
+    fn sheet_checks_see_repeats_ignoring_case_and_stray_scopes() {
+        let good = r#"<sheets><sheet name="A" sheetId="1"/><sheet name="B" sheetId="2"/></sheets>"#;
+        assert_eq!(defects(good), 0);
+        let names =
+            r#"<sheets><sheet name="A" sheetId="1"/><sheet name="a" sheetId="2"/></sheets>"#;
+        assert_eq!(defects(names), 1);
+        let ids = r#"<sheets><sheet name="A" sheetId="1"/><sheet name="B" sheetId="1"/></sheets>"#;
+        assert_eq!(defects(ids), 1);
+        let stray = format!(
+            r#"{good}<definedNames><definedName name="x" localSheetId="1"/><definedName name="y" localSheetId="2"/></definedNames>"#
+        );
+        assert_eq!(defects(&stray), 1);
     }
 }
