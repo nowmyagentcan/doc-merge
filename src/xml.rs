@@ -328,11 +328,14 @@ where
 }
 
 fn escape(s: &str) -> Cow<'_, str> {
-    if s.contains(['<', '&', '"']) {
+    if s.contains(['<', '&', '"', '\n', '\t', '\r']) {
         Cow::Owned(
             s.replace('&', "&amp;")
                 .replace('<', "&lt;")
-                .replace('"', "&quot;"),
+                .replace('"', "&quot;")
+                .replace('\n', "&#10;")
+                .replace('\t', "&#9;")
+                .replace('\r', "&#13;"),
         )
     } else {
         Cow::Borrowed(s)
@@ -914,6 +917,14 @@ mod tests {
             |_, local| local == "rsid",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn line_breaks_in_attributes_survive_a_rewrite() {
+        let text = r#"<a descr="one&#10;two&#9;three"/>"#;
+        let mut written = String::new();
+        tree(text, "x.xml", &origin()).unwrap().write(&mut written);
+        assert_eq!(written, text);
     }
 
     #[test]
