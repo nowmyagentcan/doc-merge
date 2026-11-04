@@ -842,3 +842,251 @@ fn a_link_on_a_layout_follows_its_show() {
         "{copy}"
     );
 }
+
+/// Adds a legacy comment on slide 1 with its author list.
+fn with_comment(parts: &mut Parts, author: (&str, &str, u32, u32), idx: u32) {
+    let (name, initials, id, last) = author;
+    let types = "application/vnd.openxmlformats-officedocument.presentationml.";
+    let list = format!(
+        r#"<p:cmAuthorLst xmlns:p="{P}"><p:cmAuthor id="{id}" name="{name}" initials="{initials}" lastIdx="{last}" clrIdx="0"/></p:cmAuthorLst>"#
+    );
+    let comment = format!(
+        r#"<p:cmLst xmlns:p="{P}"><p:cm authorId="{id}" dt="2026-01-01T00:00:00.000" idx="{idx}"><p:pos x="1" y="2"/><p:text>x</p:text><p:extLst><p:ext uri="{{C676402C-5697-4E1C-873F-D02D1690AC5C}}"><p15:threadingInfo xmlns:p15="urn:p15" timeZoneBias="0"><p15:parentCm authorId="{id}" idx="{idx}"/></p15:threadingInfo></p:ext></p:extLst></p:cm></p:cmLst>"#
+    );
+    set(parts, "ppt/commentAuthors.xml", list.as_bytes());
+    set(parts, "ppt/comments/comment1.xml", comment.as_bytes());
+    let overrides = format!(
+        r#"<Override PartName="/ppt/commentAuthors.xml" ContentType="{types}commentAuthors+xml"/><Override PartName="/ppt/comments/comment1.xml" ContentType="{types}comments+xml"/></Types>"#
+    );
+    replace(parts, "[Content_Types].xml", "</Types>", &overrides);
+    let main = format!(
+        r#"<Relationship Id="rId90" Type="{R}/commentAuthors" Target="commentAuthors.xml"/></Relationships>"#
+    );
+    replace(
+        parts,
+        "ppt/_rels/presentation.xml.rels",
+        "</Relationships>",
+        &main,
+    );
+    let slide = format!(
+        r#"<Relationship Id="rId90" Type="{R}/comments" Target="../comments/comment1.xml"/></Relationships>"#
+    );
+    replace(
+        parts,
+        "ppt/slides/_rels/slide1.xml.rels",
+        "</Relationships>",
+        &slide,
+    );
+}
+
+#[test]
+fn legacy_authors_match_by_name_and_initials_and_their_numbers_go_on() {
+    let mut first = deck(1, WIDE);
+    with_comment(&mut first, ("Pat", "P", 3, 4), 4);
+    let mut same = deck(1, WIDE);
+    with_comment(&mut same, ("Pat", "P", 0, 2), 2);
+    let (_, parts) = two_decks("legacy-same", &first, &same);
+    let list = text(&parts, "ppt/commentAuthors.xml");
+    assert_eq!(values(&list, "p:cmAuthor", "id"), ["3"]);
+    assert_eq!(values(&list, "p:cmAuthor", "lastIdx"), ["6"]);
+    let copy = text(&parts, "ppt/comments/comment2.xml");
+    assert_eq!(values(&copy, "p:cm", "authorId"), ["3"]);
+    assert_eq!(values(&copy, "p:cm", "idx"), ["6"]);
+    assert_eq!(values(&copy, "p15:parentCm", "authorId"), ["3"]);
+    assert_eq!(values(&copy, "p15:parentCm", "idx"), ["6"]);
+
+    let mut other = deck(1, WIDE);
+    with_comment(&mut other, ("Pat", "PX", 3, 2), 2);
+    let (_, parts) = two_decks("legacy-other", &first, &other);
+    let list = text(&parts, "ppt/commentAuthors.xml");
+    assert_eq!(values(&list, "p:cmAuthor", "id"), ["3", "4"]);
+    assert_eq!(values(&list, "p:cmAuthor", "lastIdx"), ["4", "2"]);
+    let copy = text(&parts, "ppt/comments/comment2.xml");
+    assert_eq!(values(&copy, "p:cm", "authorId"), ["4"]);
+    assert_eq!(values(&copy, "p:cm", "idx"), ["2"]);
+}
+
+#[test]
+fn comment_authors_are_created_when_only_an_appended_deck_has_them() {
+    let (_, parts) = merged("authors", &["c.pptx", "b.pptx", "a.pptx"]);
+    let legacy = text(&parts, "ppt/commentAuthors.xml");
+    assert_eq!(values(&legacy, "p:cmAuthor", "name"), ["Author A"]);
+    let modern = text(&parts, "ppt/authors.xml");
+    assert_eq!(values(&modern, "p188:author", "name"), ["Author A"]);
+    let rels = text(&parts, "ppt/_rels/presentation.xml.rels");
+    assert!(rels.contains("/commentAuthors\" Target=\"commentAuthors.xml\""));
+    assert!(rels.contains("/authors\" Target=\"authors.xml\""));
+    let types = text(&parts, "[Content_Types].xml");
+    assert!(types.contains("application/vnd.ms-powerpoint.authors+xml"));
+}
+
+#[test]
+fn modern_comments_follow_their_slide() {
+    let (_, parts) = merged("modern", &["a.pptx", "a.pptx"]);
+    assert_eq!(
+        values(&text(&parts, "ppt/authors.xml"), "p188:author", "id").len(),
+        1
+    );
+    let order = slides(&parts);
+    let main = text(&parts, "ppt/presentation.xml");
+    let ids = values(&main, "p:sldId", "id");
+    let comment_of = |slide: &str| {
+        let rels = text(&parts, &rels_of(slide));
+        let at = rels.find("comments/modernComment").unwrap();
+        let name = &rels[at..at + rels[at..].find('"').unwrap()];
+        text(&parts, &format!("ppt/{name}"))
+    };
+    let (first, second) = (comment_of(&order[2]), comment_of(&order[6]));
+    assert_eq!(values(&second, "pc:sldMk", "sldId"), [ids[6].clone()]);
+    assert_eq!(
+        values(&second, "pc:sldMk", "cId"),
+        values(&text(&parts, &order[6]), "p14:creationId", "val")
+    );
+    assert_ne!(
+        values(&first, "p188:cm", "id"),
+        values(&second, "p188:cm", "id")
+    );
+}
+
+#[test]
+fn embedded_fonts_are_added_once_by_typeface() {
+    let (_, parts) = merged("fonts-add", &["a.pptx", "c.pptx", "c.pptx"]);
+    let main = text(&parts, "ppt/presentation.xml");
+    assert_eq!(values(&main, "p:font", "typeface"), ["Merge Box"]);
+    assert!(main.contains(r#"embedTrueTypeFonts="1""#));
+    let at = |s: &str| main.find(s).unwrap_or_else(|| panic!("no {s}"));
+    assert!(at("<p:notesSz") < at("<p:embeddedFontLst"));
+    assert!(at("<p:embeddedFontLst") < at("<p:custShowLst"));
+    let rid = &values(&main, "p:regular", "r:id")[0];
+    let font = target_of(&parts, "ppt/_rels/presentation.xml.rels", rid, "ppt");
+    assert_eq!(font, "ppt/fonts/font1.fntdata");
+    assert!(parts.iter().any(|p| p.0 == font && !p.1.is_empty()));
+    let fonts = parts
+        .iter()
+        .filter(|p| p.0.starts_with("ppt/fonts/"))
+        .count();
+    assert_eq!(fonts, 1);
+}
+
+#[test]
+fn table_styles_are_added_by_their_id() {
+    let (_, parts) = merged("tables", &["a.pptx", "c.pptx", "c.pptx"]);
+    let list = text(&parts, "ppt/tableStyles.xml");
+    let names = values(&list, "a:tblStyle", "styleName");
+    assert_eq!(names.iter().filter(|n| *n == "Deck C table").count(), 1);
+    let source = text(&entries(&fixture("a.pptx")), "ppt/tableStyles.xml");
+    assert_eq!(
+        values(&list, "a:tblStyleLst", "def"),
+        values(&source, "a:tblStyleLst", "def")
+    );
+}
+
+#[test]
+fn a_table_style_list_with_nothing_new_keeps_its_bytes() {
+    let (_, parts) = merged("tables-same", &["a.pptx", "b.pptx"]);
+    let source = text(&entries(&fixture("a.pptx")), "ppt/tableStyles.xml");
+    assert_eq!(text(&parts, "ppt/tableStyles.xml"), source);
+}
+
+#[test]
+fn the_counts_of_the_document_properties_follow_the_slides() {
+    let (_, parts) = merged("counts", &["a.pptx", "b.pptx", "c.pptx"]);
+    let app = text(&parts, "docProps/app.xml");
+    assert!(app.contains("<Slides>10</Slides>"), "{app}");
+    assert!(app.contains("<Notes>8</Notes>"), "{app}");
+    assert!(app.contains("<HiddenSlides>1</HiddenSlides>"), "{app}");
+}
+
+/// A zoom object, as a slide holds it.
+fn zoom(ns: &str) -> String {
+    format!(
+        r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:z="{ns}" Requires="z"><p:graphicFrame><p:nvGraphicFramePr/><p:xfrm/><a:graphic><a:graphicData uri="{ns}"><z:sectionZm/></a:graphicData></a:graphic></p:graphicFrame></mc:Choice></mc:AlternateContent>"#
+    )
+}
+
+#[test]
+fn zoom_is_refused_in_an_appended_deck_and_kept_in_the_base() {
+    let dir = temp_dir("zoom");
+    for kind in ["sectionzoom", "slidezoom", "summaryzoom"] {
+        let ns = format!("http://schemas.microsoft.com/office/powerpoint/2016/{kind}");
+        let mut z = deck(1, WIDE);
+        with_shapes(&mut z, &zoom(&ns));
+        let z_path = file(&dir, "z.pptx", &z);
+        let out = dir.join("out.pptx");
+        let paths = [fixture("a.pptx"), z_path.clone()];
+        let e = merge(&paths, &out, &Options::default(), None).unwrap_err();
+        assert_eq!((e.code, e.input), ("unsupported_variant", Some(2)));
+        assert_eq!(
+            e.message,
+            "'z.pptx' has slide or section zoom, which doc-merge can't merge yet."
+        );
+        assert!(!out.exists());
+        let paths = [z_path, fixture("b.pptx")];
+        merge(&paths, &out, &Options::default(), None).unwrap();
+        std::fs::remove_file(&out).unwrap();
+    }
+}
+
+#[test]
+fn protection_and_unknown_parts_of_an_appended_deck_are_reported() {
+    let mut second = deck(1, WIDE);
+    let main = r#"<p:modifyVerifier cryptProviderType="rsaAES"/></p:presentation>"#;
+    replace(
+        &mut second,
+        "ppt/presentation.xml",
+        "</p:presentation>",
+        main,
+    );
+    set(&mut second, "ppt/extra.xml", b"<x/>");
+    let rel = format!(
+        r#"<Relationship Id="rId91" Type="{R}/gadget" Target="extra.xml"/></Relationships>"#
+    );
+    replace(
+        &mut second,
+        "ppt/_rels/presentation.xml.rels",
+        "</Relationships>",
+        &rel,
+    );
+    let (report, parts) = two_decks("left", &deck(1, WIDE), &second);
+    let codes: Vec<&str> = report.warnings.list().iter().map(|w| w.code).collect();
+    assert_eq!(codes, ["protection_not_kept", "part_dropped"]);
+    assert!(parts.iter().all(|p| p.0 != "ppt/extra.xml"));
+    assert!(!text(&parts, "ppt/presentation.xml").contains("modifyVerifier"));
+}
+
+#[test]
+fn a_data_store_reached_from_a_slide_comes_with_a_free_id() {
+    let store = |parts: &mut Parts| {
+        let item = r#"<root/>"#;
+        let props = r#"<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" ds:itemID="{11111111-2222-3333-4444-555555555555}"/>"#;
+        set(parts, "customXml/item1.xml", item.as_bytes());
+        set(parts, "customXml/itemProps1.xml", props.as_bytes());
+        set(
+            parts,
+            "customXml/_rels/item1.xml.rels",
+            rels(&[("rId1", &format!("{R}/customXmlProps"), "itemProps1.xml")]).as_bytes(),
+        );
+        let overrides = r#"<Override PartName="/customXml/itemProps1.xml" ContentType="application/vnd.openxmlformats-officedocument.customXmlProperties+xml"/></Types>"#;
+        replace(parts, "[Content_Types].xml", "</Types>", overrides);
+        let rel = format!(
+            r#"<Relationship Id="rId92" Type="{R}/customXml" Target="../../customXml/item1.xml"/></Relationships>"#
+        );
+        replace(
+            parts,
+            "ppt/slides/_rels/slide1.xml.rels",
+            "</Relationships>",
+            &rel,
+        );
+    };
+    let mut d = deck(1, WIDE);
+    store(&mut d);
+    let (_, parts) = two_decks("store", &d, &d);
+    let ids = |name: &str| values(&text(&parts, name), "ds:datastoreItem", "ds:itemID");
+    let (first, second) = (
+        ids("customXml/itemProps1.xml"),
+        ids("customXml/itemProps2.xml"),
+    );
+    assert_eq!(first, ["{11111111-2222-3333-4444-555555555555}"]);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first, second);
+}

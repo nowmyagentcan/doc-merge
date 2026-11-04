@@ -1,6 +1,6 @@
 //! PowerPoint: every deck's slides after the base's, with their masters, layouts and notes.
-//! Slides and what hangs off them are copied as stored; only the main part and its
-//! relationships are rebuilt.
+//! Slides and what hangs off them are copied as stored; the main part, its relationships and
+//! the lists every deck shares (comment authors, table styles, embedded fonts) are rebuilt.
 
 mod masters;
 
@@ -11,15 +11,41 @@ use std::path::Path;
 
 use crate::Rename;
 use crate::error::{Error, Warning, Warnings, thousands};
-use crate::package::{MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve};
+use crate::package::{Entry, MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve};
 use crate::writer::{Body, Part, Plan, R, Rels, guid, planned_text, relative, rels_part};
-use crate::xml::{self, Attr, Child, Node, Prefixes, XMLNS, declaration, prefix_of};
+use crate::xml::{self, A, Attr, Child, Node, Prefixes, XMLNS, declaration, prefix_of};
 use masters::{Design, Fit, Units, ratio};
 
 pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 const P14: &str = "http://schemas.microsoft.com/office/powerpoint/2010/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+const AUTHORS: &str = "http://schemas.microsoft.com/office/2018/10/relationships/authors";
+const P188: &str = "http://schemas.microsoft.com/office/powerpoint/2018/8/main";
+const COMMANDS: &str = "http://schemas.microsoft.com/office/powerpoint/2013/main/command";
+const PROPERTIES: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+const DATA_STORE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/customXml";
+const ITEM_PROPERTIES: &str =
+    "application/vnd.openxmlformats-officedocument.customXmlProperties+xml";
 const SECTIONS: &str = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}";
+/// Relationships of a main part this module handles, or that only the base's copy keeps. The
+/// last two are bookkeeping of shared editing.
+const KNOWN_PARTS: [&str; 14] = [
+    "slideMaster",
+    "slide",
+    "notesMaster",
+    "handoutMaster",
+    "presProps",
+    "viewProps",
+    "theme",
+    "tableStyles",
+    "commentAuthors",
+    "authors",
+    "font",
+    "customXml",
+    "revisionInfo",
+    "changesInfo",
+];
 const SHOW_LINK: &str = "ppaction://customshow?id=";
 const MAX_SLIDES: usize = 10_000;
 /// The children of `p:presentation`, in schema order.
@@ -59,6 +85,13 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
         .iter_mut()
         .map(Deck::read)
         .collect::<Result<Vec<_>, _>>()?;
+    for (pkg, deck) in inputs.iter().zip(&decks).skip(1) {
+        if deck.slides.iter().any(|s| s.zoom) {
+            let name = &pkg.origin.name;
+            let e = Error::unsupported_variant(name, "slide or section zoom");
+            return Err(e.at(pkg.origin.input));
+        }
+    }
     let total: usize = decks.iter().map(|d| d.slides.len()).sum();
     if total > MAX_SLIDES {
         return Err(Error::limit_exceeded(
@@ -70,7 +103,7 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
     let mut plan = Plan::base(&inputs[0], warnings)?;
     let mut renames = vec![];
     let sectioned = decks.iter().any(|d| !d.sections.is_empty());
-    let mut out = Output::new(&decks[0], &inputs[0], sectioned);
+    let mut out = Output::new(&decks[0], &mut inputs[0], sectioned)?;
     for master in &decks[0].masters {
         let design = Design::of(&mut inputs[0], master)?;
         let (part, layouts) = (master.part.clone(), master.layouts.clone());
@@ -78,13 +111,14 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
     }
     for (i, deck) in decks.iter().enumerate().skip(1) {
         out.append(&mut plan, inputs, i, deck, &mut renames)?;
+        leave_warnings(&inputs[i], deck, warnings);
         if deck.size != decks[0].size && !deck.slides.is_empty() {
             let (from, to) = (ratio(deck.size), ratio(decks[0].size));
             let origin = &inputs[i].origin;
             warnings.push(Warning::slides_scaled(i + 1, &origin.name, &from, &to));
         }
     }
-    out.finish(&mut plan, &inputs[0]);
+    out.finish(&mut plan, &mut inputs[0])?;
     let main = inputs[0].main.clone();
     check(&plan, inputs, &main, decks[0].id_defects())?;
     Ok(Merged {
@@ -104,6 +138,52 @@ struct Slide {
     creation: Option<String>,
     /// Whether a link on it runs a custom show.
     runs_show: bool,
+    hidden: bool,
+    notes: bool,
+    /// A slide or section zoom, which points at slides and sections by id.
+    zoom: bool,
+    /// Its comment parts, and whether each is a modern one.
+    comments: Vec<(String, bool)>,
+}
+
+/// A small list part of a main part, held whole.
+#[derive(Clone)]
+struct Held {
+    part: String,
+    /// Its relationship's type.
+    kind: String,
+    content_type: String,
+    declaration: String,
+    root: Node,
+    changed: bool,
+}
+
+impl Held {
+    fn read(pkg: &mut Package, rels: &[Rel], kind: &str) -> Result<Option<Self>, Error> {
+        let Some(r) = rels.iter().find(|r| r.kind == kind && !r.external) else {
+            return Ok(None);
+        };
+        let main = pkg.main.clone();
+        let part = target(pkg, &main, rels, &r.id)?;
+        let text = pkg.text(&part, MAX_PARSED)?;
+        Ok(Some(Self {
+            content_type: pkg.types.of(&part).unwrap_or_default().to_string(),
+            kind: kind.to_string(),
+            declaration: declaration(&text),
+            root: xml::tree(&text, &part, &pkg.origin)?,
+            part,
+            changed: false,
+        }))
+    }
+
+    /// Adds an element of a part whose root has `declared` on it.
+    fn add(&mut self, mut node: Node, declared: &[Attr]) {
+        let mut prefixes = Prefixes::of(&self.root.attrs);
+        node.attrs.extend(prefixes.merge(declared));
+        self.root.attrs = prefixes.attrs;
+        self.root.children.push(Child::Node(node));
+        self.changed = true;
+    }
 }
 
 /// A slide master and its layouts, in their order.
@@ -127,6 +207,9 @@ struct Deck {
     sections: Vec<Node>,
     /// The file name without its extension.
     stem: String,
+    comment_authors: Option<Held>,
+    authors: Option<Held>,
+    table_styles: Option<Held>,
 }
 
 /// The entries of list `list` in a main part or master.
@@ -197,18 +280,31 @@ impl Deck {
             };
             let text = pkg.text(&slide, MAX_PARSED)?;
             let tree = xml::tree(&text, &slide, &pkg.origin)?;
-            let mut creation = None;
+            let (mut creation, mut zoom) = (None, false);
             tree.walk(&mut |n| {
                 if n.is(P14, "creationId") {
                     creation = n.attr("", "val").map(String::from);
                 }
+                zoom |= n.ns.contains("/powerpoint/") && n.ns.ends_with("zoom");
             });
+            let comments = own
+                .iter()
+                .filter(|r| kind(r) == "comments")
+                .map(|r| {
+                    let part = target(pkg, &slide, &own, &r.id)?;
+                    Ok((part, !r.kind.starts_with(REL)))
+                })
+                .collect::<Result<_, Error>>()?;
             slides.push(Slide {
                 part: slide,
                 rid: n.attr(R, "id").unwrap_or("").to_string(),
                 id,
                 creation,
                 runs_show: text.contains(SHOW_LINK),
+                hidden: tree.attr("", "show") == Some("0"),
+                notes: count("notesSlide") == 1,
+                zoom,
+                comments,
             });
         }
         let size = slide_size(&root).ok_or_else(|| {
@@ -221,6 +317,9 @@ impl Deck {
         let stem = stem.unwrap_or_default().to_string_lossy().into_owned();
         Ok(Self {
             declaration: declaration(&text),
+            comment_authors: Held::read(pkg, &rels, &format!("{REL}commentAuthors"))?,
+            authors: Held::read(pkg, &rels, AUTHORS)?,
+            table_styles: Held::read(pkg, &rels, &format!("{REL}tableStyles"))?,
             sections,
             stem,
             size,
@@ -237,6 +336,116 @@ impl Deck {
     fn id_defects(&self) -> usize {
         let slides = self.slides.iter().map(|s| s.id);
         defects(self.master_ids.iter().copied(), MASTER_IDS) + defects(slides, SLIDE_IDS)
+    }
+}
+
+/// Says what of an appended deck stays behind: its protection, and document-level parts this
+/// merge knows nothing about.
+fn leave_warnings(pkg: &Package, deck: &Deck, warnings: &mut Warnings) {
+    let (name, input) = (&pkg.origin.name, pkg.origin.input);
+    if deck.root.child(P, "modifyVerifier").is_some() {
+        warnings.push(Warning::protection_not_kept(input, name));
+    }
+    let mut dropped: Vec<(&str, usize)> = vec![];
+    for r in &deck.rels {
+        let kind = kind(r);
+        if KNOWN_PARTS.contains(&kind) || r.external {
+            continue;
+        }
+        match dropped.iter_mut().find(|d| d.0 == kind) {
+            Some(d) => d.1 += 1,
+            None => dropped.push((kind, 1)),
+        }
+    }
+    dropped.sort();
+    if !dropped.is_empty() {
+        warnings.push(Warning::part_dropped(input, name, &dropped));
+    }
+}
+
+/// The list part `slot` of the output, created like `from` when the base has none.
+fn output_list<'a>(
+    slot: &'a mut Option<Held>,
+    from: &Held,
+    plan: &mut Plan,
+    rels: &mut Rels,
+    main: &str,
+) -> &'a mut Held {
+    slot.get_or_insert_with(|| {
+        let name = plan.claim(&from.part);
+        plan.type_part(&name, &from.content_type, false);
+        plan.add(name.clone(), Body::Data(vec![]), None);
+        rels.add(&from.kind, relative(main, &name), false);
+        let mut list = from.clone();
+        list.root.children.clear();
+        list.part = name;
+        list.changed = true;
+        list
+    })
+}
+
+/// What the ids of a legacy comment become: per old author id, the new one and what to add to
+/// each comment number.
+type CommentMap = HashMap<String, (String, u64)>;
+
+fn number(n: &Node, name: &str) -> u64 {
+    n.attr("", name).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// Takes a deck's legacy comment authors into the output's list: the same name and initials
+/// are one author, whose comment numbers carry on from the highest so far.
+fn merge_comment_authors(list: &mut Held, deck: &Held) -> CommentMap {
+    let mut map = CommentMap::new();
+    let attrs: Vec<Attr> = deck.root.attrs.clone();
+    for author in deck.root.nodes().filter(|n| n.is(P, "cmAuthor")) {
+        let old = author.attr("", "id").unwrap_or_default().to_string();
+        let last = number(author, "lastIdx");
+        let same = |n: &&mut Node| {
+            n.is(P, "cmAuthor")
+                && n.attr("", "name") == author.attr("", "name")
+                && n.attr("", "initials") == author.attr("", "initials")
+        };
+        if let Some(n) = list.root.nodes_mut().find(same) {
+            let offset = number(n, "lastIdx");
+            n.set_attr("", "", "lastIdx", &(offset + last).to_string());
+            let id = n.attr("", "id").unwrap_or_default().to_string();
+            map.insert(old, (id, offset));
+            list.changed = true;
+            continue;
+        }
+        let top = list.root.nodes().map(|n| number(n, "id") + 1).max();
+        let id = top.unwrap_or(0).to_string();
+        let mut new = author.clone();
+        new.set_attr("", "", "id", &id);
+        list.add(new, &attrs);
+        map.insert(old, (id, 0));
+    }
+    map
+}
+
+/// Renumbers the comments of a legacy comment part, and the replies in them.
+fn renumber_comments(root: &mut Node, map: &CommentMap) {
+    root.walk_mut(&mut |n| {
+        if n.local != "cm" && n.local != "parentCm" {
+            return;
+        }
+        let author = n.attr("", "authorId").unwrap_or_default();
+        if let Some((id, offset)) = map.get(author).cloned() {
+            let idx = number(n, "idx") + offset;
+            n.set_attr("", "", "authorId", &id);
+            n.set_attr("", "", "idx", &idx.to_string());
+        }
+    });
+}
+
+/// Adds the elements of list `deck` the output's list lacks, compared by attribute `key`.
+fn merge_by_id(list: &mut Held, deck: &Held, ns: &str, local: &str, key: &str) {
+    let id = |n: &Node| n.attr("", key).map(str::to_ascii_uppercase);
+    let mut known: HashSet<_> = list.root.nodes().filter_map(id).collect();
+    for n in deck.root.nodes().filter(|n| n.is(ns, local)) {
+        if id(n).is_some_and(|i| known.insert(i)) {
+            list.add(n.clone(), &deck.root.attrs);
+        }
     }
 }
 
@@ -368,10 +577,40 @@ struct Output {
     /// The prefix of `p14:` elements, colon included.
     p14: String,
     section_ids: HashSet<String>,
+    comment_authors: Option<Held>,
+    authors: Option<Held>,
+    table_styles: Option<Held>,
+    /// Upper-case ids of modern comments.
+    comment_ids: HashSet<String>,
+    /// Upper-case ids of custom XML data stores.
+    item_ids: HashSet<String>,
+    /// Lower-case names of embedded fonts.
+    fonts: HashSet<String>,
+    notes_added: u64,
+    hidden_added: u64,
 }
 
 impl Output {
-    fn new(deck: &Deck, pkg: &Package, sectioned: bool) -> Self {
+    fn new(deck: &Deck, pkg: &mut Package, sectioned: bool) -> Result<Self, Error> {
+        let mut comment_ids = HashSet::new();
+        let modern = deck.slides.iter().flat_map(|s| &s.comments);
+        for (part, _) in modern.filter(|c| c.1) {
+            let text = pkg.text(part, MAX_PARSED)?;
+            let tree = xml::tree(&text, part, &pkg.origin)?;
+            tree.walk(&mut |n| {
+                if n.ns == P188 && (n.local == "cm" || n.local == "reply") {
+                    comment_ids.extend(n.attr("", "id").map(str::to_ascii_uppercase));
+                }
+            });
+        }
+        let mut item_ids = HashSet::new();
+        for part in item_parts(pkg) {
+            let text = pkg.text(&part, MAX_PARSED)?;
+            let tree = xml::tree(&text, &part, &pkg.origin)?;
+            item_ids.extend(tree.attr(DATA_STORE, "itemID").map(str::to_ascii_uppercase));
+        }
+        let fonts = listed(&deck.root, "embeddedFontLst").filter_map(font_name);
+        let fonts = fonts.collect();
         let shows = listed(&deck.root, "custShowLst");
         let names = shows.filter_map(|n| n.attr("", "name"));
         let mut out = Self {
@@ -394,10 +633,117 @@ impl Output {
             sections: sectioned.then(Vec::new),
             p14: section_list(&deck.root).map_or("p14:".into(), prefix),
             section_ids: HashSet::new(),
+            comment_authors: deck.comment_authors.clone(),
+            authors: deck.authors.clone(),
+            table_styles: deck.table_styles.clone(),
+            comment_ids,
+            item_ids,
+            fonts,
+            notes_added: 0,
+            hidden_added: 0,
         };
         let same = deck.slides.iter().map(|s| (s.id, s.id)).collect();
         out.add_sections(deck, 0, &same);
-        out
+        Ok(out)
+    }
+
+    /// Takes in a deck's authors and table styles; returns how its legacy comments renumber.
+    fn merge_lists(&mut self, plan: &mut Plan, deck: &Deck) -> CommentMap {
+        let (rels, main) = (&mut self.rels, self.main.as_str());
+        if let Some(from) = &deck.authors {
+            let list = output_list(&mut self.authors, from, plan, rels, main);
+            merge_by_id(list, from, P188, "author", "id");
+        }
+        if let Some(from) = &deck.table_styles {
+            let list = output_list(&mut self.table_styles, from, plan, rels, main);
+            merge_by_id(list, from, A, "tblStyle", "styleId");
+        }
+        deck.comment_authors
+            .as_ref()
+            .map_or(CommentMap::new(), |from| {
+                let list = output_list(&mut self.comment_authors, from, plan, rels, main);
+                merge_comment_authors(list, from)
+            })
+    }
+
+    /// Adds the embedded fonts of a deck the output lacks, with their font parts.
+    fn add_fonts(
+        &mut self,
+        plan: &mut Plan,
+        inputs: &mut [Package],
+        i: usize,
+        deck: &Deck,
+        local: &[Attr],
+    ) -> Result<(), Error> {
+        for font in listed(&deck.root, "embeddedFontLst") {
+            if !font_name(font).is_some_and(|name| self.fonts.insert(name)) {
+                continue;
+            }
+            let mut font = font.clone();
+            font.attrs.extend(local.iter().cloned());
+            for face in font.nodes_mut() {
+                let Some(a) = face.attrs.iter_mut().find(|a| a.ns == R) else {
+                    continue;
+                };
+                let part = target(&inputs[i], &inputs[i].main, &deck.rels, &a.value)?;
+                let name = plan.copy_graph(inputs, i, &part, &|_, _| None)?;
+                let to = relative(&self.main, &name);
+                a.value = self.rels.add(&format!("{REL}font"), to, false);
+            }
+            self.root.set_attr("", "", "embedTrueTypeFonts", "1");
+            list(&mut self.root, "embeddedFontLst")
+                .children
+                .push(Child::Node(font));
+        }
+        Ok(())
+    }
+
+    /// Fits a modern comment part to its copied slide: the slide's ids, and comment ids the
+    /// output has already.
+    fn renumber_modern(&mut self, root: &mut Node, slide: u32, creation: Option<&str>, i: usize) {
+        root.walk_mut(&mut |n| {
+            if n.ns == COMMANDS && n.local == "sldMk" {
+                n.set_attr("", "", "sldId", &slide.to_string());
+                if let Some(id) = creation {
+                    n.set_attr("", "", "cId", id);
+                }
+            }
+            if n.ns == P188 && (n.local == "cm" || n.local == "reply") {
+                let old = n.attr("", "id").unwrap_or_default().to_string();
+                if !self.comment_ids.insert(old.to_ascii_uppercase()) {
+                    let id = free_guid(&mut self.comment_ids, i, &old);
+                    n.set_attr("", "", "id", &id);
+                }
+            }
+        });
+    }
+
+    /// Gives custom XML data stores copied from input `i` new ids where the output has theirs.
+    fn renumber_items(
+        &mut self,
+        plan: &mut Plan,
+        pkg: &mut Package,
+        i: usize,
+    ) -> Result<(), Error> {
+        for part in item_parts(pkg) {
+            if plan.copied(i, &part).is_none() {
+                continue;
+            }
+            let text = pkg.text(&part, MAX_PARSED)?;
+            let tree = xml::tree(&text, &part, &pkg.origin)?;
+            let old = tree
+                .attr(DATA_STORE, "itemID")
+                .unwrap_or_default()
+                .to_string();
+            if self.item_ids.insert(old.to_ascii_uppercase()) {
+                continue;
+            }
+            let id = free_guid(&mut self.item_ids, i, &old);
+            edit_part(plan, pkg, i, &part, |root| {
+                root.set_attr(DATA_STORE, "ds", "itemID", &id);
+            })?;
+        }
+        Ok(())
     }
 
     /// Adds a deck's sections with the slides' new ids; a deck without sections gets one named
@@ -446,10 +792,7 @@ impl Output {
         if !old.is_empty() && self.section_ids.insert(old.to_ascii_uppercase()) {
             return old.to_string();
         }
-        (0u32..)
-            .map(|attempt| format!("{{{}}}", guid((input, old, attempt))))
-            .find(|id| self.section_ids.insert(id.clone()))
-            .expect("a free section id")
+        free_guid(&mut self.section_ids, input, old)
     }
 
     /// The id a slide keeps or gets for `p14:creationId`, when it must change.
@@ -651,6 +994,8 @@ impl Output {
             );
             self.notes_master = Some(name);
         }
+        let comment_map = self.merge_lists(plan, deck);
+        self.add_fonts(plan, inputs, i, deck, &local)?;
         let shared = self.add_masters(plan, inputs, i, deck, &shows)?;
         let notes = self.notes_master.clone();
         let mapped = |r: &Rel, target: &str| match kind(r) {
@@ -663,8 +1008,8 @@ impl Output {
         let mut rids = HashMap::new();
         for slide in &deck.slides {
             let name = plan.copy_graph(inputs, i, &slide.part, &mapped)?;
-            let creation = slide.creation.as_ref();
-            let creation = creation.and_then(|old| self.new_creation(old, i));
+            let old_creation = slide.creation.as_ref();
+            let creation = old_creation.and_then(|old| self.new_creation(old, i));
             if fit.is_some() || creation.is_some() || slide.runs_show {
                 edit_part(plan, &mut inputs[i], i, &slide.part, |root| {
                     relink_shows(root, &shows);
@@ -680,7 +1025,19 @@ impl Output {
             let rid = self.add_entry("sldIdLst", "sldId", Some(id), "slide", &name);
             slide_ids.insert(slide.id, id);
             rids.insert(slide.rid.as_str(), rid);
+            self.notes_added += u64::from(slide.notes);
+            self.hidden_added += u64::from(slide.hidden);
+            for (part, modern) in &slide.comments {
+                edit_part(plan, &mut inputs[i], i, part, |root| {
+                    if *modern {
+                        self.renumber_modern(root, id, creation.as_deref(), i);
+                    } else {
+                        renumber_comments(root, &comment_map);
+                    }
+                })?;
+            }
         }
+        self.renumber_items(plan, &mut inputs[i], i)?;
         self.add_shows(deck, &planned, &rids, &local);
         self.add_sections(deck, i, &slide_ids);
         Ok(())
@@ -712,14 +1069,72 @@ impl Output {
         extensions.children.insert(0, Child::Node(extension));
     }
 
-    fn finish(mut self, plan: &mut Plan, base: &Package) {
+    /// Updates the base's counts of slides, notes and hidden slides, where it has them.
+    fn write_counts(&self, plan: &mut Plan, pkg: &mut Package) -> Result<(), Error> {
+        let properties = pkg.rels.iter().find(|r| kind(r) == "extended-properties");
+        let part = properties.and_then(|r| resolve("", &r.target));
+        let Some(part) = part.filter(|p| pkg.has(p)) else {
+            return Ok(());
+        };
+        let text = pkg.text(&part, MAX_PARSED)?;
+        let mut root = xml::tree(&text, &part, &pkg.origin)?;
+        let slides = listed(&self.root, "sldIdLst").count() as u64;
+        let counts = [
+            ("Slides", None, slides),
+            ("Notes", Some(self.notes_added), 0),
+            ("HiddenSlides", Some(self.hidden_added), 0),
+        ];
+        for (local, added, total) in counts {
+            if let Some(n) = root.child_mut(PROPERTIES, local) {
+                let base: u64 = n.text().trim().parse().unwrap_or(0);
+                let count = added.map_or(total, |a| base + a);
+                n.children = vec![Child::Text(count.to_string())];
+            }
+        }
+        plan.replace(&part, Body::Data(part_bytes(&declaration(&text), &root)));
+        Ok(())
+    }
+
+    fn finish(mut self, plan: &mut Plan, base: &mut Package) -> Result<(), Error> {
         self.write_sections();
+        self.write_counts(plan, base)?;
+        let lists = [&self.comment_authors, &self.authors, &self.table_styles];
+        for list in lists.into_iter().flatten().filter(|l| l.changed) {
+            let bytes = part_bytes(&list.declaration, &list.root);
+            plan.replace(&list.part, Body::Data(bytes));
+        }
         plan.replace(
             &self.main,
             Body::Data(part_bytes(&self.declaration, &self.root)),
         );
         rels_part(plan, base, &self.main, &self.rels);
+        Ok(())
     }
+}
+
+/// A new GUID in braces, not yet in `used`, that depends only on the input and the old id.
+fn free_guid(used: &mut HashSet<String>, input: usize, old: &str) -> String {
+    (0u32..)
+        .map(|attempt| format!("{{{}}}", guid((input, old, attempt))))
+        .find(|id| used.insert(id.clone()))
+        .expect("a free id")
+}
+
+/// The custom XML properties parts of a package.
+fn item_parts(pkg: &Package) -> Vec<String> {
+    let typed = |e: &&Entry| pkg.types.of(&e.name) == Some(ITEM_PROPERTIES);
+    pkg.entries
+        .iter()
+        .filter(typed)
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// An embedded font's typeface in lower case.
+fn font_name(font: &Node) -> Option<String> {
+    font.child(P, "font")?
+        .attr("", "typeface")
+        .map(str::to_lowercase)
 }
 
 /// Rewrites the copy of part `part` of input `i`.
