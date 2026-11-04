@@ -330,6 +330,53 @@ impl Plan {
     }
 }
 
+/// A part's relationships as the output will have them, with new ids after the highest.
+pub struct Rels {
+    pub list: Vec<Rel>,
+    next: u32,
+}
+
+impl Rels {
+    pub fn new(list: Vec<Rel>) -> Self {
+        let next = list
+            .iter()
+            .filter_map(|r| r.id.strip_prefix("rId")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        Self { list, next }
+    }
+
+    /// Adds a relationship and returns its new id.
+    pub fn add(&mut self, kind: &str, target: String, external: bool) -> String {
+        let id = loop {
+            let id = format!("rId{}", self.next);
+            self.next += 1;
+            if !self.list.iter().any(|r| r.id == id) {
+                break id;
+            }
+        };
+        self.list.push(Rel {
+            id: id.clone(),
+            kind: kind.into(),
+            target,
+            external,
+        });
+        id
+    }
+}
+
+/// Writes the relationships of an output part, replacing the base's when it has them.
+pub fn rels_part(plan: &mut Plan, base: &Package, part: &str, rels: &Rels) {
+    let name = rels_name(part);
+    if base.has(&name) {
+        plan.replace(&name, Body::Data(rels_xml(&rels.list)));
+    } else {
+        plan.type_part(&name, RELS_TYPE, true);
+        plan.add(name, Body::Data(rels_xml(&rels.list)), None);
+    }
+}
+
 /// A relationships part.
 pub fn rels_xml(rels: &[Rel]) -> Vec<u8> {
     let mut s = String::from(

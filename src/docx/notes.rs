@@ -4,14 +4,12 @@
 
 use std::collections::HashMap;
 
-use super::{
-    Held, Parts, Prefixes, Rels, Rewrite, W, copy_rel, held, registry, rels_part, scan, story,
-};
+use super::{Held, Parts, Rewrite, W, copy_rel, held, registry, scan, story};
 use crate::Origin;
 use crate::error::Error;
 use crate::package::{Package, Rel};
-use crate::writer::Plan;
-use crate::xml;
+use crate::writer::{Plan, Rels, rels_part};
+use crate::xml::{self, Prefixes};
 
 /// The notes parts, in the order [`Rewrite::notes`] holds their id maps.
 pub const KINDS: [(&str, &str); 3] = [

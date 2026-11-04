@@ -8,7 +8,7 @@ use std::ops::Range;
 use crate::StyleMode;
 use crate::docx::W;
 use crate::error::{Error, thousands};
-use crate::xml::{Attr, Child, Node};
+use crate::xml::{self, A, Attr, Child, Node};
 
 /// Word refuses a document with more styles.
 const MAX_STYLES: usize = 4_079;
@@ -338,8 +338,6 @@ impl Output {
     }
 }
 
-const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
-
 /// A document's theme, as far as text needs it.
 pub struct Theme {
     /// The canonical form of its colours and fonts.
@@ -367,14 +365,7 @@ impl Theme {
     /// `lang` is the document's `w:themeFontLang`.
     pub fn new(root: &Node, lang: Option<&Node>) -> Self {
         let elements = root.child(A, "themeElements");
-        let mut form = String::new();
-        for local in ["clrScheme", "fontScheme"] {
-            if let Some(n) = elements.and_then(|e| e.child(A, local)) {
-                let mut n = n.clone();
-                n.attrs.retain(|a| a.local != "name");
-                n.canonical(&mut form);
-            }
-        }
+        let form = xml::theme_form(root);
         let mut fonts = HashMap::new();
         let scheme = elements.and_then(|e| e.child(A, "fontScheme"));
         for (family, word) in [("majorFont", "major"), ("minorFont", "minor")] {

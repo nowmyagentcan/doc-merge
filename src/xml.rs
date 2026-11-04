@@ -597,6 +597,115 @@ pub fn tree(text: &str, part: &str, origin: &Origin) -> Result<Node, Error> {
     }
 }
 
+/// Elements as text, one after another.
+pub fn written(nodes: &[Node]) -> String {
+    let mut s = String::new();
+    for n in nodes {
+        n.write(&mut s);
+    }
+    s
+}
+
+/// The XML declaration a part starts with, if any, with its line break.
+pub fn declaration(text: &str) -> String {
+    match text.find("?>") {
+        Some(end) if text.starts_with("<?xml") => {
+            let rest = &text[end + 2..];
+            let eol = rest.len() - rest.trim_start_matches(['\r', '\n']).len();
+            text[..end + 2 + eol].to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// The prefix a root element binds to `ns`.
+pub fn prefix_of<'a>(root: &'a [Attr], ns: &str) -> Option<&'a str> {
+    root.iter()
+        .find(|a| a.is_declaration() && a.value == ns && !a.local.is_empty())
+        .map(|a| a.local.as_str())
+}
+
+/// The namespace declarations and `mc:Ignorable` prefixes a merged part's root element carries:
+/// the base's, plus those of appended content whose prefixes the base doesn't use.
+#[derive(Default)]
+pub struct Prefixes {
+    pub attrs: Vec<Attr>,
+}
+
+impl Prefixes {
+    pub fn of(root: &[Attr]) -> Self {
+        Self {
+            attrs: root.to_vec(),
+        }
+    }
+
+    /// Takes in the declarations of an appended part's root; returns those whose prefix the
+    /// output binds to another namespace, which each copied element then declares itself.
+    pub fn merge(&mut self, root: &[Attr]) -> Vec<Attr> {
+        let mut local = vec![];
+        for d in root.iter().filter(|a| a.is_declaration()) {
+            match self
+                .attrs
+                .iter()
+                .find(|a| a.is_declaration() && a.local == d.local)
+            {
+                Some(a) if a.value == d.value => {}
+                Some(_) => local.push(d.clone()),
+                None => self.attrs.push(d.clone()),
+            }
+        }
+        let ignorable = root.iter().find(|a| a.ns == MC && a.local == "Ignorable");
+        let wanted: Vec<&str> = ignorable
+            .iter()
+            .flat_map(|a| a.value.split_whitespace())
+            .filter(|p| !local.iter().any(|d| d.local == *p))
+            .collect();
+        if wanted.is_empty() {
+            return local;
+        }
+        match self
+            .attrs
+            .iter_mut()
+            .find(|a| a.ns == MC && a.local == "Ignorable")
+        {
+            Some(a) => {
+                for p in wanted {
+                    if !a.value.split_whitespace().any(|q| q == p) {
+                        a.value = format!("{} {p}", a.value).trim().to_string();
+                    }
+                }
+            }
+            None => {
+                let mc = prefix_of(&self.attrs, MC).unwrap_or("mc").to_string();
+                if prefix_of(&self.attrs, MC).is_none() {
+                    self.attrs
+                        .push(Attr::new(&format!("xmlns:{mc}"), XMLNS, MC));
+                    self.attrs.last_mut().unwrap().local = mc.clone();
+                }
+                self.attrs
+                    .push(Attr::new(&format!("{mc}:Ignorable"), MC, &wanted.join(" ")));
+            }
+        }
+        local
+    }
+}
+
+pub const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+/// The canonical form of a theme's colours and fonts, without their names.
+pub fn theme_form(theme: &Node) -> String {
+    let elements = theme.child(A, "themeElements");
+    let mut form = String::new();
+    for local in ["clrScheme", "fontScheme"] {
+        if let Some(n) = elements.and_then(|e| e.child(A, local)) {
+            let mut n = n.clone();
+            n.attrs.retain(|a| a.local != "name");
+            n.canonical(&mut form);
+        }
+    }
+    form
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

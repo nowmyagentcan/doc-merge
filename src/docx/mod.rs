@@ -13,9 +13,9 @@ use std::io::Write;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::error::{Error, Warning, Warnings};
-use crate::package::{MAX_PARSED, MAX_STREAMED, Package, RELS_TYPE, Rel, rels_name, resolve};
-use crate::writer::{Body, Plan, R, relative, rels_xml};
-use crate::xml::{self, Attr, MC, Node, Reader, XMLNS, start_tag};
+use crate::package::{MAX_PARSED, MAX_STREAMED, Package, Rel, resolve};
+use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
+use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, start_tag, written};
 use crate::{Origin, Rename, StyleMode};
 use notes::{KINDS, Notes};
 use numbering::Lists;
@@ -337,26 +337,6 @@ pub fn merge(
     })
 }
 
-/// Elements as text, one after another.
-fn written(nodes: &[Node]) -> String {
-    let mut s = String::new();
-    for n in nodes {
-        n.write(&mut s);
-    }
-    s
-}
-
-/// Writes the relationships of an output part, replacing the base's when it has them.
-fn rels_part(plan: &mut Plan, base: &Package, part: &str, rels: &Rels) {
-    let name = rels_name(part);
-    if base.has(&name) {
-        plan.replace(&name, Body::Data(rels_xml(&rels.list)));
-    } else {
-        plan.type_part(&name, RELS_TYPE, true);
-        plan.add(name, Body::Data(rels_xml(&rels.list)), None);
-    }
-}
-
 /// A document's theme, read with its `w:themeFontLang`.
 fn theme(pkg: &mut Package, main: &str, rels: &[Rel]) -> Result<Option<Theme>, Error> {
     let settings = held(pkg, main, rels, "settings")?;
@@ -487,42 +467,6 @@ fn io(e: std::io::Error) -> Error {
     Error::write_failed("the merged file", &e)
 }
 
-/// A part's relationships as the output will have them, with new ids after the highest.
-pub struct Rels {
-    pub list: Vec<Rel>,
-    next: u32,
-}
-
-impl Rels {
-    pub fn new(list: Vec<Rel>) -> Self {
-        let next = list
-            .iter()
-            .filter_map(|r| r.id.strip_prefix("rId")?.parse::<u32>().ok())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        Self { list, next }
-    }
-
-    /// Adds a relationship and returns its new id.
-    pub fn add(&mut self, kind: &str, target: String, external: bool) -> String {
-        let id = loop {
-            let id = format!("rId{}", self.next);
-            self.next += 1;
-            if !self.list.iter().any(|r| r.id == id) {
-                break id;
-            }
-        };
-        self.list.push(Rel {
-            id: id.clone(),
-            kind: kind.into(),
-            target,
-            external,
-        });
-        id
-    }
-}
-
 /// Copies what relationship `r` of `part` (in input `i`) points to into the output, and adds a
 /// relationship to it from the output's part `to`. Returns the new id and the copy's name.
 pub fn copy_rel(
@@ -589,90 +533,6 @@ fn diagram_drawing(
     tree.write(&mut out);
     plan.replace(copied, Body::Data(out.into_bytes()));
     Ok(())
-}
-
-/// The XML declaration a part starts with, if any, with its line break.
-pub fn declaration(text: &str) -> String {
-    match text.find("?>") {
-        Some(end) if text.starts_with("<?xml") => {
-            let rest = &text[end + 2..];
-            let eol = rest.len() - rest.trim_start_matches(['\r', '\n']).len();
-            text[..end + 2 + eol].to_string()
-        }
-        _ => String::new(),
-    }
-}
-
-/// The prefix a root element binds to `ns`.
-pub fn prefix_of<'a>(root: &'a [Attr], ns: &str) -> Option<&'a str> {
-    root.iter()
-        .find(|a| a.is_declaration() && a.value == ns && !a.local.is_empty())
-        .map(|a| a.local.as_str())
-}
-
-/// The namespace declarations and `mc:Ignorable` prefixes a merged part's root element carries:
-/// the base's, plus those of appended content whose prefixes the base doesn't use.
-#[derive(Default)]
-pub struct Prefixes {
-    pub attrs: Vec<Attr>,
-}
-
-impl Prefixes {
-    pub fn of(root: &[Attr]) -> Self {
-        Self {
-            attrs: root.to_vec(),
-        }
-    }
-
-    /// Takes in the declarations of an appended part's root; returns those whose prefix the
-    /// output binds to another namespace, which each copied element then declares itself.
-    pub fn merge(&mut self, root: &[Attr]) -> Vec<Attr> {
-        let mut local = vec![];
-        for d in root.iter().filter(|a| a.is_declaration()) {
-            match self
-                .attrs
-                .iter()
-                .find(|a| a.is_declaration() && a.local == d.local)
-            {
-                Some(a) if a.value == d.value => {}
-                Some(_) => local.push(d.clone()),
-                None => self.attrs.push(d.clone()),
-            }
-        }
-        let ignorable = root.iter().find(|a| a.ns == MC && a.local == "Ignorable");
-        let wanted: Vec<&str> = ignorable
-            .iter()
-            .flat_map(|a| a.value.split_whitespace())
-            .filter(|p| !local.iter().any(|d| d.local == *p))
-            .collect();
-        if wanted.is_empty() {
-            return local;
-        }
-        match self
-            .attrs
-            .iter_mut()
-            .find(|a| a.ns == MC && a.local == "Ignorable")
-        {
-            Some(a) => {
-                for p in wanted {
-                    if !a.value.split_whitespace().any(|q| q == p) {
-                        a.value = format!("{} {p}", a.value).trim().to_string();
-                    }
-                }
-            }
-            None => {
-                let mc = prefix_of(&self.attrs, MC).unwrap_or("mc").to_string();
-                if prefix_of(&self.attrs, MC).is_none() {
-                    self.attrs
-                        .push(Attr::new(&format!("xmlns:{mc}"), XMLNS, MC));
-                    self.attrs.last_mut().unwrap().local = mc.clone();
-                }
-                self.attrs
-                    .push(Attr::new(&format!("{mc}:Ignorable"), MC, &wanted.join(" ")));
-            }
-        }
-        local
-    }
 }
 
 /// What a body uses, found by a first pass over it.
@@ -1319,6 +1179,7 @@ fn start<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xml::{MC, XMLNS};
 
     #[test]
     fn prefixes_merge_into_the_root_or_stay_local() {
