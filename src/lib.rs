@@ -6,6 +6,7 @@ pub mod docx;
 pub mod error;
 pub mod package;
 pub mod writer;
+pub mod xlsx;
 pub mod xml;
 
 use std::cell::Cell;
