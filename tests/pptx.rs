@@ -669,3 +669,176 @@ fn an_odd_slide_size_reads_as_a_decimal_ratio() {
     let message = &report.warnings.list()[0].message;
     assert!(message.contains("(1.33:1)"), "{message}");
 }
+
+/// Each section of a merged deck: its name and how many slides it holds.
+fn sections(parts: &Parts) -> Vec<(String, usize)> {
+    let main = text(parts, "ppt/presentation.xml");
+    main.split("<p14:section ")
+        .skip(1)
+        .map(|s| {
+            let at = s.find("name=\"").unwrap() + 6;
+            let name = s[at..at + s[at..].find('"').unwrap()].to_string();
+            (name, s.matches("<p14:sldId ").count())
+        })
+        .collect()
+}
+
+#[test]
+fn every_deck_keeps_its_sections_or_gets_one_named_after_it() {
+    let (_, parts) = merged("sections", &["a.pptx", "b.pptx", "c.pptx"]);
+    let list = sections(&parts);
+    let wanted = [("Opening", 2), ("Details", 2), ("b", 3), ("c", 3)];
+    let wanted: Vec<(String, usize)> = wanted.map(|(n, c)| (n.to_string(), c)).to_vec();
+    assert_eq!(list, wanted);
+    let main = text(&parts, "ppt/presentation.xml");
+    let ids = values(&main, "p:sldId", "id");
+    assert_eq!(values(&main, "p14:sldId", "id"), ids, "in slide order");
+}
+
+#[test]
+fn a_base_without_sections_gets_one_when_a_later_deck_has_some() {
+    let (_, parts) = merged("sections-b", &["b.pptx", "a.pptx"]);
+    let names: Vec<String> = sections(&parts).into_iter().map(|s| s.0).collect();
+    assert_eq!(names, ["b", "Opening", "Details"]);
+    let main = text(&parts, "ppt/presentation.xml");
+    assert!(main.ends_with("</p:extLst></p:presentation>"));
+}
+
+#[test]
+fn no_sections_are_written_when_no_deck_has_any() {
+    let (_, parts) = two_decks("no-sections", &deck(1, WIDE), &deck(1, WIDE));
+    assert!(!text(&parts, "ppt/presentation.xml").contains("sectionLst"));
+}
+
+#[test]
+fn the_same_deck_twice_gets_new_section_and_creation_ids() {
+    let (_, parts) = merged("twice", &["a.pptx", "a.pptx"]);
+    let main = text(&parts, "ppt/presentation.xml");
+    let guids = values(&main, "p14:section", "id");
+    assert_eq!(guids.len(), 4);
+    assert_eq!(guids.iter().collect::<HashSet<_>>().len(), 4);
+    assert!(guids.iter().all(|g| g.len() == 38 && g.starts_with('{')));
+    let creation = |slide: &String| values(&text(&parts, slide), "p14:creationId", "val");
+    let all: Vec<_> = slides(&parts).iter().flat_map(creation).collect();
+    assert_eq!(all.len(), 8);
+    assert_eq!(all.iter().collect::<HashSet<_>>().len(), 8);
+}
+
+#[test]
+fn a_section_entry_for_a_missing_slide_is_left_out() {
+    let mut stale = deck(2, WIDE);
+    let p14 = "http://schemas.microsoft.com/office/powerpoint/2010/main";
+    let list = format!(
+        r#"<p:extLst><p:ext uri="{{521415D9-36F7-43E2-AB2F-B90AF26B5E84}}"><p14:sectionLst xmlns:p14="{p14}"><p14:section name="S" id="{{00000000-0000-0000-0000-000000000001}}"><p14:sldIdLst><p14:sldId id="256"/><p14:sldId id="999"/><p14:sldId id="257"/></p14:sldIdLst></p14:section></p14:sectionLst></p:ext></p:extLst></p:presentation>"#
+    );
+    replace(
+        &mut stale,
+        "ppt/presentation.xml",
+        "</p:presentation>",
+        &list,
+    );
+    let (_, parts) = two_decks("stale", &deck(1, WIDE), &stale);
+    assert_eq!(
+        sections(&parts),
+        [("a".to_string(), 1), ("S".to_string(), 2)]
+    );
+}
+
+#[test]
+fn custom_shows_are_renamed_on_a_clash_and_keep_their_slides() {
+    let (report, parts) = merged("shows", &["a.pptx", "b.pptx", "c.pptx"]);
+    assert_eq!(report.renames.len(), 1);
+    let rename = &report.renames[0];
+    assert_eq!(
+        (
+            rename.input,
+            rename.kind,
+            rename.from.as_str(),
+            rename.to.as_str()
+        ),
+        (3, "custom_show", "Short", "Short (3)")
+    );
+    let main = text(&parts, "ppt/presentation.xml");
+    assert_eq!(values(&main, "p:custShow", "name"), ["Short", "Short (3)"]);
+    assert_eq!(values(&main, "p:custShow", "id"), ["0", "1"]);
+    let list = &main[main.find(r#"name="Short (3)""#).unwrap()..];
+    let rid = &values(list, "p:sld", "r:id")[0];
+    let slide = target_of(&parts, "ppt/_rels/presentation.xml.rels", rid, "ppt");
+    assert_eq!(said(&parts, &slide), "Table of C");
+    // The button on c's table slide runs c's show, a's button still runs a's.
+    let order = slides(&parts);
+    assert!(text(&parts, &order[3]).contains(r#"action="ppaction://customshow?id=0""#));
+    assert!(text(&parts, &order[8]).contains(r#"action="ppaction://customshow?id=1""#));
+}
+
+#[test]
+fn a_show_name_taken_by_a_rename_moves_on() {
+    let show = |name: &str| {
+        format!(
+            r#"<p:custShowLst><p:custShow name="{name}" id="4"><p:sldLst><p:sld r:id="rId2"/></p:sldLst></p:custShow></p:custShowLst></p:presentation>"#
+        )
+    };
+    let with_show = |name: &str| {
+        let mut d = deck(1, WIDE);
+        replace(
+            &mut d,
+            "ppt/presentation.xml",
+            "</p:presentation>",
+            &show(name),
+        );
+        d
+    };
+    let dir = temp_dir("show-names");
+    let paths = [
+        file(&dir, "a.pptx", &with_show("One (2)")),
+        file(&dir, "b.pptx", &with_show("one")),
+        file(&dir, "c.pptx", &with_show("ONE (2)")),
+    ];
+    let (report, parts) = merged_files("show-names-out", &paths);
+    let main = text(&parts, "ppt/presentation.xml");
+    let names = values(&main, "p:custShow", "name");
+    assert_eq!(names, ["One (2)", "one", "ONE (2) (3)"]);
+    assert_eq!(values(&main, "p:custShow", "id"), ["4", "5", "6"]);
+    assert_eq!(report.renames.len(), 1);
+}
+
+#[test]
+fn slide_jump_links_land_on_the_copy_of_their_slide() {
+    let (_, parts) = merged("jump", &["b.pptx", "a.pptx"]);
+    let order = slides(&parts);
+    assert_eq!(said(&parts, &order[3]), "Deck A");
+    let xml = text(&parts, &order[3]);
+    let link = xml.find("hlinksldjump").expect("a's jump");
+    let rid = &values(&xml[..link + 15], "a:hlinkClick", "r:id")[0];
+    let dir = order[3].rsplit_once('/').unwrap().0;
+    let landed = target_of(&parts, &rels_of(&order[3]), rid, dir);
+    assert_eq!(landed, order[5]);
+    assert_eq!(said(&parts, &landed), "Detail of A");
+}
+
+#[test]
+fn a_link_on_a_layout_follows_its_show() {
+    let mut second = deck(1, WIDE);
+    let main = r#"<p:custShowLst><p:custShow name="S" id="7"><p:sldLst><p:sld r:id="rId2"/></p:sldLst></p:custShow></p:custShowLst></p:presentation>"#;
+    replace(
+        &mut second,
+        "ppt/presentation.xml",
+        "</p:presentation>",
+        main,
+    );
+    let link =
+        r#"<a:hlinkClick r:id="" action="ppaction://customshow?id=7&amp;return=true"/></a:rPr>"#;
+    let layout = "ppt/slideLayouts/slideLayout1.xml";
+    replace(
+        &mut second,
+        layout,
+        r#"<a:rPr sz="2000"/>"#,
+        &format!(r#"<a:rPr sz="2000">{link}"#),
+    );
+    let (_, parts) = two_decks("layout-link", &deck(1, WIDE), &second);
+    let copy = text(&parts, "ppt/slideLayouts/slideLayout2.xml");
+    assert!(
+        copy.contains("ppaction://customshow?id=0&amp;return=true"),
+        "{copy}"
+    );
+}

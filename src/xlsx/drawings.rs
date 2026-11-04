@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::rc::Rc;
 
@@ -14,7 +13,7 @@ use super::{Held, Maps, Patcher, adopt, element_prefix, io, new_part, parts_of, 
 use crate::Origin;
 use crate::error::Error;
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, resolve};
-use crate::writer::{Body, Plan, Rels};
+use crate::writer::{Body, Plan, Rels, guid};
 use crate::xml::{self, Child, Node, Prefixes, Reader, declaration, start_tag};
 
 const VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
@@ -110,24 +109,6 @@ fn thread_ids(text: &str, part: &str, origin: &Origin) -> Result<Vec<String>, Er
         let id = id.map(|a| a.value.trim_matches(['{', '}']).to_ascii_uppercase());
         ids.extend(id);
     }
-}
-
-/// A GUID without braces that depends only on `seed`, so two runs write the same file.
-fn guid(seed: impl Hash) -> String {
-    let half = |n: u8| {
-        let mut h = DefaultHasher::new();
-        (n, &seed).hash(&mut h);
-        h.finish()
-    };
-    let (a, b) = (half(0), half(1));
-    format!(
-        "{:08X}-{:04X}-4{:03X}-{:04X}-{:012X}",
-        a >> 32,
-        (a >> 16) & 0xFFFF,
-        a & 0xFFF,
-        (b >> 48) & 0x3FFF | 0x8000,
-        b & 0xFFFF_FFFF_FFFF
-    )
 }
 
 /// The text of `data="…"` in the attributes of an `o:idmap`, and where it stands.

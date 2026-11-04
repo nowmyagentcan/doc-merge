@@ -2,8 +2,10 @@
 //! written new, plus the content types; then the generic consistency checks and the write
 //! into a temp file beside the target, renamed into place.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -341,6 +343,24 @@ impl Plan {
             _ => self.types.add_override(name, content_type),
         }
     }
+}
+
+/// A GUID without braces that depends only on `seed`, so two runs write the same file.
+pub fn guid(seed: impl Hash) -> String {
+    let half = |n: u8| {
+        let mut h = DefaultHasher::new();
+        (n, &seed).hash(&mut h);
+        h.finish()
+    };
+    let (a, b) = (half(0), half(1));
+    format!(
+        "{:08X}-{:04X}-4{:03X}-{:04X}-{:012X}",
+        a >> 32,
+        (a >> 16) & 0xFFFF,
+        a & 0xFFF,
+        (b >> 48) & 0x3FFF | 0x8000,
+        b & 0xFFFF_FFFF_FFFF
+    )
 }
 
 /// A part's relationships as the output will have them, with new ids after the highest.
