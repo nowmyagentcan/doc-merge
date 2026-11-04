@@ -26,19 +26,17 @@ pub struct Slot {
     rid: String,
 }
 
-/// The `r:id` attribute of a new reference, with a declaration when the document has no
-/// prefix for the namespace.
-fn rid_attrs(rw: &Rewrite, rid: &str) -> Vec<Attr> {
-    match &rw.r {
-        Some(r) => vec![Attr::new(&format!("{r}:id"), R, rid)],
-        None => vec![Attr::new("xmlns:r", XMLNS, R), Attr::new("r:id", R, rid)],
-    }
-}
-
+/// A new reference, declaring its prefix when the document has none for relationships.
 fn slot_tag(rw: &Rewrite, slot: &Slot) -> String {
     let w = &rw.w;
     let mut attrs = vec![Attr::new(&format!("{w}:type"), W, slot.kind)];
-    attrs.extend(rid_attrs(rw, &slot.rid));
+    match &rw.r {
+        Some(r) => attrs.push(Attr::new(&format!("{r}:id"), R, &slot.rid)),
+        None => attrs.extend([
+            Attr::new("xmlns:r", XMLNS, R),
+            Attr::new("r:id", R, &slot.rid),
+        ]),
+    }
     start_tag(&format!("{w}:{}", slot.reference), &attrs, true)
 }
 

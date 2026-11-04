@@ -14,46 +14,15 @@ use crate::writer::{Body, Plan, Rels, rels_part};
 use crate::xml::{Child, Node, Prefixes, declaration, prefix_of};
 
 /// What comes before `w:evenAndOddHeaders` in `w:settings`.
-const BEFORE_EVEN: [&str; 38] = [
-    "writeProtection",
-    "view",
-    "zoom",
-    "removePersonalInformation",
-    "removeDateAndTime",
-    "doNotDisplayPageBoundaries",
-    "displayBackgroundShape",
-    "printPostScriptOverText",
-    "printFractionalCharacterWidth",
-    "printFormsData",
-    "embedTrueTypeFonts",
-    "embedSystemFonts",
-    "saveSubsetFonts",
-    "saveFormsData",
-    "mirrorMargins",
-    "alignBordersAndEdges",
-    "bordersDoNotSurroundHeader",
-    "bordersDoNotSurroundFooter",
-    "gutterAtTop",
-    "hideSpellingErrors",
-    "hideGrammaticalErrors",
-    "activeWritingStyle",
-    "proofState",
-    "formsDesign",
-    "attachedTemplate",
-    "linkStyles",
-    "stylePaneFormatFilter",
-    "stylePaneSortMethod",
-    "documentType",
-    "mailMerge",
-    "revisionView",
-    "trackRevisions",
-    "doNotTrackMoves",
-    "doNotTrackFormatting",
-    "documentProtection",
-    "autoFormatOverride",
-    "styleLockTheme",
-    "styleLockQFSet",
-];
+const BEFORE_EVEN: &str = "\n     writeProtection view zoom removePersonalInformation removeDateAndTime \
+     doNotDisplayPageBoundaries displayBackgroundShape printPostScriptOverText \
+     printFractionalCharacterWidth printFormsData embedTrueTypeFonts embedSystemFonts \
+     saveSubsetFonts saveFormsData mirrorMargins alignBordersAndEdges \
+     bordersDoNotSurroundHeader bordersDoNotSurroundFooter gutterAtTop hideSpellingErrors \
+     hideGrammaticalErrors activeWritingStyle proofState formsDesign attachedTemplate \
+     linkStyles stylePaneFormatFilter stylePaneSortMethod documentType mailMerge revisionView \
+     trackRevisions doNotTrackMoves doNotTrackFormatting documentProtection autoFormatOverride \
+     styleLockTheme styleLockQFSet";
 
 /// The layout mode of a document that doesn't name one (Word 2007's).
 const OLDEST_MODE: &str = "12";
@@ -275,7 +244,7 @@ impl Merger<'_> {
                 self.warnings.push(warning);
             } else {
                 let (plan, inputs) = (&mut self.plan, &mut *self.inputs);
-                super::copy_rel(plan, inputs, i, &part, r, &self.main, &mut self.rels)?;
+                copy_rel(plan, inputs, i, &part, r, &self.main, &mut self.rels)?;
                 self.has_glossary = true;
             }
         }
@@ -320,8 +289,9 @@ impl Merger<'_> {
             let (plan, rels) = (&mut self.plan, &mut self.rels);
             return registry(plan, rels, &parts, None, &self.root, &inserts, origin);
         };
+        let before: Vec<&str> = BEFORE_EVEN.split_whitespace().collect();
         h.tree
-            .child_or_insert(W, "evenAndOddHeaders", &BEFORE_EVEN)
+            .child_or_insert(W, "evenAndOddHeaders", &before)
             .attrs
             .clear();
         let mut out = declaration(&h.text);

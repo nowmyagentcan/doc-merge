@@ -349,84 +349,14 @@ fn tokens(s: &str) -> Vec<Range<usize>> {
 }
 
 /// Field names that a bare `{ name }` field of a bookmark can't be.
-const FIELDS: [&str; 76] = [
-    "ADDRESSBLOCK",
-    "ADVANCE",
-    "AUTHOR",
-    "AUTONUM",
-    "AUTONUMLGL",
-    "AUTONUMOUT",
-    "AUTOTEXT",
-    "AUTOTEXTLIST",
-    "BARCODE",
-    "BIBLIOGRAPHY",
-    "BIDIOUTLINE",
-    "CITATION",
-    "COMMENTS",
-    "COMPARE",
-    "CREATEDATE",
-    "DATABASE",
-    "DATE",
-    "DISPLAYBARCODE",
-    "DOCPROPERTY",
-    "DOCVARIABLE",
-    "EDITTIME",
-    "EMBED",
-    "EQ",
-    "FILENAME",
-    "FILESIZE",
-    "FILLIN",
-    "FORMCHECKBOX",
-    "FORMDROPDOWN",
-    "FORMTEXT",
-    "GREETINGLINE",
-    "IF",
-    "INCLUDEPICTURE",
-    "INCLUDETEXT",
-    "INDEX",
-    "INFO",
-    "KEYWORDS",
-    "LASTSAVEDBY",
-    "LINK",
-    "LISTNUM",
-    "MACROBUTTON",
-    "MERGEBARCODE",
-    "MERGEFIELD",
-    "MERGEREC",
-    "MERGESEQ",
-    "NEXT",
-    "NEXTIF",
-    "NUMCHARS",
-    "NUMPAGES",
-    "NUMWORDS",
-    "PAGE",
-    "PRINT",
-    "PRINTDATE",
-    "PRIVATE",
-    "QUOTE",
-    "RD",
-    "REVNUM",
-    "SAVEDATE",
-    "SECTION",
-    "SECTIONPAGES",
-    "SEQ",
-    "SHAPE",
-    "SKIPIF",
-    "STYLEREF",
-    "SUBJECT",
-    "SYMBOL",
-    "TA",
-    "TC",
-    "TEMPLATE",
-    "TIME",
-    "TITLE",
-    "TOA",
-    "TOC",
-    "USERADDRESS",
-    "USERINITIALS",
-    "USERNAME",
-    "XE",
-];
+const FIELDS: &str = "\n     ADDRESSBLOCK ADVANCE AUTHOR AUTONUM AUTONUMLGL AUTONUMOUT AUTOTEXT AUTOTEXTLIST BARCODE \
+     BIBLIOGRAPHY BIDIOUTLINE CITATION COMMENTS COMPARE CREATEDATE DATABASE DATE DISPLAYBARCODE \
+     DOCPROPERTY DOCVARIABLE EDITTIME EMBED EQ FILENAME FILESIZE FILLIN FORMCHECKBOX \
+     FORMDROPDOWN FORMTEXT GREETINGLINE IF INCLUDEPICTURE INCLUDETEXT INDEX INFO KEYWORDS \
+     LASTSAVEDBY LINK LISTNUM MACROBUTTON MERGEBARCODE MERGEFIELD MERGEREC MERGESEQ NEXT NEXTIF \
+     NUMCHARS NUMPAGES NUMWORDS PAGE PRINT PRINTDATE PRIVATE QUOTE RD REVNUM SAVEDATE SECTION \
+     SECTIONPAGES SEQ SHAPE SKIPIF STYLEREF SUBJECT SYMBOL TA TC TEMPLATE TIME TITLE TOA TOC \
+     USERADDRESS USERINITIALS USERNAME XE";
 
 /// A field instruction with its bookmark argument renamed through `names`, when it has one.
 pub fn rename_in_field(instr: &str, names: &HashMap<String, String>) -> Option<String> {
@@ -438,7 +368,7 @@ pub fn rename_in_field(instr: &str, names: &HashMap<String, String>) -> Option<S
             let switch = |w: &&[Range<usize>]| instr[w[0].clone()].eq_ignore_ascii_case("\\l");
             &t.windows(2).find(switch)?[1]
         }
-        n if FIELDS.contains(&n) => return None,
+        n if FIELDS.split_whitespace().any(|f| f == n) => return None,
         _ => &t[0],
     };
     let new = names.get(&instr[at.clone()].to_lowercase())?;

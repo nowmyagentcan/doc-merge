@@ -709,17 +709,13 @@ fn links_and_split_fields_follow_a_renamed_bookmark() {
     let body = format!(
         r#"<w:p>{mark}<w:hyperlink w:anchor="note"><w:r><w:t>x</w:t></w:r></w:hyperlink><w:fldSimple w:instr=" PAGEREF Note "/><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> RE</w:instrText></w:r><w:r><w:instrText>F No</w:instrText></w:r><w:r><w:instrText xml:space="preserve">te \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#
     );
-    let a = word_file(&dir, "a.docx", mark_paragraph(mark).as_str(), &[]);
+    let a = word_file(&dir, "a.docx", &format!("<w:p>{mark}</w:p>"), &[]);
     let b = word_file(&dir, "b.docx", &body, &[]);
     let (_, parts) = merge_files(&dir, &[a, b]);
     let doc = text(&parts, "word/document.xml");
     assert!(doc.contains(r#"w:anchor="Note_2""#));
     assert!(doc.contains(r#"w:instr=" PAGEREF Note_2 ""#));
     assert!(doc.contains(r#"<w:instrText xml:space="preserve"> REF Note_2 \h </w:instrText>"#));
-}
-
-fn mark_paragraph(mark: &str) -> String {
-    format!("<w:p>{mark}</w:p>")
 }
 
 #[test]
