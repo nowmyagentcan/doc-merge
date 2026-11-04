@@ -137,12 +137,7 @@ impl Book {
 
     /// A part this workbook relates to, read whole.
     fn held(&self, pkg: &mut Package, kind: &str) -> Result<Option<Held>, Error> {
-        self.held_type(pkg, &format!("{REL}{kind}"))
-    }
-
-    /// The part this workbook relates to by a full relationship type, read whole.
-    fn held_type(&self, pkg: &mut Package, kind: &str) -> Result<Option<Held>, Error> {
-        let Some(part) = self.related_type(pkg, kind)? else {
+        let Some(part) = self.related(pkg, kind)? else {
             return Ok(None);
         };
         let text = pkg.text(&part, MAX_PARSED)?;
@@ -152,13 +147,10 @@ impl Book {
 
     /// The part this workbook relates to by a relationship type.
     fn related(&self, pkg: &Package, kind: &str) -> Result<Option<String>, Error> {
-        self.related_type(pkg, &format!("{REL}{kind}"))
-    }
-
-    fn related_type(&self, pkg: &Package, kind: &str) -> Result<Option<String>, Error> {
+        let wanted = format!("{REL}{kind}");
         self.rels
             .iter()
-            .find(|r| r.kind == kind && !r.external)
+            .find(|r| r.kind == wanted && !r.external)
             .map(|r| target(pkg, &self.part, r))
             .transpose()
     }
@@ -733,7 +725,7 @@ impl Output {
             }
         }
         let taken = drawings::Taken::of(pkg)?;
-        let persons = drawings::Persons::of(&book, pkg)?;
+        let persons = drawings::Persons::of(pkg)?;
         let mut next_table_id = 1;
         let (mut table_ids, mut table_names) = (vec![], vec![]);
         for t in tables(pkg)? {
@@ -980,7 +972,7 @@ impl Output {
         let held = book.held(&mut inputs[i], "sheetMetadata")?;
         let own_metadata = list_len(held.as_ref().map(|h| &h.tree), "cellMetadata");
         let cell_metadata = held.map_or(0, |held| self.metadata.add(held));
-        self.persons.add(&book, &mut inputs[i])?;
+        self.persons.add(&mut inputs[i])?;
         let mut copied = vec![];
         let mut moved = vec![];
         for s in &book.sheets {

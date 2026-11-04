@@ -96,7 +96,7 @@ fn variant(pkg: &mut Package, book: &Book) -> Result<Option<&'static str>, Error
     Ok(None)
 }
 
-pub fn date_1904(book: &Book) -> bool {
+fn date_1904(book: &Book) -> bool {
     let properties = book.tree.child(S, "workbookPr");
     let value = properties.and_then(|p| p.attr("", "date1904"));
     matches!(value, Some("1" | "true"))

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 
-use super::{Book, Maps, Patcher, adopt, element_prefix, io, new_part, parts_of, unreadable};
+use super::{Held, Maps, Patcher, adopt, element_prefix, io, new_part, parts_of, unreadable};
 use crate::Origin;
 use crate::error::Error;
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, resolve};
@@ -65,10 +65,6 @@ impl Moved {
             Some(block) => block * BLOCK + id % BLOCK,
             None => id,
         }
-    }
-
-    fn shapes_moved(&self) -> bool {
-        self.blocks.iter().any(|(old, new)| old != new)
     }
 }
 
@@ -246,22 +242,29 @@ fn person_id(person: &Node) -> String {
         .to_ascii_uppercase()
 }
 
+/// The part with a workbook's people, read whole.
+fn people(pkg: &mut Package) -> Result<Option<Held>, Error> {
+    let Some(part) = parts_of(pkg, PEOPLE).into_iter().next() else {
+        return Ok(None);
+    };
+    let text = pkg.text(&part, MAX_PARSED)?;
+    let tree = xml::tree(&text, &part, &pkg.origin)?;
+    Ok(Some(Held { part, text, tree }))
+}
+
 impl Persons {
-    pub fn of(book: &Book, pkg: &mut Package) -> Result<Self, Error> {
-        let Some(held) = book.held_type(pkg, PERSON_REL)? else {
-            return Ok(Self::default());
-        };
-        Ok(Self {
+    pub fn of(pkg: &mut Package) -> Result<Self, Error> {
+        Ok(people(pkg)?.map_or(Self::default(), |held| Self {
             known: held.tree.nodes().map(person_id).collect(),
             part: Some((held.part, held.text)),
             tree: Some(held.tree),
             changed: false,
-        })
+        }))
     }
 
     /// Takes in an appended workbook's people.
-    pub fn add(&mut self, book: &Book, pkg: &mut Package) -> Result<(), Error> {
-        let Some(held) = book.held_type(pkg, PERSON_REL)? else {
+    pub fn add(&mut self, pkg: &mut Package) -> Result<(), Error> {
+        let Some(held) = people(pkg)? else {
             return Ok(());
         };
         let Some(out) = &mut self.tree else {
@@ -306,7 +309,7 @@ impl Persons {
 pub fn rewrite(plan: &mut Plan, inputs: &[Package], i: usize, index: usize, maps: &Rc<Maps>) {
     let moved = &maps.moved[index];
     let formulas = !maps.renames.are_empty();
-    let shapes = moved.shapes_moved();
+    let shapes = moved.blocks.iter().any(|(old, new)| old != new);
     for part in &moved.parts {
         let kind = inputs[i].types.of(part).unwrap_or_default();
         let wanted = match kind {
@@ -372,28 +375,6 @@ fn edit_after(
     Ok(out)
 }
 
-/// The attributes of the elements that hold shape ids or formulas.
-enum Attribute {
-    ShapeId,
-    /// `_x0000_s` and a shape id.
-    ShapeName,
-    Formula,
-    /// A link to an object in another file, not always a formula.
-    ObjectLink,
-}
-
-fn attribute(element: &str, name: &str) -> Option<Attribute> {
-    match (element, name) {
-        ("cNvPr", "id") | ("control" | "oleObject", "shapeId") => Some(Attribute::ShapeId),
-        ("compatExt", "spid") => Some(Attribute::ShapeName),
-        ("sp", "textlink")
-        | ("formControlPr", "fmlaLink" | "fmlaRange" | "fmlaGroup" | "fmlaTxbx")
-        | ("controlPr", "linkedCell" | "listFillRange") => Some(Attribute::Formula),
-        ("oleObject", "link") => Some(Attribute::ObjectLink),
-        _ => None,
-    }
-}
-
 /// One copied part of an appended sheet on its way out.
 pub struct Job<'a> {
     pub maps: &'a Maps,
@@ -425,21 +406,25 @@ impl Job<'_> {
         let mut attrs = r.attrs(e)?;
         let mut changed = false;
         for a in attrs.iter_mut().filter(|a| a.ns.is_empty()) {
-            let new = match attribute(element, &a.local) {
-                Some(Attribute::ShapeId) => a
-                    .value
-                    .parse()
-                    .ok()
-                    .map(|id| self.moved().shape(id).to_string()),
-                Some(Attribute::ShapeName) => a
-                    .value
-                    .strip_prefix(SHAPE_PREFIX)
-                    .and_then(|id| id.parse().ok())
-                    .map(|id| format!("{SHAPE_PREFIX}{}", self.moved().shape(id))),
-                Some(Attribute::Formula) if !a.value.is_empty() => {
+            let new = match (element, a.local.as_str()) {
+                ("cNvPr", "id") | ("control" | "oleObject", "shapeId") => {
+                    let id = a.value.parse().ok();
+                    id.map(|id| self.moved().shape(id).to_string())
+                }
+                ("compatExt", "spid") => {
+                    let id = a.value.strip_prefix(SHAPE_PREFIX);
+                    let id = id.and_then(|id| id.parse().ok());
+                    id.map(|id| format!("{SHAPE_PREFIX}{}", self.moved().shape(id)))
+                }
+                ("sp", "textlink")
+                | ("formControlPr", "fmlaLink" | "fmlaRange" | "fmlaGroup" | "fmlaTxbx")
+                | ("controlPr", "linkedCell" | "listFillRange")
+                    if !a.value.is_empty() =>
+                {
                     Some(self.formula(&a.value)?.into_owned())
                 }
-                Some(Attribute::ObjectLink) => {
+                // A link to an object in another file isn't always a formula.
+                ("oleObject", "link") => {
                     let local = &self.maps.locals[self.index];
                     let new = self.maps.renames.rewrite(&a.value, local);
                     new.map(Cow::into_owned)
