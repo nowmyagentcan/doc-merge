@@ -1044,6 +1044,11 @@ impl Output {
             persons,
             ..
         } = self;
+        // Excel rebuilds the calculation chain on load; the base's lists no appended cell.
+        for part in parts_of(base, &format!("{SML}calcChain+xml")) {
+            plan.remove(&part);
+        }
+        rels.list.retain(|r| r.kind != format!("{REL}calcChain"));
         strings.finish(plan, &mut rels, &book.part, &base.origin)?;
         metadata.finish(plan, &mut rels, &book.part);
         persons.finish(plan, &mut rels, &book.part);

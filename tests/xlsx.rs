@@ -1039,7 +1039,7 @@ fn untouched_parts_are_copied_byte_for_byte() {
         );
     }
     for (name, bytes) in &a {
-        if !rewritten(name) {
+        if !rewritten(name) && name != "xl/calcChain.xml" {
             assert_eq!(&text_or_bytes(&parts, name), bytes, "{name}");
         }
     }
@@ -1268,6 +1268,16 @@ fn a_chart_formula_that_can_t_be_read_is_refused() {
     assert_eq!(e.code, "unsupported_variant");
     assert!(e.message.contains("xl/charts/chart1.xml"), "{}", e.message);
     assert!(!out.exists());
+}
+
+#[test]
+fn the_calculation_chain_is_left_out() {
+    let (_, parts) = merged("calc-chain", &["a.xlsx", "b.xlsx"]);
+    assert!(parts.iter().all(|p| !p.0.contains("calcChain")));
+    for part in ["[Content_Types].xml", "xl/_rels/workbook.xml.rels"] {
+        let out = text(&parts, part);
+        assert!(!out.contains("calcChain"), "{out}");
+    }
 }
 
 const TC_NS: &str =

@@ -197,6 +197,13 @@ impl Plan {
         }
     }
 
+    /// Leaves a base part out of the output.
+    pub fn remove(&mut self, name: &str) {
+        self.parts.retain(|p| !p.name.eq_ignore_ascii_case(name));
+        self.types
+            .retain_overrides(|p| !p.eq_ignore_ascii_case(name));
+    }
+
     /// Copies part `part` of `inputs[input]` and every part it reaches through its
     /// relationships, each once (a part met again, also through a cycle, is linked), keeping
     /// every relationship id and pointing the targets at the copies. A relationship `mapped`
