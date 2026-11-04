@@ -123,6 +123,15 @@ pub struct Input {
     /// 1-based, `[first, last]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_sections: Option<[usize; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheets: Option<Vec<SheetName>>,
+}
+
+/// A sheet of an input and what it is called in the output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SheetName {
+    pub name: String,
+    pub output_name: String,
 }
 
 /// A name the merge changed.
@@ -175,29 +184,37 @@ pub fn merge(
     let mut inputs = open_inputs(paths, &run)?;
     let mut warnings = Warnings::default();
     let family = inputs[0].kind.family();
-    let (plan, counts, mut renames) = match family {
-        Family::Word => {
-            let m = docx::merge(&mut inputs, options.styles, &mut warnings)?;
-            (m.plan, m.sections, m.renames)
-        }
-        _ => return Err(Error::internal("only Word documents can be merged so far")),
-    };
-    let bytes = writer::write(plan, &mut inputs, output)?;
-    let mut next = 1;
-    let inputs = inputs
+    let mut listed: Vec<Input> = inputs
         .iter()
-        .zip(counts)
-        .map(|(p, n)| {
-            let first = next;
-            next += n;
-            Input {
-                path: std::path::absolute(&p.path).unwrap_or_else(|_| p.path.clone()),
-                kind: p.kind,
-                sections: Some(n),
-                output_sections: Some([first, next - 1]),
-            }
+        .map(|p| Input {
+            path: std::path::absolute(&p.path).unwrap_or_else(|_| p.path.clone()),
+            kind: p.kind,
+            sections: None,
+            output_sections: None,
+            sheets: None,
         })
         .collect();
+    let (plan, mut renames) = match family {
+        Family::Word => {
+            let m = docx::merge(&mut inputs, options.styles, &mut warnings)?;
+            let mut next = 1;
+            for (input, n) in listed.iter_mut().zip(m.sections) {
+                input.sections = Some(n);
+                input.output_sections = Some([next, next + n - 1]);
+                next += n;
+            }
+            (m.plan, m.renames)
+        }
+        Family::Excel => {
+            let m = xlsx::merge(&mut inputs, &mut warnings)?;
+            for (input, sheets) in listed.iter_mut().zip(m.sheets) {
+                input.sheets = Some(sheets);
+            }
+            (m.plan, m.renames)
+        }
+        _ => return Err(Error::internal("PowerPoint decks can't be merged so far")),
+    };
+    let bytes = writer::write(plan, &mut inputs, output)?;
     let renames_omitted = renames.len().saturating_sub(MAX_RENAMES);
     renames.truncate(MAX_RENAMES);
     Ok(Report {
@@ -206,7 +223,7 @@ pub fn merge(
             kind: family.output(),
             bytes,
         },
-        inputs,
+        inputs: listed,
         renames,
         renames_omitted,
         warnings,

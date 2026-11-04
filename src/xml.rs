@@ -4,6 +4,7 @@
 //! `quick_xml::Writer` gives the same bytes.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::name::{QName, ResolveResult};
@@ -103,7 +104,7 @@ impl<'a> Reader<'a> {
         self.origin.bad(&format!("part {} {why}", self.part))
     }
 
-    fn malformed(&self, detail: &str) -> Error {
+    pub fn malformed(&self, detail: &str) -> Error {
         let at = self
             .inner
             .error_position()
@@ -152,6 +153,27 @@ impl<'a> Reader<'a> {
             _ => {}
         }
         Ok(event)
+    }
+
+    /// How far into the text the reader is: the end of the last event.
+    pub fn position(&self) -> usize {
+        self.inner.buffer_position() as usize
+    }
+
+    /// The text of the element just opened, read up to its end, and where it stands.
+    pub fn element_text(&mut self) -> Result<(String, Range<usize>), Error> {
+        let (start, depth) = (self.position(), self.depth);
+        let mut text = String::new();
+        loop {
+            let at = self.position();
+            match self.event()? {
+                Event::End(_) if self.depth < depth => return Ok((text, start..at)),
+                Event::Text(t) => text.push_str(&t.xml10_content()),
+                Event::CData(t) => text.push_str(&t),
+                Event::GeneralRef(g) => text.push(entity(&g)),
+                _ => {}
+            }
+        }
     }
 
     /// The elements open around the next event: 0 before and after the root.
