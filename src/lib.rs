@@ -5,6 +5,7 @@
 pub mod docx;
 pub mod error;
 pub mod package;
+pub mod pptx;
 pub mod writer;
 pub mod xlsx;
 pub mod xml;
@@ -124,6 +125,11 @@ pub struct Input {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_sections: Option<[usize; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub slides: Option<usize>,
+    /// 1-based, `[first, last]`; `[0, 0]` for a deck without slides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_slides: Option<[usize; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sheets: Option<Vec<SheetName>>,
 }
 
@@ -191,6 +197,8 @@ pub fn merge(
             kind: p.kind,
             sections: None,
             output_sections: None,
+            slides: None,
+            output_slides: None,
             sheets: None,
         })
         .collect();
@@ -212,7 +220,16 @@ pub fn merge(
             }
             (m.plan, m.renames)
         }
-        _ => return Err(Error::internal("PowerPoint decks can't be merged so far")),
+        Family::PowerPoint => {
+            let m = pptx::merge(&mut inputs, &mut warnings)?;
+            let mut next = 1;
+            for (input, n) in listed.iter_mut().zip(m.slides) {
+                input.slides = Some(n);
+                input.output_slides = Some(if n == 0 { [0, 0] } else { [next, next + n - 1] });
+                next += n;
+            }
+            (m.plan, m.renames)
+        }
     };
     let bytes = writer::write(plan, &mut inputs, output)?;
     let renames_omitted = renames.len().saturating_sub(MAX_RENAMES);

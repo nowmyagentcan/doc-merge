@@ -478,6 +478,22 @@ fn is_xml(content_type: &str) -> bool {
     content_type.ends_with("+xml") || content_type.ends_with("/xml")
 }
 
+/// The text of a planned part that is held or copied whole; none for a streamed one.
+pub fn planned_text(part: &Part, inputs: &mut [Package]) -> Result<Option<String>, Error> {
+    match &part.body {
+        Body::Raw { input, entry } => {
+            let pkg = &mut inputs[*input];
+            let name = pkg.entries[*entry].name.clone();
+            pkg.text(&name, MAX_PARSED).map(Some)
+        }
+        Body::Data(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => Ok(Some(text.into())),
+            Err(_) => Err(Error::internal(&format!("part {} isn't UTF-8", part.name))),
+        },
+        Body::Stream(_) => Ok(None),
+    }
+}
+
 /// The generic rules every merged package meets (each kind adds its own): every internal
 /// relationship target exists, every relationship-id attribute of a written XML part
 /// resolves in that part's relationships, every part is typed, no override names a missing
@@ -506,19 +522,10 @@ pub fn check(plan: &Plan, inputs: &mut [Package]) -> Result<(), Error> {
         let Some(source) = source_of(&p.name) else {
             continue;
         };
-        let rels = match &p.body {
-            Body::Raw { input, entry } => {
-                let pkg = &mut inputs[*input];
-                let name = pkg.entries[*entry].name.clone();
-                parse_rels(&pkg.text(&name, MAX_PARSED)?, &name, &pkg.origin.clone())?
-            }
-            Body::Data(bytes) => {
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|_| Error::internal(&format!("part {} isn't UTF-8", p.name)))?;
-                parse_rels(text, &p.name, &inputs[0].origin)?
-            }
-            Body::Stream(_) => continue,
+        let Some(text) = planned_text(p, inputs)? else {
+            continue;
         };
+        let rels = parse_rels(&text, &p.name, &inputs[0].origin)?;
         for r in rels.iter().filter(|r| !r.external) {
             let target = resolve(&source, &r.target);
             if !target.is_some_and(|t| names.contains(&t.to_ascii_lowercase())) {
