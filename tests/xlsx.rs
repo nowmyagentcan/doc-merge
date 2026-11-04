@@ -1280,6 +1280,54 @@ fn the_calculation_chain_is_left_out() {
     }
 }
 
+#[test]
+fn custom_views_of_appended_workbooks_are_left_out() {
+    let dir = temp_dir("views");
+    let guid = "{12345678-1234-4234-8234-123456789012}";
+    let views = format!(
+        r#"<customWorkbookViews><customWorkbookView name="v" guid="{guid}" windowWidth="9" windowHeight="9" activeSheetId="1"/></customWorkbookViews>"#
+    );
+    let names = format!(
+        r#"<definedNames><definedName name="Z_12345678_1234_4234_8234_123456789012_.wvu.PrintArea" hidden="1" localSheetId="0">Sheet1!$A$1</definedName><definedName name="Kept">Sheet1!$A$1</definedName></definedNames>{views}"#
+    );
+    let mut parts = book(&[("Sheet1", "")], None);
+    let workbook =
+        text(&parts, "xl/workbook.xml").replace("</sheets>", &format!("</sheets>{names}"));
+    set(&mut parts, "xl/workbook.xml", workbook.as_bytes());
+    let sheet = text(&parts, "xl/worksheets/sheet1.xml").replace(
+        "</sheetData>",
+        &format!(
+            r#"</sheetData><customSheetViews><customSheetView guid="{guid}"><pane state="frozen"/><selection/></customSheetView></customSheetViews><pageMargins left="1" right="1" top="1" bottom="1" header="1" footer="1"/>"#
+        ),
+    );
+    set(&mut parts, "xl/worksheets/sheet1.xml", sheet.as_bytes());
+    let views = book_file(&dir, "views.xlsx", &parts);
+    let plain = book_file(&dir, "plain.xlsx", &book(&[("Plain", "")], None));
+    let (report, parts) = merged_files("views-out", &[plain.clone(), views.clone()]);
+    let codes: Vec<(&str, Option<usize>)> = report
+        .warnings
+        .list()
+        .iter()
+        .map(|w| (w.code, w.input))
+        .collect();
+    assert_eq!(codes, [("custom_views_dropped", Some(2))]);
+    let sheet = text(&parts, "xl/worksheets/sheet2.xml");
+    assert!(!sheet.contains("customSheetView"), "{sheet}");
+    assert!(sheet.contains("</sheetData><pageMargins"), "{sheet}");
+    let workbook = text(&parts, "xl/workbook.xml");
+    assert!(
+        !workbook.contains("wvu") && workbook.contains(r#"name="Kept""#),
+        "{workbook}"
+    );
+    assert!(!workbook.contains("customWorkbookView"), "{workbook}");
+
+    let (report, parts) = merged_files("views-base", &[views, plain]);
+    assert!(report.warnings.list().is_empty());
+    let workbook = text(&parts, "xl/workbook.xml");
+    assert!(workbook.contains("customWorkbookView"), "{workbook}");
+    assert!(text(&parts, "xl/worksheets/sheet1.xml").contains("customSheetView"));
+}
+
 const TC_NS: &str =
     r#"xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments""#;
 

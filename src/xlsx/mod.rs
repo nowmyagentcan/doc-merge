@@ -634,6 +634,11 @@ fn defined_names(book: &Book, origin: &Origin) -> Result<Vec<Defined>, Error> {
     Ok(list)
 }
 
+/// A hidden name that holds a custom view's print area, filter or titles.
+fn is_view_name(name: &str) -> bool {
+    name.starts_with("Z_") && name.contains("_.wvu.")
+}
+
 fn unreadable(origin: &Origin, place: &str) -> Error {
     let variant = format!("a formula it can't read ({place})");
     Error::unsupported_variant(&origin.name, &variant).at(origin.input)
@@ -866,7 +871,11 @@ impl Output {
                 output_name,
             });
         }
-        let names = defined_names(&book, &origin)?;
+        if book.tree.child(S, "customWorkbookViews").is_some() {
+            warnings.push(Warning::custom_views_dropped(i + 1, &origin.name));
+        }
+        let mut names = defined_names(&book, &origin)?;
+        names.retain(|d| !is_view_name(&d.name));
         for d in &names {
             if let Some(s) = d.sheet {
                 found.locals[s].insert(d.key.clone());
@@ -1348,6 +1357,12 @@ impl SheetJob<'_> {
                     if let Some(tag) = job.tag(&r, e, empty, element)? {
                         p.replace(start..end, &tag)?;
                     }
+                }
+                "customSheetViews" if r.element_ns(e) == S => {
+                    if !empty {
+                        r.element_text()?;
+                    }
+                    p.replace(start..r.position(), "")?;
                 }
                 "sheetView" if r.element_ns(e) == S => {
                     let mut attrs = r.attrs(e)?;
