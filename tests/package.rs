@@ -440,5 +440,8 @@ fn fixtures_carry_no_personal_data() {
             assert!(!t.contains(bad), "{name} holds {bad}");
         }
         assert!(!email(&t), "{name} holds an email address");
+        for at in t.match_indices("providerId=\"").map(|(i, m)| i + m.len()) {
+            assert!(t[at..].starts_with("None\""), "{name} names an account");
+        }
     }
 }

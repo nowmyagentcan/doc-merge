@@ -4,7 +4,7 @@
 # the file is opened and saved again by its app. Names are scrubbed last: document authors
 # become doc-merge, comment authors Author A / Author B. Only the Office processes this script
 # started are stopped.
-param([Parameter(Mandatory)][ValidateSet('word', 'excel')][string]$Family)
+param([Parameter(Mandatory)][ValidateSet('word', 'excel', 'powerpoint')][string]$Family)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing, System.IO.Compression, System.IO.Compression.FileSystem
 $out = $PSScriptRoot
@@ -89,6 +89,10 @@ function Scrub([string]$name, [string]$text, [string]$author) {
     'xl/persons/person\.xml$' {
       return $text -replace 'displayName="[^"]*"', "displayName=""$author""" -replace 'userId="[^"]*"', "userId=""$author""" -replace 'providerId="[^"]*"', 'providerId="None"'
     }
+    'ppt/authors\.xml$' {
+      return $text -replace ' id="\{[^"]*"', ' id="{7B2E9C41-0F3A-4D6E-8A11-5C0D2E4F6A01}"' -replace 'name="[^"]*"', "name=""$author""" -replace 'initials="[^"]*"', 'initials="AA"' -replace 'userId="[^"]*"', "userId=""$author""" -replace 'providerId="[^"]*"', 'providerId="None"'
+    }
+    'ppt/comments/modernComment[^/]*\.xml$' { return $text -replace 'authorId="[^"]*"', 'authorId="{7B2E9C41-0F3A-4D6E-8A11-5C0D2E4F6A01}"' }
     'pivotCacheDefinition\d*\.xml$' { return $text -replace 'refreshedBy="[^"]*"', 'refreshedBy="doc-merge"' }
     'externalLink\d+\.xml\.rels$' { return $text -replace 'Target="[^"]*ext\.xlsx"', 'Target="ext.xlsx"' }
     'people\.xml$' {
@@ -414,8 +418,202 @@ function Excel-Books {
   }
 }
 
+# A font made for these tests: every letter and digit is one box, so no licence applies.
+$boxFont = 'AAEAAAAKAIAAAwAgT1MvMkT8RAoAAAEoAAAAYGNtYXABzwKoAAABlAAAANZnbHlmTjxOOgAAAnQAAAA0aGVhZC+QkB4AAACsAAAANmhoZWEFegH4AAAA5AAAACRobXR4BdwAyAAAAYgAAAAMbG9jYQANACcAAAJsAAAACG1heHAABQAGAAABCAAAACBuYW1lqT2x+QAAAqgAAAFKcG9zdANqcHoAAAP0AAAALAABAAAAAQAArEgCkV8PPPUAAwPoAAAAAOcRJkEAAAAA5xEmQQBkAAAB9AK8AAAAAwACAAAAAAAAAAEAAAMg/zgAAAJYAGQAZAH0AAEAAAAAAAAAAAAAAAAAAAADAAEAAAADAAQAAQAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwH0AZAABQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAPz8/PwAAACAAegMg/zgAAAMgAMgAAAAAAAAAAAAAAAAAAAAgAAACWABkASwAAAJYAGQAAAACAAAAAwAAABQAAwABAAAAFAAEAMIAAAAMAAgAAgAEACAALgA5AFoAev//AAAAIAAsADAAQQBh////4QAAAAAAAAAAAAEAAAAKAA4AIABSAAAAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAAAAAANAA0AGgABAGQAAAH0ArwAAwAAMxEhEWQBkAK8/UQAAAEAZAAAAfQCvAADAAAzESERZAGQArz9RAAAAAAMAJYAAQAAAAAAAQAJAAAAAQAAAAAAAgAHAAkAAQAAAAAAAwARABAAAQAAAAAABAAJAAAAAQAAAAAABQALACEAAQAAAAAABgAQACwAAwABBAkAAQASADwAAwABBAkAAgAOAE4AAwABBAkAAwAiAFwAAwABBAkABAASADwAAwABBAkABQAWAH4AAwABBAkABgAgAJRNZXJnZSBCb3hSZWd1bGFyTWVyZ2UgQm94IFJlZ3VsYXJWZXJzaW9uIDEuME1lcmdlQm94LVJlZ3VsYXIATQBlAHIAZwBlACAAQgBvAHgAUgBlAGcAdQBsAGEAcgBNAGUAcgBnAGUAIABCAG8AeAAgAFIAZQBnAHUAbABhAHIAVgBlAHIAcwBpAG8AbgAgADEALgAwAE0AZQByAGcAZQBCAG8AeAAtAFIAZQBnAHUAbABhAHIAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAADAQIDYm94'
+
+Add-Type -Namespace Native -Name Gdi -MemberDefinition @'
+[DllImport("gdi32.dll", CharSet = CharSet.Unicode)] public static extern int AddFontResourceW(string file);
+[DllImport("gdi32.dll", CharSet = CharSet.Unicode)] public static extern bool RemoveFontResourceW(string file);
+'@
+
+# A new deck from a template, without the blank slide it opens with.
+function From-Template($ppt, [string]$template, [int]$window) {
+  $deck = $ppt.Presentations.Open($template, 0, -1, $window)
+  while ($deck.Slides.Count) { $deck.Slides.Item(1).Delete() }
+  $deck
+}
+
+# Adds a slide with a title and returns it.
+function Add-Slide($deck, [int]$layout, [string]$title) {
+  $s = $deck.Slides.AddSlide($deck.Slides.Count + 1, $deck.SlideMaster.CustomLayouts.Item($layout))
+  $s.Shapes.Title.TextFrame.TextRange.Text = $title
+  $s
+}
+
+function Add-Text($slide, [string]$text, [int]$left, [int]$top) {
+  $box = $slide.Shapes.AddTextbox(1, $left, $top, 300, 40)
+  $box.TextFrame.TextRange.Text = $text
+  $box
+}
+
+function Add-Notes($slide, [string]$text) {
+  $slide.NotesPage.Shapes.Placeholders.Item(2).TextFrame.TextRange.Text = $text
+}
+
+# Opens a patched file and lets PowerPoint save it, embedding fonts when $fonts is -1.
+function Save-Again($ppt, [string]$path, [int]$fonts) {
+  $d = $ppt.Presentations.Open($path, 0, 0, 0)
+  $copy = [string](Join-Path $tmp (Split-Path $path -Leaf))
+  $d.SaveAs($copy, 24, $fonts)
+  $d.Close()
+  Copy-Item $copy $path -Force
+}
+
+# Makes a text box jump to $target when clicked.
+function Add-Jump($slide, $target, [string]$text) {
+  $box = Add-Text $slide $text 60 400
+  $title = $target.Shapes.Title.TextFrame.TextRange.Text
+  $box.ActionSettings.Item(1).Hyperlink.SubAddress = "$($target.SlideID),$($target.SlideIndex),$title"
+}
+
+# An action button that runs the custom show called $show (10 = ppActionNamedSlideShow).
+function Add-ShowButton($slide, [string]$show) {
+  $button = $slide.Shapes.AddShape(125, 60, 300, 120, 60)
+  $button.ActionSettings.Item(1).Action = 10
+  $button.ActionSettings.Item(1).SlideShowName = $show
+}
+
+# Adds a legacy comment by Author A to a slide: PowerPoint here writes only modern ones when
+# asked, but keeps legacy ones it finds in a file.
+function Add-LegacyComment([string]$path, [string]$slide) {
+  $p = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+  $declaration = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + "`r`n"
+  $office = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+  $zip = [IO.Compression.ZipFile]::Open($path, [IO.Compression.ZipArchiveMode]::Update)
+  try {
+    $read = { param($n) $s = New-Object IO.StreamReader($zip.GetEntry($n).Open()); $t = $s.ReadToEnd(); $s.Dispose(); $t }
+    $put = {
+      param($n, $t)
+      $old = $zip.GetEntry($n); if ($old) { $old.Delete() }
+      $s = New-Object IO.StreamWriter($zip.CreateEntry($n).Open(), (New-Object Text.UTF8Encoding($false))); $s.Write($t); $s.Dispose()
+    }
+    & $put 'ppt/commentAuthors.xml' ($declaration + "<p:cmAuthorLst $p><p:cmAuthor id=""1"" name=""Author A"" initials=""AA"" lastIdx=""1"" clrIdx=""0""/></p:cmAuthorLst>")
+    & $put 'ppt/comments/comment1.xml' ($declaration + "<p:cmLst $p><p:cm authorId=""1"" dt=""2026-11-04T10:00:00.000"" idx=""1""><p:pos x=""80"" y=""80""/><p:text>Comment on B</p:text></p:cm></p:cmLst>")
+    $rels = $slide -replace '^(.*)/([^/]+)$', '$1/_rels/$2.rels'
+    & $put $rels ((& $read $rels) -replace '</Relationships>', "<Relationship Id=""rId90"" Type=""$office/comments"" Target=""../comments/comment1.xml""/></Relationships>")
+    $rels = 'ppt/_rels/presentation.xml.rels'
+    & $put $rels ((& $read $rels) -replace '</Relationships>', "<Relationship Id=""rId90"" Type=""$office/commentAuthors"" Target=""commentAuthors.xml""/></Relationships>")
+    $types = 'application/vnd.openxmlformats-officedocument.presentationml'
+    & $put '[Content_Types].xml' ((& $read '[Content_Types].xml') -replace '</Types>', "<Override PartName=""/ppt/commentAuthors.xml"" ContentType=""$types.commentAuthors+xml""/><Override PartName=""/ppt/comments/comment1.xml"" ContentType=""$types.comments+xml""/></Types>")
+  } finally { $zip.Dispose() }
+}
+
+function Ppt-Decks {
+  if (Get-Process POWERPNT -ErrorAction SilentlyContinue) { throw 'PowerPoint is running: it has one instance, so wait for it to end.' }
+  $png = [string](Join-Path $tmp 'picture.png'); New-Png $png ([Drawing.Color]::SteelBlue)
+  $ttf = [string](Join-Path $tmp 'box.ttf'); [IO.File]::WriteAllBytes($ttf, [Convert]::FromBase64String($boxFont))
+  if ([Native.Gdi]::AddFontResourceW($ttf) -eq 0) { throw 'The test font did not load.' }
+  $ppt = Track @('POWERPNT') { New-Object -ComObject PowerPoint.Application }
+  $template = [string](Join-Path $tmp 'template.potx')
+  $saved = @{ a = [string](Join-Path $out 'a.pptx'); b = [string](Join-Path $out 'b.pptx'); c = [string](Join-Path $out 'c.pptx') }
+  try {
+    # Decks a and b come from this one template, as the decks of a team do.
+    $t = $ppt.Presentations.Add(0)
+    $t.SaveAs($template, 26)
+    $t.Close()
+
+    # A clip for deck c, made by PowerPoint itself.
+    Step 'clip'
+    $clip = [string](Join-Path $tmp 'clip.mp4')
+    $v = $ppt.Presentations.Add(0)
+    $v.PageSetup.SlideWidth = 160; $v.PageSetup.SlideHeight = 120
+    $v.Slides.AddSlide(1, $v.SlideMaster.CustomLayouts.Item(7)) | Out-Null
+    $v.CreateVideo($clip, $false, 1, 240, 10, 30)
+    for ($i = 0; $i -lt 120 -and $v.CreateVideoStatus -lt 3; $i++) { Start-Sleep -Milliseconds 500 }
+    if ($v.CreateVideoStatus -ne 3) { throw "The clip failed: status $($v.CreateVideoStatus)." }
+    $v.Close()
+
+    # a.pptx: 16:9, two sections, a chart with its workbook, notes on every slide, a modern
+    # comment, a slide-jump link, a custom show with a button that runs it, a picture.
+    Step 'a.pptx'
+    $d = From-Template $ppt $template -1
+    $ppt.WindowState = 2
+    $s1 = Add-Slide $d 1 'Deck A'
+    $s2 = Add-Slide $d 2 'Chart of A'
+    $chart = Track @('EXCEL') { $s2.Shapes.AddChart2(-1, 51, 80, 120, 500, 320, $true) }
+    try { $chart.Chart.ChartData.Workbook.Application.Quit() } catch {}
+    $s3 = Add-Slide $d 2 'Detail of A'
+    $s3.Shapes.Placeholders.Item(2).TextFrame.TextRange.Text = 'The target of the link.'
+    $s4 = Add-Slide $d 6 'Picture of A'
+    $s4.Shapes.AddPicture($png, 0, -1, 100, 150, 96, 96) | Out-Null
+    Add-Jump $s1 $s3 'Go to the detail'
+    $d.SlideShowSettings.NamedSlideShows.Add('Short', [int[]]@($s1.SlideID, $s3.SlideID)) | Out-Null
+    Add-ShowButton $s4 'Short'
+    $n = 0
+    foreach ($s in $s1, $s2, $s3, $s4) { $n++; Add-Notes $s "Notes of A $n" }
+    $s3.Comments.Add(12, 12, 'Author A', 'AA', 'Comment on A') | Out-Null
+    $d.SectionProperties.AddBeforeSlide(1, 'Opening') | Out-Null
+    $d.SectionProperties.AddBeforeSlide(3, 'Details') | Out-Null
+    $d.SaveAs($saved.a, 24)
+    $d.Close()
+
+    # b.pptx: the same template, notes, a hidden slide, a legacy comment by Author A, the same
+    # picture as a.pptx.
+    Step 'b.pptx'
+    $d = From-Template $ppt $template 0
+    $s1 = Add-Slide $d 1 'Deck B'
+    $s2 = Add-Slide $d 2 'Hidden slide of B'
+    $s2.SlideShowTransition.Hidden = -1
+    $s3 = Add-Slide $d 6 'Picture of B'
+    $s3.Shapes.AddPicture($png, 0, -1, 200, 150, 96, 96) | Out-Null
+    $n = 0
+    foreach ($s in $s1, $s2, $s3) { $n++; Add-Notes $s "Notes of B $n" }
+    $d.SaveAs($saved.b, 24)
+    $d.Close()
+    Add-LegacyComment $saved.b 'ppt/slides/slide3.xml'
+    Save-Again $ppt $saved.b 0
+
+    # c.pptx: 4:3, its own master and theme, a table, a video, a line in the embedded font, a
+    # custom show named like a.pptx's with a button, a slide-jump link.
+    Step 'c.pptx'
+    $d = $ppt.Presentations.Add(0)
+    $d.PageSetup.SlideWidth = 720; $d.PageSetup.SlideHeight = 540
+    $d.SlideMaster.Name = 'Deck C design'
+    $d.SlideMaster.Theme.ThemeColorScheme.Colors(5).RGB = 0x2F7F2F
+    $d.SlideMaster.Theme.ThemeColorScheme.Colors(6).RGB = 0x7F2F7F
+    $d.SlideMaster.Theme.ThemeFontScheme.MajorFont.Item(1).Name = 'Merge Box'
+    $d.SlideMaster.Shapes.AddShape(1, 20, 500, 680, 20).Name = 'Band'
+    $s1 = Add-Slide $d 1 'Deck C'
+    $s2 = Add-Slide $d 6 'Table of C'
+    $s2.Shapes.AddTable(2, 3, 60, 140, 600, 120).Name = 'Styled table'
+    $s3 = Add-Slide $d 6 'Video of C'
+    $s3.Shapes.AddMediaObject2($clip, 0, -1, 120, 140, 240, 180) | Out-Null
+    $line = Add-Text $s3 'Boxed text' 60 440
+    $line.TextFrame.TextRange.Font.Name = 'Merge Box'
+    Add-Jump $s1 $s3 'Go to the video'
+    $d.SlideShowSettings.NamedSlideShows.Add('Short', [int[]]@($s2.SlideID)) | Out-Null
+    Add-ShowButton $s2 'Short'
+    Add-Notes $s1 'Notes of C 1'
+    $d.SaveAs($saved.c, 24, -1)
+    $d.Close()
+
+    # COM can't author a custom table style: patch it in, then let PowerPoint save the file.
+    Step 'c.pptx table style'
+    $styleId = '{0D1F6A3B-5C1E-4E1B-9C55-3A7C2B6E1F10}'
+    $style = "<a:tblStyle styleId=""$styleId"" styleName=""Deck C table""><a:wholeTbl><a:tcTxStyle><a:fontRef idx=""minor""/><a:schemeClr val=""dk1""/></a:tcTxStyle><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:srgbClr val=""FFE699""/></a:solidFill></a:fill></a:tcStyle></a:wholeTbl></a:tblStyle>"
+    Edit-Package $saved.c {
+      param($name, $text)
+      if ($name -eq 'ppt/tableStyles.xml') {
+        if ($text -match '/>\s*$') { return ($text -replace '/>\s*$', ">$style</a:tblStyleLst>") }
+        return $text -replace '</a:tblStyleLst>', "$style</a:tblStyleLst>"
+      }
+      if ($name -match '^ppt/slides/slide\d+\.xml$') { return $text -replace '<a:tableStyleId>[^<]*</a:tableStyleId>', "<a:tableStyleId>$styleId</a:tableStyleId>" }
+    }.GetNewClosure()
+    Save-Again $ppt $saved.c -1
+  } finally {
+    try { $ppt.Quit() } catch {}
+    Start-Sleep -Seconds 2
+    Stop-Mine
+    [Native.Gdi]::RemoveFontResourceW($ttf) | Out-Null
+  }
+
+  foreach ($n in 'a', 'b', 'c') {
+    Edit-Package $saved[$n] { param($name, $text) Scrub $name $text 'Author A' }.GetNewClosure()
+  }
+}
+
 try {
-  switch ($Family) { 'word' { Word-Docs } 'excel' { Excel-Books } }
+  switch ($Family) { 'word' { Word-Docs } 'excel' { Excel-Books } 'powerpoint' { Ppt-Decks } }
 } catch {
   $_.InvocationInfo.PositionMessage
   throw
@@ -423,5 +621,5 @@ try {
   Stop-Mine
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
-$files = @{ word = '*.docx'; excel = '*.xlsx' }[$Family]
+$files = @{ word = '*.docx'; excel = '*.xlsx'; powerpoint = '*.pptx' }[$Family]
 Get-ChildItem $out -Filter $files | ForEach-Object { "{0} {1:N0} bytes" -f $_.Name, $_.Length }
