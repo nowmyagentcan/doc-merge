@@ -1187,3 +1187,33 @@ fn the_three_documents_stay_whole_together() {
     assert!(reported.contains(&("toc_needs_update", Some(2))));
     assert!(reported.contains(&("compat_mode_differs", Some(3))));
 }
+
+#[test]
+fn even_headers_take_their_schema_place_in_the_bases_settings() {
+    let dir = temp_dir("settings-order");
+    let base = settings(
+        r#"<w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:defaultTableStyle w:val="T"/><w:evenAndOddHeaders w:val="0"/><w:characterSpacingControl w:val="doNotCompress"/>"#,
+    );
+    let without = base.replace(r#"<w:evenAndOddHeaders w:val="0"/>"#, "");
+    let on = settings("<w:evenAndOddHeaders/>");
+    let b = word_file(
+        &dir,
+        "b.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &on)],
+    );
+    let want =
+        r#"<w:defaultTableStyle w:val="T"/><w:evenAndOddHeaders/><w:characterSpacingControl"#;
+    for own in [&base, &without] {
+        let a = word_file(
+            &dir,
+            "a.docx",
+            "<w:p/>",
+            &[("word/settings.xml", "settings", own)],
+        );
+        let (_, parts) = merge_files(&dir, &[a, b.clone()]);
+        let merged = text(&parts, "word/settings.xml");
+        assert!(merged.contains(want), "{merged}");
+        assert_eq!(count(&merged, "evenAndOddHeaders"), 1);
+    }
+}

@@ -14,7 +14,8 @@ use crate::writer::{Body, Plan, Rels, rels_part};
 use crate::xml::{Child, Node, Prefixes, declaration, prefix_of};
 
 /// What comes before `w:evenAndOddHeaders` in `w:settings`.
-const BEFORE_EVEN: &str = "\n     writeProtection view zoom removePersonalInformation removeDateAndTime \
+const BEFORE_EVEN: &str = "\
+     writeProtection view zoom removePersonalInformation removeDateAndTime \
      doNotDisplayPageBoundaries displayBackgroundShape printPostScriptOverText \
      printFractionalCharacterWidth printFormsData embedTrueTypeFonts embedSystemFonts \
      saveSubsetFonts saveFormsData mirrorMargins alignBordersAndEdges \
@@ -22,7 +23,9 @@ const BEFORE_EVEN: &str = "\n     writeProtection view zoom removePersonalInform
      hideGrammaticalErrors activeWritingStyle proofState formsDesign attachedTemplate \
      linkStyles stylePaneFormatFilter stylePaneSortMethod documentType mailMerge revisionView \
      trackRevisions doNotTrackMoves doNotTrackFormatting documentProtection autoFormatOverride \
-     styleLockTheme styleLockQFSet";
+     styleLockTheme styleLockQFSet defaultTabStop autoHyphenation consecutiveHyphenLimit \
+     hyphenationZone doNotHyphenateCaps showEnvelope summaryLength clickAndTypeStyle \
+     defaultTableStyle";
 
 /// The layout mode of a document that doesn't name one (Word 2007's).
 const OLDEST_MODE: &str = "12";
