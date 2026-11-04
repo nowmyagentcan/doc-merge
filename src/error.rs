@@ -13,6 +13,9 @@ pub struct Error {
     pub input: Option<usize>,
     #[serde(skip)]
     pub exit: u8,
+    /// What lies behind it, for `--debug`.
+    #[serde(skip)]
+    pub cause: Option<String>,
 }
 
 const RESAVE: &str = "Save it as .docx, .pptx or .xlsx.";
@@ -26,6 +29,7 @@ fn new(code: &'static str, exit: u8, message: String, hint: Option<&'static str>
         hint,
         input: None,
         exit,
+        cause: None,
     }
 }
 
@@ -44,6 +48,18 @@ impl Error {
     /// The same error, blamed on the 1-based input `n`.
     pub fn at(mut self, n: usize) -> Self {
         self.input = Some(n);
+        self
+    }
+
+    /// The same error with `cause` and its sources behind it.
+    pub fn because(mut self, cause: &dyn std::error::Error) -> Self {
+        let mut chain = cause.to_string();
+        let mut next = cause.source();
+        while let Some(e) = next {
+            chain += &format!(": {e}");
+            next = e.source();
+        }
+        self.cause = Some(chain);
         self
     }
 
@@ -180,7 +196,7 @@ impl Error {
 
     /// A usage error from the argument parser, with its own message.
     pub fn usage(message: String) -> Self {
-        new("usage", 2, message, None)
+        new("usage", 2, message, Some("See doc-merge --help."))
     }
 
     pub fn need_two_files(found: usize) -> Self {

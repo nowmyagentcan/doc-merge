@@ -375,21 +375,16 @@ impl Package {
             }
             Some(_) => {}
         }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| origin.bad("its zip structure can't be read"))?;
-        let mut zip = ZipArchive::new(BufReader::new(file))
-            .map_err(|_| origin.bad("its zip structure can't be read"))?;
+        let unreadable =
+            |e: &dyn std::error::Error| origin.bad("its zip structure can't be read").because(e);
+        file.seek(SeekFrom::Start(0)).map_err(|e| unreadable(&e))?;
+        let mut zip = ZipArchive::new(BufReader::new(file)).map_err(|e| unreadable(&e))?;
 
         let mut entries = vec![];
         let mut by_name = HashMap::new();
         for index in 0..zip.len() {
-            let e = zip
-                .by_index_data(index)
-                .map_err(|_| origin.bad("its zip structure can't be read"))?;
-            let part = e
-                .name()
-                .map_err(|_| origin.bad("its zip structure can't be read"))?
-                .into_owned();
+            let e = zip.by_index_data(index).map_err(|e| unreadable(&e))?;
+            let part = e.name().map_err(|e| unreadable(&e))?.into_owned();
             if part.ends_with('/') && e.size() == 0 {
                 continue;
             }

@@ -11,10 +11,14 @@ pub mod writer;
 pub mod xlsx;
 pub mod xml;
 
+use std::backtrace::Backtrace;
 use std::cell::Cell;
+use std::panic::{self, AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Instant;
 
 use serde::{Serialize, Serializer};
@@ -25,6 +29,49 @@ use paths::Target;
 
 /// Set on Ctrl+C: a run under way ends at its next look at the clock, removing its temp file.
 pub static STOP: AtomicBool = AtomicBool::new(false);
+
+const WORKER: &str = "doc-merge worker";
+/// XML nests at most 256 deep and nothing else recurses, so this is many times what a run needs.
+const WORKER_STACK: usize = 64 << 20;
+
+thread_local! {
+    static PANIC_AT: Cell<Option<String>> = const { Cell::new(None) };
+}
+
+/// Runs `work` on a thread with a large stack. A panic there prints nothing and comes back as
+/// an `internal` error, with where it happened as its cause.
+pub fn guarded<T: Send>(work: impl FnOnce() -> Result<T, Error> + Send) -> Result<T, Error> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if thread::current().name() == Some(WORKER) {
+                let at = info.location().map(ToString::to_string).unwrap_or_default();
+                let stack = Backtrace::force_capture();
+                PANIC_AT.set(Some(format!("{at}\n{stack}")));
+            } else {
+                default(info);
+            }
+        }));
+    });
+    thread::scope(|scope| {
+        thread::Builder::new()
+            .name(WORKER.into())
+            .stack_size(WORKER_STACK)
+            .spawn_scoped(scope, || {
+                catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+                    let text = panic.downcast_ref::<&str>().map(ToString::to_string);
+                    let text = text.or_else(|| panic.downcast_ref::<String>().cloned());
+                    let mut e = Error::internal(text.as_deref().unwrap_or("a panic"));
+                    e.cause = PANIC_AT.take();
+                    Err(e)
+                })
+            })
+            .map_err(|e| Error::internal("a thread can't start").because(&e))?
+            .join()
+            .unwrap_or_else(|_| Err(Error::internal("a thread ended early")))
+    })
+}
 
 /// Opens the inputs after `first`, the first of `paths`, in order, then checks that they are
 /// all of one family.
@@ -291,4 +338,31 @@ pub fn merge(
             ("write", ms(planned, done)),
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_is_an_internal_error_and_the_next_run_still_works() {
+        let e = guarded(|| -> Result<(), Error> { panic!("boom") }).unwrap_err();
+        assert_eq!((e.code, e.exit), ("internal", 3));
+        assert_eq!(e.message, "Something went wrong inside doc-merge: boom.");
+        assert!(e.cause.unwrap().starts_with("src"));
+        assert_eq!(guarded(|| Ok(7)), Ok(7));
+    }
+
+    #[test]
+    fn the_deepest_xml_fits_on_the_worker_many_times_over() {
+        fn depth(n: u32) -> u32 {
+            let pad = std::hint::black_box([0u8; 4096]);
+            if n == 0 {
+                u32::from(pad[0])
+            } else {
+                1 + depth(n - 1)
+            }
+        }
+        assert_eq!(guarded(|| Ok(depth(10 * xml::MAX_DEPTH as u32))), Ok(2560));
+    }
 }

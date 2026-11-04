@@ -17,9 +17,11 @@ strip = true
 opt-level = 3
 
 [dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 quick-xml = "=0.42.0"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 zip = { version = "=9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
-[dev-dependencies]
-serde_json = "1.0.154"
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }

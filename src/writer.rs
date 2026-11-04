@@ -651,10 +651,15 @@ fn too_big(what: &str, n: u64) -> Error {
 pub fn write(plan: Plan, inputs: &mut [Package], place: &Place) -> Result<(u64, PathBuf), Error> {
     check(&plan, inputs)?;
     let dir = place.dir();
-    let shown = dir.to_string_lossy();
+    let shown = match place {
+        Place::File { path, .. } => path.to_string_lossy(),
+        Place::Free { dir, .. } => dir.to_string_lossy(),
+    };
     let failed = |e: io::Error| Error::write_failed(&shown, &e);
     static N: AtomicUsize = AtomicUsize::new(0);
-    fs::create_dir_all(dir).map_err(failed)?;
+    if matches!(place, Place::Free { .. }) {
+        fs::create_dir_all(dir).map_err(failed)?;
+    }
     let temp_path = dir.join(format!(
         ".doc-merge-{}-{}.tmp",
         std::process::id(),
