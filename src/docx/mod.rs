@@ -89,6 +89,7 @@ pub fn merge(
     let num_rels_before = num_rels.list.len();
     let mut out_lists =
         numbering::Output::new(Lists::new(base_numbering.as_ref().map(|h| &h.tree)));
+    let mut next_bookmark = 0;
     let mut notes = vec![];
     for kind in KINDS {
         notes.push(Notes::open(&mut inputs[0], &main, &base_rels, kind)?);
@@ -106,6 +107,7 @@ pub fn merge(
         sections.push(uses.sections);
         let w = prefix_of(&uses.root, W).unwrap_or("w").to_string();
         if i == 0 {
+            next_bookmark = uses.bookmarks + 1;
             root = Prefixes::of(&uses.root);
             docs.push(Rewrite {
                 w,
@@ -130,6 +132,7 @@ pub fn merge(
                 let found = scan(&text, &target, &origin)?;
                 uses.styles.extend(found.styles);
                 uses.nums.extend(found.nums);
+                uses.bookmarks = uses.bookmarks.max(found.bookmarks);
                 stories.push((id.clone(), target, text));
             }
         }
@@ -140,6 +143,7 @@ pub fn merge(
                 let found = scan(&h.text, &h.part, &origin)?;
                 uses.styles.extend(found.styles);
                 uses.nums.extend(found.nums);
+                uses.bookmarks = uses.bookmarks.max(found.bookmarks);
             }
             doc_notes.push(h);
         }
@@ -216,6 +220,7 @@ pub fn merge(
             rids: Some(HashMap::new()),
             nums: copied.nums,
             notes: Default::default(),
+            bookmarks: next_bookmark,
             bare_p: bare("paragraph", &base_p),
             bare_table: bare("table", &base_table),
             theme: doc_theme,
@@ -224,6 +229,7 @@ pub fn merge(
             w,
             appended: true,
         };
+        next_bookmark += uses.bookmarks + 1;
         let local = style_root.merge(doc_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
         for s in &mut out_styles.styles[mapped.copied] {
             s.walk_mut(&mut |n| {
@@ -677,6 +683,8 @@ struct Uses {
     styles: BTreeSet<String>,
     /// `w:numId`s, without 0, which means no list.
     nums: BTreeSet<String>,
+    /// The highest bookmark id.
+    bookmarks: u64,
     sections: usize,
     root: Vec<Attr>,
 }
@@ -747,6 +755,12 @@ fn scan(text: &str, part: &str, origin: &Origin) -> Result<Uses, Error> {
         {
             uses.nums.insert(a.value.clone());
         }
+        if r.element_ns(e) == W
+            && e.local_name().as_ref() == "bookmarkStart"
+            && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "id")
+        {
+            uses.bookmarks = uses.bookmarks.max(a.value.parse().unwrap_or(0));
+        }
         for a in attrs.iter().filter(|a| is_rid(a)) {
             if seen.insert(a.value.clone()) {
                 uses.rids.push(a.value.clone());
@@ -771,6 +785,8 @@ struct Rewrite {
     nums: HashMap<String, String>,
     /// Old to new note and comment ids, by [`KINDS`].
     notes: [HashMap<String, String>; 3],
+    /// What bookmark ids move up by, which keeps each start paired with its end.
+    bookmarks: u64,
     /// Set when theme links come off this document's content.
     theme: Option<Theme>,
     /// The style for paragraphs and tables with none, when not the output's default.
@@ -816,6 +832,15 @@ impl Rewrite {
         {
             changed |= *new != a.value;
             a.value = new.clone();
+        }
+        if ns == W
+            && self.bookmarks > 0
+            && matches!(local, "bookmarkStart" | "bookmarkEnd")
+            && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "id")
+            && let Ok(id) = a.value.parse::<u64>()
+        {
+            a.value = (id + self.bookmarks).to_string();
+            changed = true;
         }
         let notes = match local {
             "footnoteReference" => Some(&self.notes[0]),

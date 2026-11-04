@@ -333,6 +333,19 @@ fn content_controls_keep_their_text_and_lose_their_binding() {
 }
 
 #[test]
+fn bookmark_ids_stay_unique_and_paired() {
+    let (_, parts) = merged("bookmarks", &["a.docx", "b.docx", "c.docx", "a.docx"]);
+    let doc = text(&parts, "word/document.xml");
+    let mut starts = values(&doc, "w:bookmarkStart", "w:id");
+    let mut ends = values(&doc, "w:bookmarkEnd", "w:id");
+    starts.sort();
+    ends.sort();
+    assert_eq!(starts, ends);
+    let unique: std::collections::HashSet<_> = starts.iter().collect();
+    assert_eq!(unique.len(), starts.len(), "{starts:?}");
+}
+
+#[test]
 fn only_one_style_is_the_default_of_its_type() {
     let (_, parts) = merged("one-default", &["a.docx", "b.docx"]);
     let styles = text(&parts, "word/styles.xml");
