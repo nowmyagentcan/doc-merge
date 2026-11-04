@@ -534,3 +534,138 @@ fn a_bad_slide_size_is_damaged() {
     let e = merge(&paths, &dir.join("o.pptx"), &Options::default(), None).unwrap_err();
     assert_eq!((e.code, e.input), ("bad_package", Some(2)));
 }
+
+#[test]
+fn a_four_by_three_deck_is_centred_in_a_wide_one() {
+    let (report, parts) = merged("centre", &["a.pptx", "c.pptx"]);
+    let w = report.warnings.list();
+    assert_eq!(w.len(), 1);
+    assert_eq!((w[0].code, w[0].input), ("slides_scaled", Some(2)));
+    assert_eq!(
+        w[0].message,
+        "Slides from c.pptx (4:3) were scaled to fit the 16:9 slide size and centred."
+    );
+    let source = entries(&fixture("c.pptx"));
+    let table = text(&source, "ppt/slides/slide2.xml");
+    let order = slides(&parts);
+    let copy = text(&parts, &order[5]);
+    let offsets = |xml: &str| {
+        let x = values(xml, "a:off", "x");
+        let x: Vec<i64> = x.iter().map(|v| v.parse().unwrap()).collect();
+        (x, values(xml, "a:off", "y"))
+    };
+    let ((before, y_before), (after, y_after)) = (offsets(&table), offsets(&copy));
+    assert_eq!(before[0], 0, "the slide's own group");
+    assert_eq!(after[0], 0);
+    assert!(before.len() > 1);
+    for (b, a) in before.iter().zip(&after).skip(1) {
+        assert_eq!(a - b, 1_524_000);
+    }
+    assert_eq!(y_before, y_after);
+    assert_eq!(
+        values(&table, "a:gridCol", "w"),
+        values(&copy, "a:gridCol", "w"),
+        "nothing is scaled at the same height"
+    );
+    // The design moves with its slides: the master's band is centred too.
+    let master = "ppt/slideMasters/slideMaster2.xml";
+    let band = offsets(&text(&parts, master)).0;
+    let source_band = offsets(&text(&source, "ppt/slideMasters/slideMaster1.xml")).0;
+    assert_eq!(
+        band.last().unwrap() - source_band.last().unwrap(),
+        1_524_000
+    );
+}
+
+#[test]
+fn notes_pages_are_not_fitted() {
+    let (_, parts) = merged("notes-fit", &["a.pptx", "c.pptx"]);
+    let source = entries(&fixture("c.pptx"));
+    let notes = text(&source, "ppt/notesSlides/notesSlide1.xml");
+    assert!(parts.iter().any(|p| p.1 == notes.as_bytes()));
+}
+
+/// Puts `shapes` after the shape of slide 1.
+fn with_shapes(parts: &mut Parts, shapes: &str) {
+    let closing = format!("{shapes}</p:spTree>");
+    replace(parts, "ppt/slides/slide1.xml", "</p:spTree>", &closing);
+}
+
+#[test]
+fn slides_of_another_size_are_scaled_by_the_smaller_ratio_then_centred() {
+    let mut small = deck(1, (4_000_000, 3_000_000));
+    with_shapes(
+        &mut small,
+        concat!(
+            r#"<p:grpSp><p:nvGrpSpPr/><p:grpSpPr><a:xfrm><a:off x="100" y="200"/><a:ext cx="300" cy="400"/><a:chOff x="500" y="600"/><a:chExt cx="700" cy="800"/></a:xfrm></p:grpSpPr>"#,
+            r#"<p:sp><p:nvSpPr/><p:spPr><a:xfrm><a:off x="10" y="20"/><a:ext cx="30" cy="40"/></a:xfrm></p:spPr></p:sp></p:grpSp>"#,
+            r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="1000" y="1000"/><a:ext cx="2000" cy="2000"/></p:xfrm><a:graphic><a:graphicData uri="x"><a:tbl><a:tblGrid><a:gridCol w="1000"/></a:tblGrid><a:tr h="500"/></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#,
+            r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x"><p:sp><p:nvSpPr/><p:spPr><a:xfrm><a:off x="2" y="4"/></a:xfrm></p:spPr></p:sp></mc:Choice><mc:Fallback><p:pic><p:nvPicPr/><p:spPr><a:xfrm><a:off x="6" y="8"/></a:xfrm></p:spPr></p:pic></mc:Fallback></mc:AlternateContent>"#,
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="9" name="X"><a:extLst><a:ext uri="{K}"/></a:extLst></p:cNvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:pPr defTabSz="914400"/><a:r><a:rPr sz="110"/><a:t>x</a:t></a:r><a:endParaRPr sz="1000"/></a:p></p:txBody></p:sp>"#,
+        ),
+    );
+    // Twice the width but one and a half times the height: scaled by 1.5, 1,000,000 left over
+    // on each side.
+    let (report, parts) = two_decks("scale", &deck(1, (8_000_000, 4_500_000)), &small);
+    assert_eq!(report.warnings.list()[0].code, "slides_scaled");
+    let xml = text(&parts, &slides(&parts)[1]);
+    for wanted in [
+        r#"<a:off x="1001500" y="3000"/><a:ext cx="4500" cy="6000"/>"#,
+        r#"<a:off x="1000150" y="300"/><a:ext cx="450" cy="600"/><a:chOff x="750" y="900"/><a:chExt cx="1050" cy="1200"/>"#,
+        r#"<a:off x="15" y="30"/><a:ext cx="45" cy="60"/>"#,
+        r#"<p:xfrm><a:off x="1001500" y="1500"/><a:ext cx="3000" cy="3000"/></p:xfrm>"#,
+        r#"<a:gridCol w="1500"/>"#,
+        r#"<a:tr h="750"/>"#,
+        r#"<a:off x="1000003" y="6"/>"#,
+        r#"<a:off x="1000009" y="12"/>"#,
+        r#"<a:ext uri="{K}"/>"#,
+        r#"defTabSz="1371600""#,
+        r#"<a:rPr sz="165"/>"#,
+        r#"<a:endParaRPr sz="1500"/>"#,
+        r#"<a:rPr sz="3000"/>"#,
+        r#"<a:off x="0" y="0"/><a:ext cx="0" cy="0"/>"#,
+    ] {
+        assert!(xml.contains(wanted), "{wanted} not in {xml}");
+    }
+    let master = text(&parts, "ppt/slideMasters/slideMaster2.xml");
+    assert!(
+        master.contains(r#"<a:off x="1001500" y="3000"/>"#),
+        "{master}"
+    );
+    let layout = text(&parts, "ppt/slideLayouts/slideLayout2.xml");
+    assert!(
+        layout.contains(r#"<a:off x="1001500" y="3000"/>"#),
+        "{layout}"
+    );
+}
+
+#[test]
+fn small_fonts_stop_at_the_smallest_size_a_file_may_state() {
+    let mut big = deck(1, (24_000_000, 13_500_000));
+    let run = r#"<a:rPr sz="2000"/>"#;
+    let small = r#"<a:rPr sz="150"/>"#;
+    replace(&mut big, "ppt/slides/slide1.xml", run, small);
+    let (_, parts) = two_decks("fonts", &deck(1, (2_400_000, 1_350_000)), &big);
+    let xml = text(&parts, &slides(&parts)[1]);
+    assert!(xml.contains(r#"<a:rPr sz="100"/>"#), "{xml}");
+}
+
+#[test]
+fn two_decks_of_one_other_size_share_their_fitted_master() {
+    let dir = temp_dir("fitted");
+    let paths = [
+        file(&dir, "a.pptx", &deck(1, WIDE)),
+        file(&dir, "b.pptx", &deck(1, (9_144_000, 6_858_000))),
+        file(&dir, "c.pptx", &deck(2, (9_144_000, 6_858_000))),
+    ];
+    let (report, parts) = merged_files("fitted-out", &paths);
+    assert_eq!(counts(&parts), (2, 2, 2));
+    assert_eq!(report.warnings.list().len(), 2);
+}
+
+#[test]
+fn an_odd_slide_size_reads_as_a_decimal_ratio() {
+    let (report, _) = two_decks("ratio", &deck(1, WIDE), &deck(1, (9_144_001, 6_858_000)));
+    let message = &report.warnings.list()[0].message;
+    assert!(message.contains("(1.33:1)"), "{message}");
+}

@@ -1,7 +1,8 @@
 //! Slide masters as units: a master with all its layouts, its theme and what they relate to.
 //! Two units are the same design when their canonical text is equal: every part in canonical
 //! form, each relationship attribute replaced by the hash of what it points at, and media
-//! compared by their bytes.
+//! compared by their bytes. Designs and slides from a deck of another size are fitted to the
+//! output's.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -11,8 +12,10 @@ use super::{Master, P, target};
 use crate::error::Error;
 use crate::package::{MAX_PARSED, Package};
 use crate::writer::{MAX_SHARED, R, is_xml};
-use crate::xml;
+use crate::xml::{self, A, MC, Node};
 
+/// The smallest font size a file may state, in hundredths of a point.
+const MIN_FONT: i64 = 100;
 /// The hash of a target already on the walk's stack, such as a layout's link to its master.
 const CYCLE: u64 = 0;
 
@@ -183,4 +186,118 @@ fn same_media(
         }
     }
     Ok(true)
+}
+
+/// How the content of a deck of another slide size fits the output's: scaled, then centred.
+pub struct Fit {
+    scale: f64,
+    dx: i64,
+    dy: i64,
+}
+
+impl Fit {
+    /// None when the sizes are equal.
+    pub fn new(from: (u64, u64), to: (u64, u64)) -> Option<Self> {
+        if from == to {
+            return None;
+        }
+        let side = |v: u64| v as f64;
+        let scale = (side(to.0) / side(from.0)).min(side(to.1) / side(from.1));
+        let margin = |to: u64, from: u64| ((side(to) - scale * side(from)) / 2.0).round() as i64;
+        Some(Self {
+            scale,
+            dx: margin(to.0, from.0),
+            dy: margin(to.1, from.1),
+        })
+    }
+
+    fn scaled(&self, value: &str, least: i64) -> Option<String> {
+        let v: i64 = value.parse().ok()?;
+        let scaled = (v as f64 * self.scale).round() as i64;
+        Some(scaled.max(least.min(v)).to_string())
+    }
+
+    /// Scales one attribute of `n` if it has it.
+    fn scale_attr(&self, n: &mut Node, name: &str, least: i64) {
+        let a = n
+            .attrs
+            .iter_mut()
+            .find(|a| a.ns.is_empty() && a.local == name);
+        if let Some(a) = a {
+            a.value = self.scaled(&a.value, least).unwrap_or(a.value.clone());
+        }
+    }
+
+    /// Fits a slide, layout or master.
+    pub fn apply(&self, root: &mut Node) {
+        root.walk_mut(&mut |n| {
+            self.scale_attr(n, "defTabSz", i64::MIN);
+            if n.ns != A {
+                return;
+            }
+            let names: &[&str] = match n.local.as_str() {
+                "off" | "chOff" => &["x", "y"],
+                "ext" | "chExt" => &["cx", "cy"],
+                "gridCol" => &["w"],
+                "tr" => &["h"],
+                "rPr" | "defRPr" | "endParaRPr" => {
+                    self.scale_attr(n, "sz", MIN_FONT);
+                    &[]
+                }
+                _ => &[],
+            };
+            for name in names {
+                self.scale_attr(n, name, i64::MIN);
+            }
+        });
+        let tree = root
+            .child_mut(P, "cSld")
+            .and_then(|c| c.child_mut(P, "spTree"));
+        for shape in tree.into_iter().flat_map(Node::nodes_mut) {
+            if shape.local != "nvGrpSpPr" && shape.local != "grpSpPr" {
+                self.centre(shape);
+            }
+        }
+    }
+
+    /// Moves a top-level shape, whichever alternative of it a reader takes.
+    fn centre(&self, shape: &mut Node) {
+        if shape.ns == MC {
+            for branch in shape.nodes_mut() {
+                self.centre(branch);
+            }
+            return;
+        }
+        for n in shape.nodes_mut() {
+            let holder = if n.local == "xfrm" {
+                Some(n)
+            } else if n.local == "spPr" || n.local == "grpSpPr" {
+                n.child_mut(A, "xfrm")
+            } else {
+                None
+            };
+            let off = holder.and_then(|x| x.child_mut(A, "off"));
+            for a in off.into_iter().flat_map(|o| o.attrs.iter_mut()) {
+                let by = if a.local == "x" { self.dx } else { self.dy };
+                if let Ok(v) = a.value.parse::<i64>() {
+                    a.value = (v + by).to_string();
+                }
+            }
+        }
+    }
+}
+
+/// An aspect ratio in words, such as `4:3`.
+pub fn ratio((cx, cy): (u64, u64)) -> String {
+    let gcd = |mut a: u64, mut b: u64| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let g = gcd(cx, cy);
+    if cx / g > 100 || cy / g > 100 {
+        return format!("{:.2}:1", cx as f64 / cy as f64);
+    }
+    format!("{}:{}", cx / g, cy / g)
 }

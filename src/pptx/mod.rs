@@ -7,11 +7,11 @@ mod masters;
 use std::collections::{HashMap, HashSet};
 
 use crate::Rename;
-use crate::error::{Error, Warnings, thousands};
+use crate::error::{Error, Warning, Warnings, thousands};
 use crate::package::{MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve};
 use crate::writer::{Body, Part, Plan, R, Rels, planned_text, relative, rels_part};
 use crate::xml::{self, Attr, Child, Node, XMLNS, declaration, prefix_of};
-use masters::{Design, Units};
+use masters::{Design, Fit, Units, ratio};
 
 pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
@@ -69,6 +69,11 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
     }
     for (i, deck) in decks.iter().enumerate().skip(1) {
         out.append(&mut plan, inputs, i, deck)?;
+        if deck.size != decks[0].size && !deck.slides.is_empty() {
+            let (from, to) = (ratio(deck.size), ratio(decks[0].size));
+            let origin = &inputs[i].origin;
+            warnings.push(Warning::slides_scaled(i + 1, &origin.name, &from, &to));
+        }
     }
     out.finish(&mut plan, &inputs[0]);
     let main = inputs[0].main.clone();
@@ -292,6 +297,7 @@ struct Output {
     slide_ids: Ids,
     notes_master: Option<String>,
     units: Units,
+    size: (u64, u64),
 }
 
 impl Output {
@@ -305,6 +311,7 @@ impl Output {
             slide_ids: Ids::new(deck.slides.iter().map(|s| s.id), SLIDE_IDS),
             notes_master: deck.notes_master.clone(),
             units: Units::default(),
+            size: deck.size,
         }
     }
 
@@ -322,13 +329,15 @@ impl Output {
         list(&mut self.root, of).children.push(Child::Node(entry));
     }
 
-    /// Copies a master with its layouts, theme and pictures under new ids; returns its name.
+    /// Copies a master with its layouts, theme and pictures under new ids, fitted to the
+    /// output's slide size; returns its name.
     fn add_master(
         &mut self,
         plan: &mut Plan,
         inputs: &mut [Package],
         i: usize,
         master: &Master,
+        fit: Option<&Fit>,
     ) -> Result<String, Error> {
         let name = plan.copy_graph(inputs, i, &master.part, &|_, _| None)?;
         let text = inputs[i].text(&master.part, MAX_PARSED)?;
@@ -337,6 +346,12 @@ impl Output {
         if let Some(layouts) = tree.child_mut(P, "sldLayoutIdLst") {
             for n in layouts.nodes_mut() {
                 n.set_attr("", "", "id", &self.master_ids.take().to_string());
+            }
+        }
+        if let Some(fit) = fit {
+            fit.apply(&mut tree);
+            for layout in &master.layouts {
+                edit_part(plan, &mut inputs[i], i, layout, |root| fit.apply(root))?;
             }
         }
         plan.replace(&name, Body::Data(part_bytes(&declaration(&text), &tree)));
@@ -360,6 +375,7 @@ impl Output {
         deck: &Deck,
     ) -> Result<HashMap<String, String>, Error> {
         let mut shared = HashMap::new();
+        let fit = Fit::new(deck.size, self.size);
         for master in &deck.masters {
             let design = Design::of(&mut inputs[i], master)?;
             if let Some(unit) = self.units.find(deck.size, &design, i, inputs)? {
@@ -369,7 +385,7 @@ impl Output {
                 }
                 continue;
             }
-            let name = self.add_master(plan, inputs, i, master)?;
+            let name = self.add_master(plan, inputs, i, master, fit.as_ref())?;
             let copied = master.layouts.iter().filter_map(|l| plan.copied(i, l));
             let layouts = copied.map(String::from).collect();
             self.units.add(deck.size, design, i, name, layouts);
@@ -402,8 +418,12 @@ impl Output {
             "slideLayout" | "slideMaster" => shared.get(&target.to_ascii_lowercase()).cloned(),
             _ => None,
         };
+        let fit = Fit::new(deck.size, self.size);
         for slide in &deck.slides {
             let name = plan.copy_graph(inputs, i, &slide.part, &mapped)?;
+            if let Some(fit) = &fit {
+                edit_part(plan, &mut inputs[i], i, &slide.part, |root| fit.apply(root))?;
+            }
             let id = self.slide_ids.take();
             self.add_entry("sldIdLst", "sldId", Some(id), "slide", &name);
         }
@@ -417,6 +437,22 @@ impl Output {
         );
         rels_part(plan, base, &self.main, &self.rels);
     }
+}
+
+/// Rewrites the copy of part `part` of input `i`.
+fn edit_part(
+    plan: &mut Plan,
+    pkg: &mut Package,
+    i: usize,
+    part: &str,
+    edit: impl FnOnce(&mut Node),
+) -> Result<(), Error> {
+    let text = pkg.text(part, MAX_PARSED)?;
+    let mut root = xml::tree(&text, part, &pkg.origin)?;
+    edit(&mut root);
+    let name = plan.copied(i, part).expect("a copied part").to_string();
+    plan.replace(&name, Body::Data(part_bytes(&declaration(&text), &root)));
+    Ok(())
 }
 
 /// A whole part as bytes, after the declaration of the text it came from.
