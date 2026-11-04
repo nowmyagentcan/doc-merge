@@ -144,9 +144,9 @@ pub fn section<'a>(
     let first = std::mem::take(&mut walk.first_sect);
     let more = added(rw, first);
     if empty && more.is_empty() {
-        return start(r, e, true, rw, place, &mut walk.bare, buf);
+        return start(r, e, true, rw, place, walk, buf);
     }
-    start(r, e, false, rw, place, &mut walk.bare, buf)?;
+    start(r, e, false, rw, place, walk, buf)?;
     let mut pieces: [Vec<u8>; 3] = Default::default();
     let depth = r.depth();
     let mut at = REST;
@@ -173,7 +173,7 @@ pub fn section<'a>(
                 } else {
                     Place::Inner
                 };
-                start(r, c, empty, rw, place, &mut walk.bare, &mut pieces[at])?;
+                start(r, c, empty, rw, place, walk, &mut pieces[at])?;
                 pieces[at].extend(twin.unwrap_or_default().as_bytes());
             }
             Event::End(_) if r.depth() < depth => {}
@@ -202,6 +202,8 @@ impl Merger<'_> {
         let origin = self.inputs[i].origin.clone();
         rw.twin = true;
         let body_rids = rw.rids.take();
+        let appended = std::mem::replace(&mut rw.appended, true);
+        rw.copying = true;
         for id in &uses.defaults {
             let Some(r) = own.iter().find(|r| &r.id == id) else {
                 continue;
@@ -236,6 +238,8 @@ impl Merger<'_> {
             rw.twins.insert(id.clone(), new);
         }
         rw.rids = body_rids;
+        rw.appended = appended;
+        rw.copying = false;
         Ok(())
     }
 

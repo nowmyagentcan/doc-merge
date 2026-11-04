@@ -163,14 +163,10 @@ fn clashing_styles_are_copied_under_new_names() {
     assert!(styles.contains(r#"w:styleId="ClauseText_2""#));
     assert!(styles.contains(r#"<w:name w:val="ClauseText (2)"/>"#));
     assert!(styles.contains(r#"<w:name w:val="Heading 1 (2)"/>"#));
-    let renamed: Vec<_> = report.renames.iter().map(|r| r.to.as_str()).collect();
+    let styles_renamed = report.renames.iter().filter(|r| r.kind == "style");
+    let renamed: Vec<_> = styles_renamed.clone().map(|r| r.to.as_str()).collect();
     assert!(renamed.contains(&"ClauseText (2)"), "{renamed:?}");
-    assert!(
-        report
-            .renames
-            .iter()
-            .all(|r| r.input == 2 && r.kind == "style")
-    );
+    assert!(styles_renamed.clone().all(|r| r.input == 2));
     let doc = text(&parts, "word/document.xml");
     let b = &doc[doc.find("Title of B").unwrap()..];
     assert!(b.contains(r#"<w:pStyle w:val="ClauseText_2"/>"#));
@@ -183,7 +179,7 @@ fn clashing_styles_are_copied_under_new_names() {
 #[test]
 fn first_mode_takes_the_first_documents_styles() {
     let (report, parts) = merged_with("first", &["a.docx", "b.docx"], StyleMode::First);
-    assert_eq!(report.renames, []);
+    assert!(report.renames.iter().all(|r| r.kind != "style"));
     let doc = text(&parts, "word/document.xml");
     let b = &doc[doc.find("Title of B").unwrap()..];
     assert!(b.contains(r#"<w:pStyle w:val="ClauseText"/>"#));
@@ -561,4 +557,203 @@ fn a_base_with_no_settings_gets_them_for_even_headers() {
     let (_, parts) = merge_files(&dir, &[a, b]);
     assert!(text(&parts, "word/settings.xml").contains("<w:evenAndOddHeaders/>"));
     assert!(text(&parts, "word/_rels/document.xml.rels").contains("settings.xml"));
+}
+
+#[test]
+fn a_clashing_bookmark_is_renamed_with_what_points_to_it() {
+    let (report, parts) = merged("bookmark-rename", &["a.docx", "b.docx"]);
+    let doc = text(&parts, "word/document.xml");
+    let names = values(&doc, "w:bookmarkStart", "w:name");
+    assert!(names.contains(&"Intro".to_string()), "{names:?}");
+    assert!(names.contains(&"Intro_2".to_string()), "{names:?}");
+    let b = &doc[doc.find("Title of B").unwrap()..];
+    assert!(
+        b.contains(" REF Intro_2 "),
+        "b's field follows its bookmark"
+    );
+    assert!(!b.contains(" REF Intro "));
+    let renamed = report
+        .renames
+        .iter()
+        .find(|r| r.kind == "bookmark")
+        .unwrap();
+    assert_eq!(
+        (renamed.input, &*renamed.from, &*renamed.to),
+        (2, "Intro", "Intro_2")
+    );
+    let a = &doc[..doc.find("Title of B").unwrap()];
+    assert!(!a.contains("Intro_2"));
+}
+
+#[test]
+fn the_same_file_twice_gets_toc_marks_of_its_own() {
+    let (report, parts) = merged("twice", &["a.docx", "a.docx"]);
+    let doc = text(&parts, "word/document.xml");
+    let names = values(&doc, "w:bookmarkStart", "w:name");
+    let unique: std::collections::HashSet<_> = names.iter().map(|n| n.to_lowercase()).collect();
+    assert_eq!(unique.len(), names.len(), "{names:?}");
+    let toc = report
+        .renames
+        .iter()
+        .find(|r| r.from.starts_with("_Toc"))
+        .unwrap();
+    assert_eq!(toc.to, format!("{}_2", toc.from));
+    assert!(doc.contains(&format!(" PAGEREF {} ", toc.to)));
+}
+
+/// A body of `n` paragraphs, each with a bookmark, a control, a drawing and a tracked insert.
+fn busy_body(n: usize) -> String {
+    (0..n)
+        .map(|i| {
+            format!(
+                r#"<w:p w14:paraId="0000{i:04X}"><w:bookmarkStart w:id="{i}" w:name="Mark{i}"/><w:bookmarkEnd w:id="{i}"/><w:ins w:id="{i}"/><w:permStart w:id="{i}"/><w:permEnd w:id="{i}"/><w:sdt><w:sdtPr><w:id w:val="{i}"/></w:sdtPr></w:sdt><w:r><w:drawing><wp:inline><wp:docPr id="{i}" name="x"/></wp:inline></w:drawing></w:r></w:p>"#
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_thousand_equal_bookmarks_and_every_pool_stay_unique() {
+    let dir = temp_dir("pools");
+    let body = busy_body(1000);
+    let a = word_file(&dir, "a.docx", &body, &[]);
+    let b = word_file(&dir, "b.docx", &body, &[]);
+    let (report, parts) = merge_files(&dir, &[a, b]);
+    let doc = text(&parts, "word/document.xml");
+    for (element, attr, n) in [
+        ("w:bookmarkStart", "w:id", 2000),
+        ("w:bookmarkStart", "w:name", 2000),
+        ("w:ins", "w:id", 2000),
+        ("w:permStart", "w:id", 2000),
+        ("w:id", "w:val", 2000),
+        ("wp:docPr", "id", 2000),
+    ] {
+        let found = values(&doc, element, attr);
+        let unique: std::collections::HashSet<_> = found.iter().collect();
+        assert_eq!((found.len(), unique.len()), (n, n), "{element} {attr}");
+    }
+    let mut starts = values(&doc, "w:bookmarkStart", "w:id");
+    let mut ends = values(&doc, "w:bookmarkEnd", "w:id");
+    starts.sort();
+    ends.sort();
+    assert_eq!(starts, ends);
+    assert_eq!(report.renames.len(), 1000);
+    assert!(doc.contains(r#"w:name="Mark999_2""#));
+    let paras = values(&doc, "w:p", "w14:paraId");
+    let unique: std::collections::HashSet<_> = paras.iter().collect();
+    assert_eq!(unique.len(), 2000, "repeated paragraph ids changed");
+}
+
+#[test]
+fn a_drawing_id_at_the_top_leaves_room_below() {
+    let dir = temp_dir("top-id");
+    let drawing = |id: u32| {
+        format!(
+            r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr id="{id}" name="x"/></wp:inline></w:drawing></w:r></w:p>"#
+        )
+    };
+    let a = word_file(&dir, "a.docx", &drawing(2_147_483_646), &[]);
+    let b = word_file(&dir, "b.docx", &drawing(7), &[]);
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    let ids = values(&text(&parts, "word/document.xml"), "wp:docPr", "id");
+    assert_eq!(ids, ["2147483646", "1"]);
+}
+
+#[test]
+fn ids_in_the_bases_headers_and_notes_count() {
+    let dir = temp_dir("story-ids");
+    let header = format!(
+        r#"<w:hdr xmlns:w="{WORD_NS}"><w:p><w:bookmarkStart w:id="40" w:name="Head"/><w:bookmarkEnd w:id="40"/></w:p></w:hdr>"#
+    );
+    let sect = r#"<w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+    let a = word_file(
+        &dir,
+        "a.docx",
+        &format!("<w:p/>{sect}"),
+        &[("word/header1.xml", "header", &header)],
+    );
+    let b = word_file(
+        &dir,
+        "b.docx",
+        r#"<w:p><w:bookmarkStart w:id="40" w:name="Head"/><w:bookmarkEnd w:id="40"/></w:p>"#,
+        &[],
+    );
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    let doc = text(&parts, "word/document.xml");
+    assert_eq!(values(&doc, "w:bookmarkStart", "w:id"), ["41"]);
+    assert_eq!(values(&doc, "w:bookmarkStart", "w:name"), ["Head_2"]);
+}
+
+#[test]
+fn the_last_edit_mark_of_an_appended_document_goes() {
+    let dir = temp_dir("go-back");
+    let mark = r#"<w:p><w:bookmarkStart w:id="1" w:name="_GoBack"/><w:bookmarkEnd w:id="1"/><w:bookmarkStart w:id="2" w:name="Stays"/><w:bookmarkEnd w:id="2"/></w:p>"#;
+    let a = word_file(&dir, "a.docx", mark, &[]);
+    let b = word_file(&dir, "b.docx", &mark.replace("Stays", "Other"), &[]);
+    let (report, parts) = merge_files(&dir, &[a, b]);
+    let doc = text(&parts, "word/document.xml");
+    assert_eq!(
+        values(&doc, "w:bookmarkStart", "w:name"),
+        ["_GoBack", "Stays", "Other"]
+    );
+    assert_eq!(count(&doc, "<w:bookmarkEnd "), 3);
+    assert!(report.renames.is_empty());
+}
+
+#[test]
+fn links_and_split_fields_follow_a_renamed_bookmark() {
+    let dir = temp_dir("field-kinds");
+    let mark = r#"<w:bookmarkStart w:id="1" w:name="Note"/><w:bookmarkEnd w:id="1"/>"#;
+    let body = format!(
+        r#"<w:p>{mark}<w:hyperlink w:anchor="note"><w:r><w:t>x</w:t></w:r></w:hyperlink><w:fldSimple w:instr=" PAGEREF Note "/><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> RE</w:instrText></w:r><w:r><w:instrText>F No</w:instrText></w:r><w:r><w:instrText xml:space="preserve">te \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#
+    );
+    let a = word_file(&dir, "a.docx", mark_paragraph(mark).as_str(), &[]);
+    let b = word_file(&dir, "b.docx", &body, &[]);
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    let doc = text(&parts, "word/document.xml");
+    assert!(doc.contains(r#"w:anchor="Note_2""#));
+    assert!(doc.contains(r#"w:instr=" PAGEREF Note_2 ""#));
+    assert!(doc.contains(r#"<w:instrText xml:space="preserve"> REF Note_2 \h </w:instrText>"#));
+}
+
+fn mark_paragraph(mark: &str) -> String {
+    format!("<w:p>{mark}</w:p>")
+}
+
+#[test]
+fn a_twin_shares_no_bookmark_or_drawing_id_with_its_part() {
+    let dir = temp_dir("twin-ids");
+    let header = format!(
+        r#"<w:hdr xmlns:w="{WORD_NS}" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:p><w:bookmarkStart w:id="1" w:name="Head"/><w:bookmarkEnd w:id="1"/><w:r><w:drawing><wp:inline><wp:docPr id="3" name="x"/></wp:inline></w:drawing></w:r></w:p></w:hdr>"#
+    );
+    let sect = r#"<w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+    let a = word_file(
+        &dir,
+        "a.docx",
+        &format!("<w:p/>{sect}"),
+        &[("word/header1.xml", "header", &header)],
+    );
+    let settings =
+        format!(r#"<w:settings xmlns:w="{WORD_NS}"><w:evenAndOddHeaders/></w:settings>"#);
+    let b = word_file(
+        &dir,
+        "b.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &settings)],
+    );
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    let mut drawings = vec![];
+    let mut marks = 0;
+    for (name, xml) in parts.iter().filter(|p| p.0.starts_with("word/header")) {
+        let xml = String::from_utf8_lossy(xml);
+        drawings.extend(values(&xml, "wp:docPr", "id"));
+        marks += count(&xml, "<w:bookmarkStart ");
+        assert_eq!(
+            count(&xml, "<w:bookmarkStart "),
+            count(&xml, "<w:bookmarkEnd "),
+            "{name}"
+        );
+    }
+    assert_eq!(drawings, ["3", "4"]);
+    assert_eq!(marks, 1);
 }

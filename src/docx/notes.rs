@@ -2,9 +2,9 @@
 //! new ids, and relationships inside them move into that part's relationships. The separator
 //! notes stay the base's.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::{Held, Parts, Rewrite, W, copy_rel, held, registry, scan, story};
+use super::{Held, Parts, Rewrite, Uses, W, copy_rel, held, ids, registry, scan, story};
 use crate::Origin;
 use crate::error::Error;
 use crate::package::{Package, Rel};
@@ -32,6 +32,8 @@ pub struct Notes {
     added: String,
     /// Whether an appended part stands in for one the base lacks, separators included.
     adopted: bool,
+    /// Paragraph ids in the part.
+    paras: HashSet<u32>,
 }
 
 fn number(n: &xml::Node) -> i64 {
@@ -63,7 +65,18 @@ impl Notes {
             next: highest.map_or(first, |m| first.max(m + 1)),
             added: String::new(),
             adopted: false,
+            paras: HashSet::new(),
         })
+    }
+
+    /// What the base's part uses.
+    pub fn scan_base(&mut self, origin: &Origin) -> Result<Uses, Error> {
+        let Some(h) = &self.base else {
+            return Ok(Uses::default());
+        };
+        let uses = scan(&h.text, &h.part, origin, false)?;
+        self.paras = uses.paras.iter().copied().collect();
+        Ok(uses)
     }
 
     /// Adds input `i`'s items; returns their old to new ids.
@@ -78,7 +91,9 @@ impl Notes {
         let origin = inputs[i].origin.clone();
         let own = inputs[i].rels_of(&doc.part)?;
         let mut rids = HashMap::new();
-        for id in scan(&doc.text, &doc.part, &origin, false)?.rids {
+        let uses = scan(&doc.text, &doc.part, &origin, false)?;
+        rw.paras = ids::new_values(i + 1, &uses.paras, &mut self.paras);
+        for id in uses.rids {
             let Some(r) = own.iter().find(|r| r.id == id) else {
                 let why = format!("{} points to a missing relationship {id}", doc.part);
                 return Err(origin.bad(&why));
@@ -89,6 +104,7 @@ impl Notes {
         let body_rids = rw.rids.replace(rids);
         let text = story(&doc.text, &doc.part, &origin, rw);
         rw.rids = body_rids;
+        rw.paras.clear();
         let text = String::from_utf8(text?).map_err(|e| Error::internal(&e.to_string()))?;
         let tree = xml::tree(&text, &doc.part, &origin)?;
         let local = self.root.merge(&tree.attrs);

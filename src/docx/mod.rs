@@ -4,12 +4,15 @@
 //! relationship ids.
 
 mod headers;
+mod ids;
 mod notes;
 mod numbering;
 mod styles;
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
+use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
 
@@ -19,6 +22,7 @@ use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
 use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, start_tag, written};
 use crate::{Origin, Rename, StyleMode};
 use headers::Slot;
+use ids::{Field, Ids, Local, Tally};
 use notes::{KINDS, Notes};
 use numbering::Lists;
 use styles::{Sheet, Source, Theme};
@@ -103,7 +107,11 @@ struct Merger<'a> {
     num_rels: Rels,
     num_rels_before: usize,
     out_lists: numbering::Output,
-    next_bookmark: u64,
+    ids: Rc<RefCell<Ids>>,
+    /// Bookmark names in the output, in lower case.
+    bookmarks: HashSet<String>,
+    /// Paragraph ids of the main part.
+    paras: HashSet<u32>,
     notes: Vec<Notes>,
     root: Prefixes,
     docs: Vec<Rewrite>,
@@ -156,7 +164,9 @@ impl<'a> Merger<'a> {
             out_lists: numbering::Output::new(Lists::new(base_numbering.as_ref().map(|h| &h.tree))),
             base_styles,
             base_numbering,
-            next_bookmark: 0,
+            ids: Rc::default(),
+            bookmarks: HashSet::new(),
+            paras: HashSet::new(),
             notes,
             root: Prefixes::default(),
             docs: vec![],
@@ -180,18 +190,25 @@ impl<'a> Merger<'a> {
         let main = self.main.clone();
         let twins = self.needs_twins(0);
         let text = self.inputs[0].text(&main, MAX_STREAMED)?;
-        let uses = scan(&text, &main, &origin, twins)?;
+        let mut uses = scan(&text, &main, &origin, twins)?;
         drop(text);
         self.sections.push(uses.sections);
-        self.next_bookmark = uses.bookmarks + 1;
+        self.paras = uses.paras.iter().copied().collect();
+        let own = self.inputs[0].rels_of(&main)?;
+        self.stories(0, &own, &mut uses)?;
+        for n in &mut self.notes {
+            uses.add(n.scan_base(&origin)?);
+        }
+        self.ids = Rc::new(RefCell::new(Ids::base(&uses.tally)));
+        self.bookmarks = uses.names.iter().map(|n| n.to_lowercase()).collect();
         self.root = Prefixes::of(&uses.root);
         let mut rw = Rewrite {
             w: prefix_of(&uses.root, W).unwrap_or("w").to_string(),
             r: prefix_of(&uses.root, R).map(String::from),
+            ids: self.ids.clone(),
             ..Rewrite::default()
         };
         if twins {
-            let own = self.inputs[0].rels_of(&main)?;
             self.add_twins(0, &own, &uses, &mut rw)?;
         }
         self.docs.push(rw);
@@ -205,6 +222,9 @@ impl<'a> Merger<'a> {
         let mut stories = vec![];
         for id in &uses.rids.clone() {
             let Some(r) = own.iter().find(|r| &r.id == id) else {
+                if i == 0 {
+                    continue;
+                }
                 return Err(origin.bad(&format!("{part} points to a missing relationship {id}")));
             };
             if r.external || ![format!("{REL}header"), format!("{REL}footer")].contains(&r.kind) {
@@ -230,6 +250,7 @@ impl<'a> Merger<'a> {
         let mut uses = scan(&text, &part, &origin, twins)?;
         drop(text);
         self.sections.push(uses.sections);
+        let body_paras = std::mem::take(&mut uses.paras);
         let own = self.inputs[i].rels_of(&part)?;
         let stories = self.stories(i, &own, &mut uses)?;
         let mut doc_notes = vec![];
@@ -310,9 +331,20 @@ impl<'a> Merger<'a> {
         let copied = self
             .out_lists
             .copy(&lists, &uses.nums, i + 1, &mut bullet)?;
+        uses.names
+            .retain(|n| !n.eq_ignore_ascii_case(ids::HIDDEN_BOOKMARK));
+        let (names, renamed) = ids::rename_bookmarks(&uses.names, i + 1, &mut self.bookmarks);
+        self.renames
+            .extend(renamed.into_iter().map(|(from, to)| Rename {
+                input: i + 1,
+                kind: "bookmark",
+                from,
+                to,
+            }));
         let mut rw = Rewrite {
             nums: copied.nums,
-            bookmarks: self.next_bookmark,
+            names,
+            ids: self.ids.clone(),
             bare_p: bare("paragraph", &self.base_p),
             bare_table: bare("table", &self.base_table),
             theme: doc_theme,
@@ -323,7 +355,6 @@ impl<'a> Merger<'a> {
             appended: true,
             ..Rewrite::default()
         };
-        self.next_bookmark += uses.bookmarks + 1;
         let local = self
             .style_root
             .merge(doc_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
@@ -359,6 +390,7 @@ impl<'a> Merger<'a> {
             self.add_twins(i, &own, &uses, &mut rw)?;
         }
         self.fill_slots(&uses, &mut rw, twins);
+        rw.paras = ids::new_values(i + 1, &body_paras, &mut self.paras);
         self.docs.push(rw);
         Ok(())
     }
@@ -599,8 +631,9 @@ fn story(text: &str, part: &str, origin: &Origin, rw: &Rewrite) -> Result<Vec<u8
                 let empty = matches!(event, Event::Empty(_));
                 element(&mut r, e, empty, rw, &mut walk, Place::Inner, &mut buf)?;
             }
-            Event::End(_) => {
+            Event::End(e) => {
                 walk.bare.end(rw, &mut buf);
+                walk.closing(e.local_name().as_ref(), rw, &mut buf);
                 put(&mut buf, &event);
             }
             _ => put(&mut buf, &event),
@@ -688,8 +721,11 @@ struct Uses {
     styles: BTreeSet<String>,
     /// `w:numId`s, without 0, which means no list.
     nums: BTreeSet<String>,
-    /// The highest bookmark id.
-    bookmarks: u64,
+    /// Bookmark names, in the order first met.
+    names: Vec<String>,
+    tally: Tally,
+    /// `w14:paraId`s and `w14:textId`s of this part.
+    paras: BTreeSet<u32>,
     sections: usize,
     root: Vec<Attr>,
     /// Relationship ids of the default header and footer references of every section.
@@ -703,7 +739,8 @@ impl Uses {
     fn add(&mut self, other: Uses) {
         self.styles.extend(other.styles);
         self.nums.extend(other.nums);
-        self.bookmarks = self.bookmarks.max(other.bookmarks);
+        self.names.extend(other.names);
+        self.tally.add(other.tally);
     }
 }
 
@@ -776,10 +813,14 @@ fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Er
         }
         if r.element_ns(e) == W
             && e.local_name().as_ref() == "bookmarkStart"
-            && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "id")
+            && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "name")
         {
-            uses.bookmarks = uses.bookmarks.max(a.value.parse().unwrap_or(0));
+            uses.names.push(a.value.clone());
         }
+        uses.tally
+            .see(r.element_ns(e), e.local_name().as_ref(), &attrs);
+        uses.paras
+            .extend(attrs.iter().filter_map(ids::paragraph_id));
         let reference = headers::reference(r.element_ns(e), e.local_name().as_ref());
         if let Some(local) = reference.filter(|_| stack.last() == Some(&Tag::SectPr)) {
             let kind = attrs.iter().find(|a| a.ns == W && a.local == "type");
@@ -819,8 +860,14 @@ struct Rewrite {
     nums: HashMap<String, String>,
     /// Old to new note and comment ids, by [`KINDS`].
     notes: [HashMap<String, String>; 3],
-    /// What bookmark ids move up by, which keeps each start paired with its end.
-    bookmarks: u64,
+    /// The output's id pools.
+    ids: Rc<RefCell<Ids>>,
+    /// Old (lower case) to new bookmark names.
+    names: HashMap<String, String>,
+    /// Old to new paragraph ids of the part being written.
+    paras: HashMap<u32, u32>,
+    /// Set while writing a copy of a part already in the output, which brings no bookmarks.
+    copying: bool,
     /// Set when theme links come off this document's content.
     theme: Option<Theme>,
     /// The style for paragraphs and tables with none, when not the output's default.
@@ -874,14 +921,16 @@ impl Rewrite {
             changed |= *new != a.value;
             a.value = new.clone();
         }
-        if ns == W
-            && self.bookmarks > 0
-            && matches!(local, "bookmarkStart" | "bookmarkEnd")
-            && let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == "id")
-            && let Ok(id) = a.value.parse::<u64>()
-        {
-            a.value = (id + self.bookmarks).to_string();
-            changed = true;
+        if ns == W && !self.names.is_empty() {
+            changed |= self.rename_bookmark(local, attrs);
+        }
+        if !self.paras.is_empty() {
+            for a in attrs.iter_mut() {
+                if let Some(new) = ids::paragraph_id(a).and_then(|v| self.paras.get(&v)) {
+                    a.value = format!("{new:08X}");
+                    changed = true;
+                }
+            }
         }
         let notes = match local {
             "footnoteReference" => Some(&self.notes[0]),
@@ -905,6 +954,29 @@ impl Rewrite {
                 }
             }
         }
+        changed
+    }
+}
+
+impl Rewrite {
+    /// Renames a bookmark, or a link or simple field pointing to one; true when it did.
+    fn rename_bookmark(&self, local: &str, attrs: &mut [Attr]) -> bool {
+        let key = match local {
+            "bookmarkStart" => "name",
+            "hyperlink" => "anchor",
+            "fldSimple" => "instr",
+            _ => return false,
+        };
+        let Some(a) = attrs.iter_mut().find(|a| a.ns == W && a.local == key) else {
+            return false;
+        };
+        let new = if local == "fldSimple" {
+            ids::rename_in_field(&a.value, &self.names)
+        } else {
+            self.names.get(&a.value.to_lowercase()).cloned()
+        };
+        let changed = new.is_some();
+        a.value = new.unwrap_or_else(|| std::mem::take(&mut a.value));
         changed
     }
 }
@@ -1087,6 +1159,7 @@ fn body(
                 {
                     mark = Some(Mark::Insert(buf.len()));
                 }
+                walk.closing(e.local_name().as_ref(), rw, &mut buf);
                 put(&mut buf, &event);
                 if depth == b {
                     match mark {
@@ -1129,6 +1202,19 @@ struct Walk {
     bare: Bare,
     /// Whether the next section break is an appended document's first.
     first_sect: bool,
+    local: Local,
+    field: Field,
+}
+
+impl Walk {
+    /// Runs before an element's end is written.
+    fn closing(&mut self, local: &str, rw: &Rewrite, buf: &mut Vec<u8>) {
+        match local {
+            "instrText" | "delInstrText" => self.field.close(buf.len()),
+            "p" => self.field.settle(&rw.names, buf),
+            _ => {}
+        }
+    }
 }
 
 /// Gives paragraphs and tables with no style their document's default one, when that isn't the
@@ -1246,11 +1332,24 @@ fn element<'a>(
         }
         return Ok(true);
     }
-    if tag(ns, e.local_name().as_ref().as_bytes()) == Tag::SectPr {
+    let local = e.local_name();
+    let local: &str = local.as_ref();
+    if rw.appended
+        && ns == W
+        && matches!(local, "bookmarkStart" | "bookmarkEnd")
+        && walk.local.leaves_out(local, &r.attrs(e)?, rw.copying)
+    {
+        let depth = r.depth();
+        while !empty && r.depth() >= depth {
+            r.event()?;
+        }
+        return Ok(true);
+    }
+    if tag(ns, local.as_bytes()) == Tag::SectPr {
         headers::section(r, e, empty, rw, walk, place, buf)?;
         return Ok(true);
     }
-    start(r, e, empty, rw, place, &mut walk.bare, buf)?;
+    start(r, e, empty, rw, place, walk, buf)?;
     Ok(false)
 }
 
@@ -1261,7 +1360,7 @@ fn start<'a>(
     empty: bool,
     rw: &Rewrite,
     place: Place,
-    bare: &mut Bare,
+    walk: &mut Walk,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     let event = if empty {
@@ -1275,11 +1374,19 @@ fn start<'a>(
     }
     let (ns, local) = (r.element_ns(e), e.local_name());
     let local: &str = local.as_ref();
-    if bare.before(rw, (ns, local), empty, buf) {
+    if walk.bare.before(rw, (ns, local), empty, buf) {
         return Ok(());
     }
     let mut attrs = r.attrs(e)?;
     let mut changed = rw.attrs(ns, local, &mut attrs);
+    if let Some(slot) = ids::slot(ns, local) {
+        changed |= walk
+            .local
+            .renumber(&mut rw.ids.borrow_mut(), &slot, &mut attrs);
+    }
+    if ns == W && local == "fldChar" {
+        walk.field.settle(&rw.names, buf);
+    }
     if place == Place::Top && !rw.local.is_empty() {
         attrs.extend(rw.local.iter().cloned());
         changed = true;
@@ -1305,10 +1412,13 @@ fn start<'a>(
         put(buf, &event);
     }
     if opened {
-        bare.make(rw, Block::P, buf);
+        walk.bare.make(rw, Block::P, buf);
         buf.extend(format!("</{}>", e.name().as_ref()).as_bytes());
     } else if !empty && let Some(b) = block {
-        bare.open = Some((b, false));
+        walk.bare.open = Some((b, false));
+    }
+    if !empty && ns == W && matches!(local, "instrText" | "delInstrText") {
+        walk.field.open(buf.len());
     }
     Ok(())
 }
