@@ -487,6 +487,33 @@ impl Node {
         self.nodes_mut().find(|n| n.is(ns, local))
     }
 
+    /// The child `local`, added after the last of the children named in `after` when missing.
+    pub fn child_or_insert(&mut self, ns: &str, local: &str, after: &[&str]) -> &mut Node {
+        let is_child = |c: &Child, matches: &dyn Fn(&Node) -> bool| match c {
+            Child::Node(n) => matches(n),
+            Child::Text(_) => false,
+        };
+        let found = self
+            .children
+            .iter()
+            .position(|c| is_child(c, &|n| n.is(ns, local)));
+        let at = found.unwrap_or_else(|| {
+            let last = self
+                .children
+                .iter()
+                .rposition(|c| is_child(c, &|n| n.ns == ns && after.contains(&n.local.as_str())));
+            let at = last.map_or(0, |i| i + 1);
+            let prefix = &self.name[..self.name.len() - self.local.len()];
+            let node = Node::new(&format!("{prefix}{local}"), ns, vec![]);
+            self.children.insert(at, Child::Node(node));
+            at
+        });
+        match &mut self.children[at] {
+            Child::Node(n) => n,
+            Child::Text(_) => unreachable!(),
+        }
+    }
+
     pub fn attr(&self, ns: &str, local: &str) -> Option<&str> {
         self.attrs
             .iter()
@@ -494,7 +521,7 @@ impl Node {
             .map(|a| a.value.as_str())
     }
 
-    /// Sets an attribute, adding it as `prefix:local` when it is missing.
+    /// Sets an attribute, adding it as `prefix:local` (or `local`) when it is missing.
     pub fn set_attr(&mut self, ns: &str, prefix: &str, local: &str, value: &str) {
         match self
             .attrs
@@ -502,6 +529,7 @@ impl Node {
             .find(|a| a.ns == ns && a.local == local)
         {
             Some(a) => a.value = value.into(),
+            None if prefix.is_empty() => self.attrs.push(Attr::new(local, ns, value)),
             None => self
                 .attrs
                 .push(Attr::new(&format!("{prefix}:{local}"), ns, value)),

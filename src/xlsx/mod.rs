@@ -2,6 +2,7 @@
 //! formulas rewritten, under names that stay unique.
 
 pub mod a1;
+mod styles;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,7 @@ use crate::{Origin, Rename, SheetName};
 pub const S: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
 const SML: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.";
+const DECLARATION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n";
 const XM: &str = "http://schemas.microsoft.com/office/excel/2006/main";
 const MAX_SHEETS: usize = 10_000;
 const NAME_ROUNDS: usize = 8;
@@ -67,6 +69,13 @@ struct Sheet {
     node: Node,
 }
 
+/// A part read whole.
+struct Held {
+    part: String,
+    text: String,
+    tree: Node,
+}
+
 /// A workbook's main part and what it lists.
 struct Book {
     part: String,
@@ -112,6 +121,16 @@ impl Book {
             rels,
             sheets,
         })
+    }
+
+    /// A part this workbook relates to, read whole.
+    fn held(&self, pkg: &mut Package, kind: &str) -> Result<Option<Held>, Error> {
+        let Some(part) = self.related(pkg, kind)? else {
+            return Ok(None);
+        };
+        let text = pkg.text(&part, MAX_PARSED)?;
+        let tree = xml::tree(&text, &part, &pkg.origin)?;
+        Ok(Some(Held { part, text, tree }))
     }
 
     /// The part this workbook relates to by a relationship type.
@@ -317,7 +336,7 @@ impl SharedStrings {
             root[0].local.clear();
             set(&mut root);
             let text = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n{}{}</sst>",
+                "{DECLARATION}{}{}</sst>",
                 start_tag("sst", &root, false),
                 self.added
             );
@@ -370,6 +389,8 @@ struct Output {
     used: HashMap<String, Option<String>>,
     next_table_id: u64,
     links: u32,
+    styles: styles::Output,
+    base_styles: Option<Held>,
 }
 
 /// A table part as read.
@@ -450,30 +471,6 @@ fn unreadable(origin: &Origin, place: &str) -> Error {
     Error::unsupported_variant(&origin.name, &variant).at(origin.input)
 }
 
-/// The element `local` of a workbook, added after the last of the elements `after` when it
-/// is missing.
-fn list_element<'t>(tree: &'t mut Node, local: &str, after: &[&str]) -> &'t mut Node {
-    let at = tree.children.iter().position(|c| match c {
-        xml::Child::Node(n) => n.is(S, local),
-        _ => false,
-    });
-    let at = at.unwrap_or_else(|| {
-        let last = tree.children.iter().rposition(|c| match c {
-            xml::Child::Node(n) => n.ns == S && after.contains(&n.local.as_str()),
-            _ => false,
-        });
-        let at = last.map_or(tree.children.len(), |i| i + 1);
-        let name = format!("{}{local}", prefix(tree));
-        let node = Node::new(&name, S, vec![]);
-        tree.children.insert(at, xml::Child::Node(node));
-        at
-    });
-    match &mut tree.children[at] {
-        xml::Child::Node(n) => n,
-        _ => unreachable!(),
-    }
-}
-
 impl Output {
     fn new(book: Book, pkg: &mut Package) -> Result<Self, Error> {
         let mut names = SheetNames::default();
@@ -496,6 +493,7 @@ impl Output {
             .child(S, "externalReferences")
             .map_or(0, |n| n.nodes().count());
         let strings = SharedStrings::new(pkg, book.related(pkg, "sharedStrings")?)?;
+        let base_styles = book.held(pkg, "styles")?;
         let mut used = HashMap::new();
         for d in defined_names(&book, &pkg.origin)? {
             if d.sheet.is_none() {
@@ -518,6 +516,8 @@ impl Output {
             used,
             next_table_id,
             links: links as u32,
+            styles: styles::Output::new(base_styles.as_ref().map(|h| h.tree.clone())),
+            base_styles,
             book,
         })
     }
@@ -629,7 +629,10 @@ impl Output {
             let new = self.rels.add(&r.kind, relative(&main, &part), false);
             let node = self.with_id(node.clone(), "externalReference", &new);
             let after = ["sheets", "functionGroups"];
-            let list = list_element(&mut self.book.tree, "externalReferences", &after);
+            let list = self
+                .book
+                .tree
+                .child_or_insert(S, "externalReferences", &after);
             list.children.push(xml::Child::Node(node));
             self.links += 1;
         }
@@ -693,7 +696,7 @@ impl Output {
         let added = self.settle_names(&tables, &names, &mut found, i + 1)?;
         if !added.is_empty() {
             let after = ["sheets", "functionGroups", "externalReferences"];
-            let list = list_element(&mut self.book.tree, "definedNames", &after);
+            let list = self.book.tree.child_or_insert(S, "definedNames", &after);
             let own = prefix(list).to_string();
             list.children.extend(added.into_iter().map(|mut n| {
                 n.name = format!("{own}definedName");
@@ -707,9 +710,13 @@ impl Output {
             }
             None => vec![],
         };
+        let sheet = book.held(&mut inputs[i], "styles")?;
+        let sheet = sheet.as_ref().map(|h| &h.tree);
+        let styles = self.styles.add(sheet, &origin, &mut found.list)?;
         renames.append(&mut found.list);
         let maps = Rc::new(Maps {
             strings,
+            styles,
             views: self.views,
             renames: found.renames,
             locals: found.locals,
@@ -769,22 +776,50 @@ impl Output {
             tree.set_attr("", "", "displayName", new);
         }
         let none = HashSet::new();
-        let mut failed = false;
+        let mut unreadable_formula = false;
+        let mut bad_format = None;
         tree.walk_mut(&mut |n| {
-            if n.ns == S
-                && ["calculatedColumnFormula", "totalsRowFormula"].contains(&n.local.as_str())
-            {
+            if n.ns != S {
+                return;
+            }
+            if ["calculatedColumnFormula", "totalsRowFormula"].contains(&n.local.as_str()) {
                 match maps.renames.rewrite(&n.text(), &none) {
                     Some(f) => {
                         let f = f.into_owned();
                         n.children = vec![xml::Child::Text(f)];
                     }
-                    None => failed = true,
+                    None => unreadable_formula = true,
                 }
             }
+            for a in &mut n.attrs {
+                if a.ns.is_empty() && (a.local == "dxfId" || a.local.ends_with("DxfId")) {
+                    match a
+                        .value
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| maps.styles.dxfs.get(i))
+                    {
+                        Some(new) => a.value = new.to_string(),
+                        None => bad_format = Some(a.value.clone()),
+                    }
+                }
+            }
+            if n.local == "tableStyleInfo"
+                && let Some(new) = n
+                    .attr("", "name")
+                    .and_then(|s| maps.styles.table_styles.get(s))
+            {
+                let new = new.clone();
+                n.set_attr("", "", "name", &new);
+            }
         });
-        if failed {
+        if unreadable_formula {
             return Err(unreadable(origin, &format!("table {name}")));
+        }
+        if let Some(id) = bad_format {
+            return Err(origin.bad(&format!(
+                "table {name} uses format {id}, which isn't defined"
+            )));
         }
         let mut out = declaration(&text);
         tree.write(&mut out);
@@ -796,9 +831,25 @@ impl Output {
             book,
             mut rels,
             strings,
+            styles,
+            base_styles,
             ..
         } = self;
         strings.finish(plan, &mut rels, &book.part, &base.origin)?;
+        if let Some(sheet) = styles.finish() {
+            let head = base_styles.as_ref().map(|h| declaration(&h.text));
+            let mut text = head.unwrap_or(DECLARATION.to_string());
+            sheet.write(&mut text);
+            match base_styles {
+                Some(h) => plan.replace(&h.part, Body::Data(text.into_bytes())),
+                None => {
+                    let part = plan.claim("xl/styles.xml");
+                    plan.type_part(&part, &format!("{SML}styles+xml"), false);
+                    rels.add(&format!("{REL}styles"), relative(&book.part, &part), false);
+                    plan.add(part, Body::Data(text.into_bytes()), None);
+                }
+            }
+        }
         let mut text = declaration(&book.text);
         book.tree.write(&mut text);
         plan.replace(&book.part, Body::Data(text.into_bytes()));
@@ -842,6 +893,7 @@ impl Found {
 struct Maps {
     /// Shared-string indices.
     strings: Vec<u32>,
+    styles: styles::Map,
     views: usize,
     renames: a1::Renames,
     /// Per sheet, the lower-case names of its sheet-scope names.
@@ -876,15 +928,40 @@ impl Patcher<'_> {
     }
 }
 
-/// Whether a cell holds a shared string.
-fn is_string_cell(r: &Reader, e: &BytesStart) -> Result<bool, Error> {
+/// `e`'s start tag as written, with the attribute `name` set to `value`.
+fn with_attr(
+    r: &Reader,
+    e: &BytesStart,
+    empty: bool,
+    name: &str,
+    value: &str,
+) -> Result<String, Error> {
+    let mut s = format!("<{}", e.name().as_ref());
+    let mut set = false;
     for a in e.attributes() {
         let a = a.map_err(|e| r.malformed(&e.to_string()))?;
-        if a.key.as_ref() == "t" {
-            return Ok(a.value == "s");
+        let key: &str = a.key.as_ref();
+        let mine = key == name;
+        set |= mine;
+        let kept = if mine { value } else { &a.value };
+        s += &format!(" {key}=\"{}\"", kept.replace('"', "&quot;"));
+    }
+    if !set {
+        s += &format!(" {name}=\"{value}\"");
+    }
+    s += if empty { "/>" } else { ">" };
+    Ok(s)
+}
+
+/// A number attribute of `e`, when it has it.
+fn number(r: &Reader, e: &BytesStart, name: &str) -> Result<Option<u32>, Error> {
+    for a in e.attributes() {
+        let a = a.map_err(|e| r.malformed(&e.to_string()))?;
+        if a.key.as_ref() == name {
+            return Ok(a.value.parse().ok());
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// One appended sheet on its way out.
@@ -913,6 +990,9 @@ impl SheetJob<'_> {
         };
         let mut cell = None;
         let mut string_cell = false;
+        let bad_format = |n: u32, place: String| {
+            origin.bad(&format!("{place} uses format {n}, which isn't defined"))
+        };
         let place = |cell: &Option<BytesStart>| {
             let at = cell.as_ref().and_then(|c| c.try_get_attribute("r").ok()?);
             match at {
@@ -933,8 +1013,45 @@ impl SheetJob<'_> {
             let empty = matches!(event, Event::Empty(_));
             match e.local_name().as_ref() {
                 "c" if r.element_ns(e) == S => {
-                    string_cell = is_string_cell(&r, e)?;
                     cell = Some(e.clone());
+                    string_cell = false;
+                    let mut style = 0;
+                    for a in e.attributes() {
+                        let a = a.map_err(|e| r.malformed(&e.to_string()))?;
+                        match a.key.as_ref() {
+                            "t" => string_cell = a.value == "s",
+                            "s" => style = a.value.parse().unwrap_or(u32::MAX),
+                            _ => {}
+                        }
+                    }
+                    let Some(new) = maps.styles.xf(style) else {
+                        return Err(bad_format(style, place(&cell)));
+                    };
+                    if new != style {
+                        let tag = with_attr(&r, e, empty, "s", &new.to_string())?;
+                        p.replace(start..end, &tag)?;
+                    }
+                }
+                local @ ("row" | "col") if r.element_ns(e) == S => {
+                    let name = if local == "row" { "s" } else { "style" };
+                    if let Some(style) = number(&r, e, name)? {
+                        let Some(new) = maps.styles.xf(style) else {
+                            return Err(bad_format(style, self.name.to_string()));
+                        };
+                        if new != style {
+                            let tag = with_attr(&r, e, empty, name, &new.to_string())?;
+                            p.replace(start..end, &tag)?;
+                        }
+                    }
+                }
+                "cfRule" | "sortCondition" | "colorFilter" if r.element_ns(e) == S => {
+                    if let Some(dxf) = number(&r, e, "dxfId")? {
+                        let Some(new) = maps.styles.dxfs.get(dxf as usize) else {
+                            return Err(bad_format(dxf, self.name.to_string()));
+                        };
+                        let tag = with_attr(&r, e, empty, "dxfId", &new.to_string())?;
+                        p.replace(start..end, &tag)?;
+                    }
                 }
                 "v" if string_cell && !empty && r.element_ns(e) == S => {
                     let (value, span) = r.element_text()?;

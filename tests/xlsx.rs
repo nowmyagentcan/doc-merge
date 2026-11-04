@@ -490,3 +490,321 @@ fn a_formula_that_can_t_be_read_is_refused_by_cell() {
         "nothing written"
     );
 }
+
+/// Gives a workbook the style sheet with `lists` inside it.
+fn with_styles(parts: &mut Vec<(String, Vec<u8>)>, lists: &str) {
+    let sheet = format!(r#"<styleSheet {SML_NS}>{lists}</styleSheet>"#);
+    set(parts, "xl/styles.xml", sheet.as_bytes());
+    let types = text(parts, "[Content_Types].xml").replace(
+        "</Types>",
+        &format!(r#"<Override PartName="/xl/styles.xml" ContentType="{SML}styles+xml"/></Types>"#),
+    );
+    set(parts, "[Content_Types].xml", types.as_bytes());
+    let rels = text(parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        &format!(
+            r#"<Relationship Id="rId80" Type="{REL}styles" Target="styles.xml"/></Relationships>"#
+        ),
+    );
+    set(parts, "xl/_rels/workbook.xml.rels", rels.as_bytes());
+}
+
+const FONTS_A: &str = r#"<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>"#;
+const FILLS: &str = r#"<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>"#;
+const BORDERS: &str =
+    r#"<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>"#;
+
+/// Lists with a Calibri default and a custom format id 164 of code `code`.
+fn plain_styles(code: &str, more: &str) -> String {
+    format!(
+        r#"<numFmts count="1"><numFmt numFmtId="164" formatCode="{code}"/></numFmts>{FONTS_A}{FILLS}{BORDERS}<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="14" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>{more}"#
+    )
+}
+
+fn styled_pair(test: &str, a: &str, b: &str, cells: &str) -> (Report, Vec<(String, Vec<u8>)>) {
+    let dir = temp_dir(test);
+    let mut first = book(&[("A", "")], None);
+    with_styles(&mut first, a);
+    let mut second = book(&[("B", cells)], None);
+    with_styles(&mut second, b);
+    let paths = [
+        book_file(&dir, "a.xlsx", &first),
+        book_file(&dir, "b.xlsx", &second),
+    ];
+    merged_files(&format!("{test}-out"), &paths)
+}
+
+#[test]
+fn equal_styles_leave_the_style_sheet_alone() {
+    let lists = plain_styles("0.0", "");
+    let cells = r#"<row r="1" s="2" customFormat="1"><c r="A1" s="1"><v>1</v></c><c r="B1"><v>2</v></c></row>"#;
+    let (_, parts) = styled_pair("equal-styles", &lists, &lists, cells);
+    let sheet = text(&parts, "xl/styles.xml");
+    assert_eq!(
+        sheet,
+        format!(r#"<styleSheet {SML_NS}>{lists}</styleSheet>"#)
+    );
+    assert!(text(&parts, "xl/worksheets/sheet2.xml").contains(cells));
+}
+
+#[test]
+fn number_formats_with_a_taken_id_get_a_new_one() {
+    let a = plain_styles("0.0", "");
+    let b = plain_styles("0.00", "");
+    let cells = r#"<row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1" s="2"><v>2</v></c></row>"#;
+    let (_, parts) = styled_pair("formats", &a, &b, cells);
+    let sheet = text(&parts, "xl/styles.xml");
+    assert!(sheet.contains(r#"<numFmts count="2">"#), "{sheet}");
+    assert!(sheet.contains(r#"<numFmt numFmtId="165" formatCode="0.00"/>"#));
+    assert!(sheet.contains(r#"<cellXfs count="4">"#));
+    assert!(sheet.contains(r#"<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>"#));
+    let out = text(&parts, "xl/worksheets/sheet2.xml");
+    // Format 1 is new; format 2 equals the base's and keeps its index.
+    assert!(
+        out.contains(r#"<c r="A1" s="3"><v>1</v></c><c r="B1" s="2">"#),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_cell_with_no_format_keeps_the_appended_default() {
+    let a = plain_styles("0.0", "");
+    let b = plain_styles("0.0", "").replace("Calibri", "Arial");
+    let cells =
+        r#"<row r="1" s="0" customFormat="1"><c r="A1"><v>1</v></c><c r="B1" t="s" s="0"/></row>"#;
+    let (_, parts) = styled_pair("default", &a, &b, cells);
+    let sheet = text(&parts, "xl/styles.xml");
+    assert!(sheet.contains(r#"<fonts count="4">"#), "{sheet}");
+    assert!(sheet.contains(r#"<cellXfs count="6">"#), "{sheet}");
+    let out = text(&parts, "xl/worksheets/sheet2.xml");
+    assert!(
+        out.contains(r#"<row r="1" s="3" customFormat="1">"#),
+        "{out}"
+    );
+    assert!(out.contains(r#"<c r="A1" s="3"><v>1</v></c>"#), "{out}");
+    assert!(out.contains(r#"<c r="B1" t="s" s="3"/>"#), "{out}");
+}
+
+#[test]
+fn named_styles_match_or_come_along() {
+    let a = plain_styles("0.0", "").replace(
+        r#"<cellStyle name="Normal" xfId="0" builtinId="0"/>"#,
+        r#"<cellStyle name="Normal" xfId="0" builtinId="0"/><cellStyle name="Mine" xfId="0"/>"#,
+    );
+    let b = plain_styles("0.0", "")
+        .replace("Calibri", "Arial")
+        .replace(
+            r#"<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>"#,
+            r#"<cellStyleXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0"/><xf numFmtId="14" fontId="1" fillId="0" borderId="0"/></cellStyleXfs>"#,
+        )
+        .replace(
+            r#"<cellStyle name="Normal" xfId="0" builtinId="0"/>"#,
+            r#"<cellStyle name="Normal" xfId="0" builtinId="0"/><cellStyle name="MINE" xfId="1"/><cellStyle name="Theirs" xfId="2"/>"#,
+        )
+        .replace(
+            r#"<xf numFmtId="14" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>"#,
+            r#"<xf numFmtId="14" fontId="1" fillId="0" borderId="0" xfId="2" applyFont="1"/>"#,
+        );
+    let (_, parts) = styled_pair("named", &a, &b, "");
+    let sheet = text(&parts, "xl/styles.xml");
+    // Normal and Mine map to the base's style format; Theirs comes along with its own.
+    assert!(sheet.contains(r#"<cellStyleXfs count="2">"#), "{sheet}");
+    assert!(
+        sheet.contains(r#"<xf numFmtId="14" fontId="3" fillId="0" borderId="0"/></cellStyleXfs>"#)
+    );
+    assert!(sheet.contains(r#"<cellStyle name="Theirs" xfId="1"/></cellStyles>"#));
+    assert!(sheet.contains(r#"<cellStyles count="3">"#));
+    assert!(sheet.contains(
+        r#"<xf numFmtId="14" fontId="3" fillId="0" borderId="0" xfId="1" applyFont="1"/></cellXfs>"#
+    ));
+}
+
+#[test]
+fn every_dxf_id_follows_and_table_styles_keep_their_look() {
+    let dxf = |rgb: &str| {
+        format!(r#"<dxf><fill><patternFill><bgColor rgb="{rgb}"/></patternFill></fill></dxf>"#)
+    };
+    let style = |id: u32| {
+        format!(
+            r#"<tableStyles count="1"><tableStyle name="Mine" count="1"><tableStyleElement type="wholeTable" dxfId="{id}"/></tableStyle></tableStyles>"#
+        )
+    };
+    let a = plain_styles(
+        "0.0",
+        &format!(r#"<dxfs count="1">{}</dxfs>{}"#, dxf("FF111111"), style(0)),
+    );
+    let b = plain_styles(
+        "0.0",
+        &format!(
+            r#"<dxfs count="3">{}{}{}</dxfs>{}"#,
+            dxf("FF222222"),
+            dxf("FF111111"),
+            r#"<dxf><numFmt numFmtId="164" formatCode="0.000"/></dxf>"#,
+            style(0)
+        ),
+    );
+    let dir = temp_dir("dxf");
+    let mut first = book(&[("A", "")], None);
+    with_styles(&mut first, &a);
+    let mut second = book(&[("B", "")], None);
+    with_styles(&mut second, &b);
+    with_table(&mut second, "T");
+    let table = text(&second, "xl/tables/table1.xml")
+        .replace(
+            r#"ref="A1:A2">"#,
+            r#"ref="A1:A2" headerRowDxfId="1" dataDxfId="0">"#,
+        )
+        .replace(r#"name="X"/>"#, r#"name="X" totalsRowDxfId="0"/>"#)
+        .replace(
+            "</table>",
+            r#"<tableStyleInfo name="Mine" showRowStripes="1"/></table>"#,
+        );
+    set(&mut second, "xl/tables/table1.xml", table.as_bytes());
+    let sheet = text(&second, "xl/worksheets/sheet1.xml").replace(
+        "</sheetData>",
+        r#"</sheetData><autoFilter ref="A1:A9"><sortState ref="A1:A9"><sortCondition ref="A1:A9" dxfId="1"/></sortState></autoFilter><conditionalFormatting sqref="A1"><cfRule type="expression" dxfId="0" priority="1"><formula>A1&gt;1</formula></cfRule></conditionalFormatting>"#,
+    );
+    set(&mut second, "xl/worksheets/sheet1.xml", sheet.as_bytes());
+    let paths = [
+        book_file(&dir, "a.xlsx", &first),
+        book_file(&dir, "b.xlsx", &second),
+    ];
+    let (report, parts) = merged_files("dxf-out", &paths);
+    let out = text(&parts, "xl/styles.xml");
+    assert!(out.contains(r#"<dxfs count="3">"#), "{out}");
+    let renamed = report
+        .renames
+        .iter()
+        .find(|r| r.kind == "table_style")
+        .unwrap();
+    assert_eq!(
+        (renamed.from.as_str(), renamed.to.as_str()),
+        ("Mine", "Mine 2")
+    );
+    assert!(out.contains(r#"<tableStyle name="Mine 2" count="1"><tableStyleElement type="wholeTable" dxfId="1"/>"#), "{out}");
+    assert!(out.contains(r#"<tableStyles count="2">"#));
+    assert!(
+        out.contains(r#"<numFmt numFmtId="165" formatCode="0.000"/></dxf>"#),
+        "{out}"
+    );
+    let table = text(&parts, "xl/tables/table1.xml");
+    assert!(
+        table.contains(r#"headerRowDxfId="0" dataDxfId="1""#),
+        "{table}"
+    );
+    assert!(table.contains(r#"totalsRowDxfId="1""#), "{table}");
+    assert!(
+        table.contains(r#"<tableStyleInfo name="Mine 2""#),
+        "{table}"
+    );
+    let sheet = text(&parts, "xl/worksheets/sheet2.xml");
+    assert!(
+        sheet.contains(r#"<cfRule type="expression" dxfId="1" priority="1">"#),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains(r#"<sortCondition ref="A1:A9" dxfId="0"/>"#),
+        "{sheet}"
+    );
+}
+
+#[test]
+fn a_base_without_a_style_sheet_gets_one() {
+    let dir = temp_dir("no-styles");
+    let mut b = book(&[("B", r#"<row r="1"><c r="A1" s="2"/></row>"#)], None);
+    with_styles(&mut b, &plain_styles("0.0", ""));
+    let paths = [
+        book_file(&dir, "a.xlsx", &book(&[("A", "")], None)),
+        book_file(&dir, "b.xlsx", &b),
+    ];
+    let (_, parts) = merged_files("no-styles-out", &paths);
+    let sheet = text(&parts, "xl/styles.xml");
+    assert!(sheet.contains(r#"<cellXfs count="3">"#), "{sheet}");
+    let order: Vec<usize> = [
+        "<numFmts",
+        "<fonts",
+        "<fills",
+        "<borders",
+        "<cellStyleXfs",
+        "<cellXfs",
+        "<cellStyles",
+    ]
+    .iter()
+    .map(|l| sheet.find(l).unwrap())
+    .collect();
+    assert!(order.is_sorted(), "{sheet}");
+    assert!(text(&parts, "xl/_rels/workbook.xml.rels").contains("styles.xml"));
+    assert!(text(&parts, "xl/worksheets/sheet2.xml").contains(r#"s="2""#));
+}
+
+#[test]
+fn too_many_formats_or_fonts_are_refused() {
+    let formats = |from: usize| -> String {
+        let xfs: String = (from..from + 40_000)
+            .map(|i| format!(r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"><alignment indent="{i}"/></xf>"#))
+            .collect();
+        plain_styles("0.0", "").replace(
+            r#"<cellXfs count="3">"#,
+            &format!(r#"<cellXfs count="40003">{xfs}"#),
+        )
+    };
+    let fonts = |from: usize| -> String {
+        let list: String = (from..from + 300)
+            .map(|i| format!(r#"<font><sz val="{i}"/><name val="Calibri"/></font>"#))
+            .collect();
+        plain_styles("0.0", "").replace(
+            r#"<fonts count="2">"#,
+            &format!(r#"<fonts count="302">{list}"#),
+        )
+    };
+    for (a, b, words) in [
+        (
+            formats(0),
+            formats(40_000),
+            "cell format count is over the limit: 80,003 (at most 65,490)",
+        ),
+        (
+            fonts(0),
+            fonts(300),
+            "font count is over the limit: 602 (at most 512)",
+        ),
+    ] {
+        let dir = temp_dir("limits");
+        let mut first = book(&[("A", "")], None);
+        with_styles(&mut first, &a);
+        let mut second = book(&[("B", "")], None);
+        with_styles(&mut second, &b);
+        let paths = [
+            book_file(&dir, "a.xlsx", &first),
+            book_file(&dir, "b.xlsx", &second),
+        ];
+        let e = merge(&paths, &dir.join("out.xlsx"), &Options::default(), None).unwrap_err();
+        assert_eq!(e.code, "limit_exceeded");
+        assert!(e.message.contains(words), "{}", e.message);
+    }
+}
+
+#[test]
+fn the_fixtures_keep_their_formats() {
+    let (_, parts) = merged("styles", &["a.xlsx", "b.xlsx"]);
+    let sheet = text(&parts, "xl/styles.xml");
+    assert!(sheet.contains(r#"numFmtId="164" formatCode="0.00&quot; kg&quot;""#));
+    assert!(sheet.contains("numFmtId=\"165\" formatCode=\"#,##0.0&quot; units&quot;\""));
+    let count = |list: &str| {
+        let open = format!("<{list} count=\"");
+        let at = sheet.find(&open).unwrap() + open.len();
+        let n = sheet[at..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let end = format!("</{list}>");
+        let body = sheet[at..].split(&end).next().unwrap();
+        (n, body.to_string())
+    };
+    let (xfs, body) = count("cellXfs");
+    assert_eq!(xfs, body.matches("<xf ").count());
+    let (fonts, body) = count("fonts");
+    assert_eq!(fonts, body.matches("<font>").count());
+}
