@@ -1026,6 +1026,8 @@ fn untouched_parts_are_copied_byte_for_byte() {
             "xl/worksheets/sheet3.xml",
             "xl/worksheets/sheet4.xml",
             "xl/tables/table2.xml",
+            "xl/drawings/vmlDrawing2.vml",
+            "xl/ctrlProps/ctrlProp1.xml",
         ]
         .contains(&name)
     };
@@ -1095,4 +1097,175 @@ fn prefixed_workbooks_keep_their_spelling() {
     let (_, parts) = merged_files("prefixed-2-out", &paths);
     assert!(text(&parts, "xl/sharedStrings.xml").contains("<si><t>x</t></si>"));
     assert!(text(&parts, "xl/workbook.xml").contains(r#"<sheet name="A""#));
+}
+
+/// Gives sheet 1 a part: its relationship is rId7 of type `rel`, and `tag` goes in the sheet.
+fn with_sheet_part(
+    parts: &mut Vec<(String, Vec<u8>)>,
+    name: &str,
+    content_type: &str,
+    rel: &str,
+    body: &str,
+    tag: &str,
+) {
+    set(parts, name, body.as_bytes());
+    let types = text(parts, "[Content_Types].xml").replace(
+        "</Types>",
+        &format!(r#"<Override PartName="/{name}" ContentType="{content_type}"/></Types>"#),
+    );
+    set(parts, "[Content_Types].xml", types.as_bytes());
+    let target = format!("../{}", name.trim_start_matches("xl/"));
+    let list = rels(&[("rId7", rel, target.as_str())]);
+    set(
+        parts,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        list.as_bytes(),
+    );
+    let sheet =
+        text(parts, "xl/worksheets/sheet1.xml").replace("</worksheet>", tag) + "</worksheet>";
+    set(parts, "xl/worksheets/sheet1.xml", sheet.as_bytes());
+}
+
+fn with_vml(parts: &mut Vec<(String, Vec<u8>)>, vml: &str) {
+    with_sheet_part(
+        parts,
+        "xl/drawings/vmlDrawing1.vml",
+        "application/vnd.openxmlformats-officedocument.vmlDrawing",
+        &format!("{REL}vmlDrawing"),
+        vml,
+        r#"<legacyDrawing r:id="rId7"/>"#,
+    );
+}
+
+#[test]
+fn charts_follow_their_renamed_sheets() {
+    let (_, parts) = merged("chart", &["a.xlsx", "a.xlsx"]);
+    let chart = text(&parts, "xl/charts/chart2.xml");
+    assert!(chart.contains("<c:f>'Data (2)'!$B$1</c:f>"), "{chart}");
+    assert!(chart.contains("<c:f>'Data (2)'!$A$2:$A$5</c:f>"), "{chart}");
+    assert!(!chart.contains("<c:f>Data!"), "{chart}");
+    let base = text(&parts, "xl/charts/chart1.xml");
+    assert_eq!(
+        base,
+        text(&entries(&fixture("a.xlsx")), "xl/charts/chart1.xml")
+    );
+}
+
+#[test]
+fn shape_ids_clear_the_block_the_output_uses() {
+    let (_, parts) = merged("shapes", &["b.xlsx", "b.xlsx"]);
+    let vml = text(&parts, "xl/drawings/vmlDrawing2.vml");
+    assert!(vml.contains(r#"<o:idmap v:ext="edit" data="2"/>"#), "{vml}");
+    assert!(vml.contains(r#"id="_x0000_s2049""#), "{vml}");
+    assert!(!vml.contains("_x0000_s1025"), "{vml}");
+    assert!(vml.contains("_x0000_t201"), "{vml}");
+    assert!(
+        vml.contains("<x:FmlaLink>'Summary (2)'!$D$1</x:FmlaLink>"),
+        "{vml}"
+    );
+    let sheet = text(&parts, "xl/worksheets/sheet4.xml");
+    assert!(sheet.contains(r#"<control shapeId="2049""#), "{sheet}");
+    let drawing = text(&parts, "xl/drawings/drawing2.xml");
+    assert!(
+        drawing.contains(r#"id="2049" name="Check Box 1""#),
+        "{drawing}"
+    );
+    assert!(drawing.contains(r#"spid="_x0000_s2049""#), "{drawing}");
+    let control = text(&parts, "xl/ctrlProps/ctrlProp2.xml");
+    assert!(
+        control.contains(r#"fmlaLink="'Summary (2)'!$D$1""#),
+        "{control}"
+    );
+    let base = entries(&fixture("b.xlsx"));
+    for part in ["xl/drawings/vmlDrawing1.vml", "xl/ctrlProps/ctrlProp1.xml"] {
+        assert_eq!(text(&parts, part), text(&base, part), "{part}");
+    }
+}
+
+#[test]
+fn a_block_nobody_uses_stays() {
+    let (_, parts) = merged("free-block", &["a.xlsx", "b.xlsx"]);
+    let vml = text(&parts, "xl/drawings/vmlDrawing2.vml");
+    assert!(
+        vml.contains(r#"data="1""#) && vml.contains("_x0000_s1025"),
+        "{vml}"
+    );
+    let sheet = text(&parts, "xl/worksheets/sheet4.xml");
+    assert!(sheet.contains(r#"<control shapeId="1025""#), "{sheet}");
+}
+
+#[test]
+fn vml_is_edited_as_text_and_blocks_move_one_by_one() {
+    let dir = temp_dir("vml");
+    let vml = r#"<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel"><o:shapedefaults v:ext="edit" spidmax="5122"/><o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1,5"/></o:shapelayout><v:shape id="_x0000_s1025" o:spid="_x0000_s1025"><font>one<br>two</font><x:ClientData ObjectType="List"><x:FmlaRange>'Other&amp;'!$A$1:$A$2</x:FmlaRange><x:FmlaMacro>[0]!Sheet1</x:FmlaMacro></x:ClientData></v:shape><v:shape id="_x0000_s5121"/></xml>"#;
+    let mut parts = book(&[("Other&amp;", "")], None);
+    with_vml(&mut parts, vml);
+    let base = book_file(&dir, "base.xlsx", &parts);
+    let (_, parts) = merged_files("vml-out", &[base.clone(), base]);
+    let out = text(&parts, "xl/drawings/vmlDrawing2.vml");
+    assert!(out.contains(r#"spidmax="3074""#), "{out}");
+    assert!(out.contains(r#"data="2,3""#), "{out}");
+    assert!(
+        out.contains(r#"id="_x0000_s2049" o:spid="_x0000_s2049""#),
+        "{out}"
+    );
+    assert!(out.contains(r#"id="_x0000_s3073""#), "{out}");
+    assert!(out.contains("one<br>two"), "{out}");
+    assert!(
+        out.contains("<x:FmlaRange>'Other&amp; (2)'!$A$1:$A$2</x:FmlaRange>"),
+        "{out}"
+    );
+    assert!(
+        out.contains("<x:FmlaMacro>[0]!Sheet1</x:FmlaMacro>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn shapes_and_control_cells_keep_their_links() {
+    let dir = temp_dir("links");
+    let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:sp macro="" textlink="Sheet1!$A$1"/></xdr:wsDr>"#;
+    let mut parts = book(&[("Sheet1", "")], None);
+    with_sheet_part(
+        &mut parts,
+        "xl/drawings/drawing1.xml",
+        "application/vnd.openxmlformats-officedocument.drawing+xml",
+        &format!("{REL}drawing"),
+        drawing,
+        r#"<drawing r:id="rId7"/><controls><control shapeId="1025" name="x"><controlPr linkedCell="Sheet1!$A$1" listFillRange="Sheet1!$B$1:$B$2"/></control></controls>"#,
+    );
+    let base = book_file(&dir, "base.xlsx", &parts);
+    let (_, parts) = merged_files("links-out", &[base.clone(), base]);
+    let out = text(&parts, "xl/drawings/drawing2.xml");
+    assert!(out.contains(r#"textlink="'Sheet1 (2)'!$A$1""#), "{out}");
+    let sheet = text(&parts, "xl/worksheets/sheet2.xml");
+    assert!(
+        sheet.contains(r#"linkedCell="'Sheet1 (2)'!$A$1""#),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains(r#"listFillRange="'Sheet1 (2)'!$B$1:$B$2""#),
+        "{sheet}"
+    );
+}
+
+#[test]
+fn a_chart_formula_that_can_t_be_read_is_refused() {
+    let dir = temp_dir("chart-formula");
+    let chart = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:f>'Sheet1!$A$1</c:f></c:chartSpace>"#;
+    let mut parts = book(&[("Sheet1", "")], None);
+    with_sheet_part(
+        &mut parts,
+        "xl/charts/chart1.xml",
+        "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+        &format!("{REL}chart"),
+        chart,
+        "",
+    );
+    let base = book_file(&dir, "base.xlsx", &parts);
+    let out = dir.join("out.xlsx");
+    let e = merge(&[base.clone(), base], &out, &Options::default(), None).unwrap_err();
+    assert_eq!(e.code, "unsupported_variant");
+    assert!(e.message.contains("xl/charts/chart1.xml"), "{}", e.message);
+    assert!(!out.exists());
 }

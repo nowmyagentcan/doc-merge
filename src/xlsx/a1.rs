@@ -265,7 +265,7 @@ pub struct Renames {
 }
 
 impl Renames {
-    fn are_empty(&self) -> bool {
+    pub fn are_empty(&self) -> bool {
         self.sheets.is_empty() && self.names.is_empty() && self.links == 0
     }
 

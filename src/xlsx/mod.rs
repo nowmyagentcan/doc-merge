@@ -2,6 +2,7 @@
 //! formulas rewritten, under names that stay unique.
 
 pub mod a1;
+mod drawings;
 mod styles;
 
 use std::borrow::Cow;
@@ -414,6 +415,7 @@ struct Output {
     base_styles: Option<Held>,
     base_theme: Option<Held>,
     metadata: Metadata,
+    taken: drawings::Taken,
 }
 
 /// The output's dynamic-array metadata, if any workbook has some.
@@ -542,16 +544,18 @@ struct Table {
     name: String,
 }
 
-fn tables(pkg: &mut Package) -> Result<Vec<Table>, Error> {
-    let kind = format!("{SML}table+xml");
-    let parts: Vec<String> = pkg
+/// The parts of a content type.
+fn parts_of(pkg: &Package, kind: &str) -> Vec<String> {
+    let of_kind = pkg
         .entries
         .iter()
-        .filter(|e| pkg.types.of(&e.name) == Some(kind.as_str()))
-        .map(|e| e.name.clone())
-        .collect();
+        .filter(|e| pkg.types.of(&e.name) == Some(kind));
+    of_kind.map(|e| e.name.clone()).collect()
+}
+
+fn tables(pkg: &mut Package) -> Result<Vec<Table>, Error> {
     let mut list = vec![];
-    for part in parts {
+    for part in parts_of(pkg, &format!("{SML}table+xml")) {
         let text = pkg.text(&part, MAX_PARSED)?;
         let tree = xml::tree(&text, &part, &pkg.origin)?;
         let name = tree
@@ -647,6 +651,7 @@ impl Output {
                 used.insert(d.key, Some(d.formula));
             }
         }
+        let taken = drawings::Taken::of(pkg)?;
         let mut next_table_id = 1;
         for t in tables(pkg)? {
             used.insert(t.name.to_lowercase(), None);
@@ -667,6 +672,7 @@ impl Output {
             base_styles,
             base_theme,
             metadata,
+            taken,
             book,
         })
     }
@@ -880,6 +886,12 @@ impl Output {
             Some(held) => self.metadata.add(held),
             None => 0,
         };
+        let mut copied = vec![];
+        let mut moved = vec![];
+        for s in &book.sheets {
+            copied.push(plan.copy_graph(inputs, i, &s.part, &|_, _| None)?);
+            moved.push(self.taken.add(&mut inputs[i], &s.part)?);
+        }
         let maps = Rc::new(Maps {
             strings,
             cell_metadata,
@@ -888,12 +900,12 @@ impl Output {
             views: self.views,
             renames: found.renames,
             locals: found.locals,
+            moved,
         });
         let main = self.book.part.clone();
-        for (index, s) in book.sheets.into_iter().enumerate() {
+        for (index, (s, part)) in book.sheets.into_iter().zip(copied).enumerate() {
             let shown = listed[index].output_name.clone();
-            let part = plan.copy_graph(inputs, i, &s.part, &|_, _| None)?;
-            let maps = maps.clone();
+            let sheet_maps = maps.clone();
             let source = s.part.clone();
             let name = shown.clone();
             plan.replace(
@@ -902,13 +914,14 @@ impl Output {
                     let origin = inputs[i].origin.clone();
                     let text = inputs[i].text(&source, MAX_STREAMED)?;
                     let job = SheetJob {
-                        maps: &maps,
+                        maps: &sheet_maps,
                         index,
                         name: &name,
                     };
                     job.write(&text, &source, &origin, out)
                 })),
             );
+            drawings::rewrite(plan, inputs, i, index, &maps);
             let id = self.rels.add(&s.kind, relative(&main, &part), false);
             let mut node = self.with_id(s.node, "sheet", &id);
             node.set_attr("", "", "name", &shown);
@@ -1067,6 +1080,8 @@ struct Maps {
     renames: a1::Renames,
     /// Per sheet, the lower-case names of its sheet-scope names.
     locals: Vec<HashSet<String>>,
+    /// Per sheet, what its own parts turned into.
+    moved: Vec<drawings::Moved>,
 }
 
 /// Copies a part, with chosen spans replaced.
@@ -1288,6 +1303,17 @@ impl SheetJob<'_> {
                             None if !cfvo => {}
                             None => return Err(unreadable(origin, self.name)),
                         }
+                    }
+                }
+                element @ ("control" | "controlPr" | "oleObject") if r.element_ns(e) == S => {
+                    let job = drawings::Job {
+                        maps,
+                        index: self.index,
+                        part,
+                        origin,
+                    };
+                    if let Some(tag) = job.tag(&r, e, empty, element)? {
+                        p.replace(start..end, &tag)?;
                     }
                 }
                 "sheetView" if r.element_ns(e) == S => {
