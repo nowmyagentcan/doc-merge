@@ -119,8 +119,7 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
         }
     }
     out.finish(&mut plan, &mut inputs[0])?;
-    let main = inputs[0].main.clone();
-    check(&plan, inputs, &main, decks[0].id_defects())?;
+    check(&plan, inputs, decks[0].id_defects())?;
     Ok(Merged {
         plan,
         slides: decks.iter().map(|d| d.slides.len()).collect(),
@@ -396,7 +395,6 @@ fn number(n: &Node, name: &str) -> u64 {
 /// are one author, whose comment numbers carry on from the highest so far.
 fn merge_comment_authors(list: &mut Held, deck: &Held) -> CommentMap {
     let mut map = CommentMap::new();
-    let attrs: Vec<Attr> = deck.root.attrs.clone();
     for author in deck.root.nodes().filter(|n| n.is(P, "cmAuthor")) {
         let old = author.attr("", "id").unwrap_or_default().to_string();
         let last = number(author, "lastIdx");
@@ -417,7 +415,7 @@ fn merge_comment_authors(list: &mut Held, deck: &Held) -> CommentMap {
         let id = top.unwrap_or(0).to_string();
         let mut new = author.clone();
         new.set_attr("", "", "id", &id);
-        list.add(new, &attrs);
+        list.add(new, &deck.root.attrs);
         map.insert(old, (id, 0));
     }
     map
@@ -805,7 +803,7 @@ impl Output {
             (input, old, attempt).hash(&mut h);
             (h.finish() as u32).max(1).to_string()
         });
-        let id = fresh.into_iter().find(|id| !self.creations.contains(id));
+        let id = { fresh }.find(|id| !self.creations.contains(id));
         self.creations.extend(id.clone());
         id
     }
@@ -1161,21 +1159,20 @@ fn part_bytes(declaration: &str, root: &Node) -> Vec<u8> {
 }
 
 /// The PowerPoint rules of a merged deck: slide, master and layout ids unique and in range
-/// (but for the `allowed` defects the base came with), and each slide with one layout and at
-/// most one notes page.
-fn check(plan: &Plan, inputs: &mut [Package], main: &str, allowed: usize) -> Result<(), Error> {
+/// (but for the `allowed` defects the base came with), each slide with one layout and at most
+/// one notes page, and every slide of a section in the deck.
+fn check(plan: &Plan, inputs: &mut [Package], allowed: usize) -> Result<(), Error> {
     let parts: HashMap<String, &Part> = plan
         .parts
         .iter()
         .map(|p| (p.name.to_ascii_lowercase(), p))
         .collect();
-    let origin = inputs[0].origin.clone();
+    let (origin, main) = (inputs[0].origin.clone(), inputs[0].main.clone());
     let mut text = |name: &str| -> Result<String, Error> {
         let part = parts.get(&name.to_ascii_lowercase());
         let text = part.map(|p| planned_text(p, inputs)).transpose()?.flatten();
         text.ok_or_else(|| Error::internal(&format!("part {name} is missing")))
     };
-    let main = main.to_string();
     let rels_of = |text: &mut dyn FnMut(&str) -> Result<String, Error>, part: &str| {
         let name = rels_name(part);
         parse_rels(&text(&name)?, &name, &origin)
@@ -1202,10 +1199,7 @@ fn check(plan: &Plan, inputs: &mut [Package], main: &str, allowed: usize) -> Res
     let sections = section_list(&root).into_iter().flat_map(Node::nodes);
     for list in sections.filter_map(|s| s.child(P14, "sldIdLst")) {
         let in_section = list.nodes().filter_map(|n| n.attr("", "id")?.parse().ok());
-        if let Some(id) = in_section
-            .into_iter()
-            .find(|id: &u32| !listed_ids.contains(id))
-        {
+        if let Some(id) = { in_section }.find(|id: &u32| !listed_ids.contains(id)) {
             return Err(Error::internal(&format!(
                 "a section lists a slide {id} that isn't there"
             )));
