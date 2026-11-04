@@ -119,9 +119,8 @@ pub fn expand(args: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
         let found = if fs::metadata(arg).is_ok_and(|m| m.is_dir()) {
             listed(arg, |_| true)
         } else if fs::symlink_metadata(arg).is_err() && name.contains(['*', '?']) {
-            let dir = arg.parent().filter(|d| !d.as_os_str().is_empty());
             let pattern: Vec<char> = name.to_lowercase().chars().collect();
-            listed(dir.unwrap_or(Path::new(".")), |n| {
+            listed(folder_of(arg), |n| {
                 matches(&pattern, &n.to_lowercase().chars().collect::<Vec<_>>())
             })
         } else {
@@ -139,7 +138,7 @@ pub fn expand(args: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
         n if n > MAX_FILES => Err(Error::limit_exceeded(
             "The number of files",
             &thousands(n as u64),
-            "500",
+            &thousands(MAX_FILES as u64),
         )),
         _ => Ok(files),
     }

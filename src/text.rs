@@ -9,8 +9,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use doc_merge::Report;
 use doc_merge::error::Error;
+use doc_merge::package::Kind;
+use doc_merge::{Input, Report};
 
 pub const BOLD: &str = "1";
 pub const DIM: &str = "2";
@@ -168,15 +169,13 @@ fn counted(n: usize, what: &str) -> String {
 
 /// What the merged file holds, as a count of its slides, sheets or sections.
 fn contents(r: &Report) -> String {
-    let sum = |of: &dyn Fn(&doc_merge::Input) -> Option<usize>| -> Option<usize> {
-        r.inputs.iter().map(of).sum()
+    let what = match r.output.kind {
+        Kind::Pptx => "slide",
+        Kind::Xlsx => "sheet",
+        _ => "section",
     };
-    let sheets = |i: &doc_merge::Input| i.sheets.as_ref().map(Vec::len);
-    match (sum(&|i| i.slides), sum(&sheets), sum(&|i| i.sections)) {
-        (Some(n), ..) => counted(n, "slide"),
-        (_, Some(n), _) => counted(n, "sheet"),
-        (.., n) => counted(n.unwrap_or_default(), "section"),
-    }
+    let of = |i: &Input| i.slides.or(i.sections).or(i.sheets.as_ref().map(Vec::len));
+    counted(r.inputs.iter().filter_map(of).sum(), what)
 }
 
 /// A file size: `B`, whole `KB`, or `MB` with one decimal; 1 KB is 1,024 bytes.
@@ -292,8 +291,7 @@ fn spinner(mut w: impl Write, look: Look, line: &str, stopped: Receiver<()>) {
 mod tests {
     use super::*;
     use doc_merge::error::{Warning, Warnings};
-    use doc_merge::package::Kind;
-    use doc_merge::{Input, Output, Rename};
+    use doc_merge::{Output, Rename};
 
     const COLOUR: Look = Look {
         ansi: true,
@@ -397,10 +395,12 @@ mod tests {
         let mut r = sample();
         r.inputs[1].slides = Some(1);
         assert!(printed(&r, Look::default()).contains("  13 slides from 2 files"));
+        r.output.kind = Kind::Docx;
         for i in &mut r.inputs {
             (i.slides, i.sections) = (None, Some(1));
         }
         assert!(printed(&r, Look::default()).contains("  2 sections from 2 files"));
+        r.output.kind = Kind::Xlsx;
         r.inputs[0].sections = None;
         r.inputs[1].sections = None;
         r.inputs[0].sheets = Some(vec![]);

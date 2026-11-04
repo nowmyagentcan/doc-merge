@@ -196,7 +196,6 @@ fn main() -> ExitCode {
     };
     match done {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
-            drop(out);
             fail(&Error::write_failed("the output stream", &e), false)
         }
         // A reader that hung up ends the run quietly with the code earned so far.
@@ -232,9 +231,11 @@ fn ask(
         ..Cli::default()
     };
     run(&cli, out, err, code)?;
-    let stopped = STOP.load(Ordering::SeqCst);
-    *code = if stopped { *code } else { 0 };
-    Ok(!stopped)
+    let go_on = !STOP.load(Ordering::SeqCst);
+    if go_on {
+        *code = 0;
+    }
+    Ok(go_on)
 }
 
 /// Merges `cli.paths` and prints how it went; `code` is set before anything is printed.
