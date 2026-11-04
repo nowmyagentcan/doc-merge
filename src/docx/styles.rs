@@ -98,6 +98,10 @@ impl Sheet {
             .map(id_of)
     }
 
+    pub fn ids(&self) -> HashSet<String> {
+        self.by_id.keys().cloned().collect()
+    }
+
     /// Whether a style gives its paragraphs an outline level, itself or through `basedOn`.
     pub fn outlined(&self, id: &str) -> bool {
         let mut seen = HashSet::new();
@@ -234,6 +238,10 @@ impl Output {
         self.ids.insert(id_of(&s).to_lowercase());
         self.by_id.entry(id_of(&s).into()).or_insert(at);
         self.styles.push(s);
+    }
+
+    pub fn ids(&self) -> HashSet<String> {
+        self.by_id.keys().cloned().collect()
     }
 
     /// The id of the output's style of a type and (lower-case) name.

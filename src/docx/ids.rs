@@ -7,6 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
 use super::W;
+use crate::error::Error;
 use crate::xml::{Attr, escape_text};
 
 pub const W14: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
@@ -79,19 +80,72 @@ impl Slot {
     }
 }
 
-/// The ids an input's content holds.
+/// What content points to outside itself: style ids, list ids, and footnote, endnote and
+/// comment ids, in this order.
+const TARGETS: usize = 5;
+
+/// Which ids exist, in the order of [`Tally`]'s references.
+pub type Known = [HashSet<String>; TARGETS];
+
+/// How many of each defect a [`Tally`] holds: per pool repeated or unpaired ids, then per kind
+/// of target references to nothing.
+pub type Defects = [usize; POOLS + TARGETS];
+
+const DEFECTS: [&str; POOLS + TARGETS] = [
+    "bookmark ids",
+    "revision ids",
+    "permission ids",
+    "content control ids",
+    "drawing ids",
+    "style references",
+    "list references",
+    "footnote references",
+    "endnote references",
+    "comment references",
+];
+
+fn target_of(local: &str) -> Option<usize> {
+    match local {
+        "pStyle" | "rStyle" | "tblStyle" => Some(0),
+        "numId" => Some(1),
+        "footnoteReference" => Some(2),
+        "endnoteReference" => Some(3),
+        "commentReference" | "commentRangeStart" | "commentRangeEnd" => Some(4),
+        _ => None,
+    }
+}
+
+/// The ids and references of some content.
 #[derive(Default)]
 pub struct Tally {
     seen: [HashMap<i64, u32>; POOLS],
+    /// Per paired id, starts less ends.
+    open: [HashMap<i64, i32>; POOLS],
+    targets: [HashSet<String>; TARGETS],
 }
 
 impl Tally {
     pub fn see(&mut self, ns: &str, local: &str, attrs: &[Attr]) {
         if let Some(s) = slot(ns, local)
-            && !local.ends_with("End")
             && let Some(id) = s.find(attrs).and_then(|a| a.value.parse().ok())
         {
-            *self.seen[s.pool as usize].entry(id).or_default() += 1;
+            let end = local.ends_with("End");
+            if !end {
+                *self.seen[s.pool as usize].entry(id).or_default() += 1;
+            }
+            if s.paired {
+                *self.open[s.pool as usize].entry(id).or_default() += if end { -1 } else { 1 };
+            }
+        }
+        if ns == W
+            && let Some(k) = target_of(local)
+        {
+            let key = if matches!(k, 0 | 1) { "val" } else { "id" };
+            let value = attrs.iter().find(|a| a.ns == W && a.local == key);
+            let value = value
+                .map(|a| a.value.as_str())
+                .filter(|v| k != 1 || *v != "0");
+            self.targets[k].extend(value.map(String::from));
         }
     }
 
@@ -101,6 +155,41 @@ impl Tally {
                 *mine.entry(id).or_default() += n;
             }
         }
+        for (mine, theirs) in self.open.iter_mut().zip(other.open) {
+            for (id, n) in theirs {
+                *mine.entry(id).or_default() += n;
+            }
+        }
+        for (mine, theirs) in self.targets.iter_mut().zip(other.targets) {
+            mine.extend(theirs);
+        }
+    }
+
+    pub fn defects(&self, known: &Known) -> Defects {
+        let pools = self.seen.iter().zip(&self.open).map(|(seen, open)| {
+            let repeats: u32 = seen.values().map(|n| n - 1).sum();
+            let unpaired: u32 = open.values().map(|n| n.unsigned_abs()).sum();
+            (repeats + unpaired) as usize
+        });
+        let targets = self.targets.iter().zip(known);
+        let targets = targets.map(|(used, known)| used.difference(known).count());
+        let mut out = [0; POOLS + TARGETS];
+        for (slot, n) in out.iter_mut().zip(pools.chain(targets)) {
+            *slot = n;
+        }
+        out
+    }
+}
+
+/// The output's defects may only be those its inputs brought.
+pub fn check(output: &Defects, inputs: &Defects) -> Result<(), Error> {
+    let worse = (0..output.len()).find(|&k| output[k] > inputs[k]);
+    match worse {
+        Some(k) => Err(Error::internal(&format!(
+            "the merged document has {} bad {}, its inputs {}",
+            output[k], DEFECTS[k], inputs[k]
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -549,6 +638,63 @@ mod tests {
         let moved = new(W, "moveFromRangeStart", "id", "5");
         assert_eq!(new(W, "moveFromRangeEnd", "id", "5"), moved);
         assert_ne!(new(W, "ins", "id", "7"), new(W, "ins", "id", "7"));
+    }
+
+    fn tally(elements: &[(&str, &str, &str)]) -> Tally {
+        let mut t = Tally::default();
+        for (element, key, value) in elements {
+            t.see(W, element, &[Attr::new(&format!("w:{key}"), W, value)]);
+        }
+        t
+    }
+
+    #[test]
+    fn repeats_lone_ends_and_dangling_references_count_as_defects() {
+        let mut known = Known::default();
+        known[0].insert("Normal".into());
+        known[4].insert("7".into());
+        let fine = tally(&[
+            ("bookmarkStart", "id", "1"),
+            ("bookmarkEnd", "id", "1"),
+            ("id", "val", "5"),
+            ("ins", "id", "9"),
+            ("pStyle", "val", "Normal"),
+            ("numId", "val", "0"),
+            ("commentReference", "id", "7"),
+        ]);
+        assert_eq!(fine.defects(&known), [0; 10]);
+        let bad = tally(&[
+            ("bookmarkStart", "id", "1"),
+            ("bookmarkStart", "id", "1"),
+            ("bookmarkEnd", "id", "1"),
+            ("permEnd", "id", "2"),
+            ("id", "val", "5"),
+            ("id", "val", "5"),
+            ("pStyle", "val", "Missing"),
+            ("numId", "val", "3"),
+            ("footnoteReference", "id", "1"),
+            ("endnoteReference", "id", "1"),
+            ("commentRangeStart", "id", "8"),
+        ]);
+        assert_eq!(bad.defects(&known), [2, 0, 1, 1, 0, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn only_defects_the_inputs_lacked_fail_the_check() {
+        let mut inputs = [0; 10];
+        inputs[1] = 2;
+        let mut output = inputs;
+        assert!(check(&output, &inputs).is_ok());
+        output[1] = 1;
+        assert!(check(&output, &inputs).is_ok());
+        output[0] = 1;
+        let e = check(&output, &inputs).unwrap_err();
+        assert_eq!(e.code, "internal");
+        assert!(
+            e.message.contains("1 bad bookmark ids, its inputs 0"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

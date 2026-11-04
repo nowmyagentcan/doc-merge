@@ -1135,3 +1135,14 @@ fn fonts_join_by_name_with_their_embedded_files() {
     assert!(fonts.ends_with("</w:fonts>"), "{fonts}");
     assert!(text(&parts, "word/_rels/document.xml.rels").contains("fontTable.xml"));
 }
+
+#[test]
+fn defects_a_file_brings_along_dont_stop_the_merge() {
+    let dir = temp_dir("own-defects");
+    let body = r#"<w:p><w:pPr><w:pStyle w:val="Nowhere"/><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr><w:bookmarkEnd w:id="4"/><w:bookmarkStart w:id="5" w:name="Open"/><w:r><w:drawing><wp:inline><wp:docPr id="1" name="x"/></wp:inline></w:drawing><w:drawing><wp:inline><wp:docPr id="1" name="y"/></wp:inline></w:drawing></w:r></w:p>"#;
+    let a = word_file(&dir, "a.docx", body, &[]);
+    let b = word_file(&dir, "b.docx", body, &[]);
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    let ids = values(&text(&parts, "word/document.xml"), "wp:docPr", "id");
+    assert_eq!(ids, ["1", "1", "2", "3"], "only the base keeps its repeat");
+}

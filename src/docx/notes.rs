@@ -40,6 +40,14 @@ pub struct Notes {
     adopted: bool,
     /// Paragraph ids in the part.
     paras: HashSet<u32>,
+    /// The ids of the items added.
+    new_ids: HashSet<String>,
+}
+
+/// The ids of a notes part's items.
+pub fn item_ids(h: &Held) -> HashSet<String> {
+    let ids = h.tree.nodes().filter_map(|n| n.attr(W, "id"));
+    ids.map(String::from).collect()
 }
 
 fn number(n: &xml::Node) -> i64 {
@@ -72,7 +80,15 @@ impl Notes {
             added: String::new(),
             adopted: false,
             paras: HashSet::new(),
+            new_ids: HashSet::new(),
         })
+    }
+
+    /// The ids of every item in the part so far.
+    pub fn ids(&self) -> HashSet<String> {
+        let mut ids = self.base.as_ref().map_or(HashSet::new(), item_ids);
+        ids.extend(self.new_ids.iter().cloned());
+        ids
     }
 
     /// What the base's part uses.
@@ -134,6 +150,7 @@ impl Notes {
                 n.set_attr(W, "w", "id", &next.to_string());
                 next += 1;
             }
+            self.new_ids.extend(n.attr(W, "id").map(String::from));
             n.attrs.extend(local.iter().cloned());
             n.write(&mut added);
         }

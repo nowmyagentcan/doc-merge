@@ -23,7 +23,7 @@ use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
 use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, start_tag, written};
 use crate::{Origin, Rename, StyleMode};
 use headers::Slot;
-use ids::{Field, Ids, Local, Tally};
+use ids::{Defects, Field, Ids, Known, Local, Tally};
 use notes::{KINDS, Notes, Sides};
 use numbering::Lists;
 use settings::{Fonts, Settings};
@@ -130,6 +130,9 @@ struct Merger<'a> {
     bookmarks: HashSet<String>,
     /// Paragraph ids of the main part.
     paras: HashSet<u32>,
+    /// What the output's content holds, and the defects its inputs brought.
+    tally: Rc<RefCell<Tally>>,
+    defects: Defects,
     notes: Vec<Notes>,
     sides: Sides,
     root: Prefixes,
@@ -193,6 +196,8 @@ impl<'a> Merger<'a> {
             ids: Rc::default(),
             bookmarks: HashSet::new(),
             paras: HashSet::new(),
+            tally: Rc::default(),
+            defects: Defects::default(),
             notes,
             sides,
             root: Prefixes::default(),
@@ -210,6 +215,25 @@ impl<'a> Merger<'a> {
     /// and odd headers on.
     fn needs_twins(&self, i: usize) -> bool {
         !self.settings[i].even && self.settings.iter().any(|s| s.even)
+    }
+
+    /// What the output's content can point to so far.
+    fn known(&self) -> Known {
+        let [footnotes, endnotes, comments] = [0, 1, 2].map(|k| self.notes[k].ids());
+        let styles = self.out_styles.ids();
+        [
+            styles,
+            self.out_lists.lists.ids(),
+            footnotes,
+            endnotes,
+            comments,
+        ]
+    }
+
+    fn count_defects(&mut self, tally: &Tally, known: &Known) {
+        for (sum, n) in self.defects.iter_mut().zip(tally.defects(known)) {
+            *sum += n;
+        }
     }
 
     fn add_base(&mut self) -> Result<(), Error> {
@@ -230,10 +254,14 @@ impl<'a> Merger<'a> {
         self.ids = Rc::new(RefCell::new(Ids::base(&uses.tally)));
         self.bookmarks = uses.names.iter().map(|n| n.to_lowercase()).collect();
         self.root = Prefixes::of(&uses.root);
+        let known = self.known();
+        self.count_defects(&uses.tally, &known);
+        self.tally.borrow_mut().add(std::mem::take(&mut uses.tally));
         let mut rw = Rewrite {
             w: prefix_of(&uses.root, W).unwrap_or("w").to_string(),
             r: prefix_of(&uses.root, R).map(String::from),
             ids: self.ids.clone(),
+            tally: self.tally.clone(),
             ..Rewrite::default()
         };
         if twins {
@@ -359,6 +387,19 @@ impl<'a> Merger<'a> {
         let copied = self
             .out_lists
             .copy(&lists, &uses.nums, i + 1, &mut bullet)?;
+        let note_ids = |k: usize| {
+            doc_notes[k]
+                .as_ref()
+                .map_or(HashSet::new(), notes::item_ids)
+        };
+        let known = [
+            sheet.ids(),
+            lists.ids(),
+            note_ids(0),
+            note_ids(1),
+            note_ids(2),
+        ];
+        self.count_defects(&uses.tally, &known);
         uses.names
             .retain(|n| !n.eq_ignore_ascii_case(ids::HIDDEN_BOOKMARK));
         let (names, renamed) = ids::rename_bookmarks(&uses.names, i + 1, &mut self.bookmarks);
@@ -379,6 +420,7 @@ impl<'a> Merger<'a> {
             nums: copied.nums,
             names,
             ids: self.ids.clone(),
+            tally: self.tally.clone(),
             bare_p: bare("paragraph", &self.base_p),
             bare_table: bare("table", &self.base_table),
             theme: doc_theme,
@@ -530,6 +572,8 @@ impl<'a> Merger<'a> {
         if let Some(input) = self.headings.filter(|_| self.has_toc) {
             self.warnings.push(Warning::toc_needs_update(input));
         }
+        let known = self.known();
+        let (tally, defects) = (self.tally, self.defects);
         let root_attrs = self.root.attrs;
         let count = self.inputs.len();
         let docs = self.docs;
@@ -548,6 +592,7 @@ impl<'a> Merger<'a> {
                     };
                     tail = body(&text, &part, &origin, rw, &role, out)?.unwrap_or(tail);
                 }
+                ids::check(&tally.borrow().defects(&known), &defects)?;
                 out.write_all(tail.as_bytes()).map_err(io)
             })),
         );
@@ -937,8 +982,9 @@ struct Rewrite {
     nums: HashMap<String, String>,
     /// Old to new note and comment ids, by [`KINDS`].
     notes: [HashMap<String, String>; 3],
-    /// The output's id pools.
+    /// The output's id pools, and what its content holds so far.
     ids: Rc<RefCell<Ids>>,
+    tally: Rc<RefCell<Tally>>,
     /// Old (lower case) to new bookmark names.
     names: HashMap<String, String>,
     /// Old to new paragraph ids of the part being written.
@@ -1463,6 +1509,7 @@ fn start<'a>(
             .local
             .renumber(&mut rw.ids.borrow_mut(), &slot, &mut attrs);
     }
+    rw.tally.borrow_mut().see(ns, local, &attrs);
     if ns == W && local == "fldChar" {
         walk.field.settle(&rw.names, buf);
     }

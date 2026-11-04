@@ -37,6 +37,12 @@ impl Lists {
         lists
     }
 
+    /// The `w:numId` of every list.
+    pub fn ids(&self) -> HashSet<String> {
+        let ids = self.nums.iter().filter_map(|n| n.attr(W, "numId"));
+        ids.map(String::from).collect()
+    }
+
     fn abstract_of(&self, num: &str) -> Option<&Node> {
         let n = self.nums.iter().find(|n| n.attr(W, "numId") == Some(num))?;
         let wanted = reference(n, "abstractNumId")?;
