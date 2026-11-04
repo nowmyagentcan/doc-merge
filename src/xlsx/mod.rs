@@ -1156,15 +1156,16 @@ impl SheetJob<'_> {
             copied: 0,
             out,
         };
-        let mut cell = None;
+        // Where the cell being read starts and ends.
+        let mut cell = 0..0;
         let mut string_cell = false;
         let bad_format = |n: u32, place: String| {
             origin.bad(&format!("{place} uses format {n}, which isn't defined"))
         };
-        let place = |cell: &Option<BytesStart>| {
-            let at = cell.as_ref().and_then(|c| c.try_get_attribute("r").ok()?);
-            match at {
-                Some(a) => format!("{}!{}", self.name, a.value),
+        let place = |cell: &Range<usize>| {
+            let tag = &text[cell.clone()];
+            match tag.split_once(" r=\"").and_then(|t| t.1.split_once('"')) {
+                Some((at, _)) => format!("{}!{at}", self.name),
                 None => self.name.to_string(),
             }
         };
@@ -1181,15 +1182,19 @@ impl SheetJob<'_> {
             let empty = matches!(event, Event::Empty(_));
             match e.local_name().as_ref() {
                 "c" if r.element_ns(e) == S => {
-                    cell = Some(e.clone());
+                    cell = start..end;
                     string_cell = false;
                     let mut style = 0;
+                    let mut styled = false;
                     let mut metadata = None;
                     for a in e.attributes() {
                         let a = a.map_err(|e| r.malformed(&e.to_string()))?;
                         match a.key.as_ref() {
                             "t" => string_cell = a.value == "s",
-                            "s" => style = a.value.parse().unwrap_or(u32::MAX),
+                            "s" => {
+                                style = a.value.parse().unwrap_or(u32::MAX);
+                                styled = true;
+                            }
                             "cm" => metadata = a.value.parse::<u32>().ok(),
                             _ => {}
                         }
@@ -1198,7 +1203,15 @@ impl SheetJob<'_> {
                         return Err(bad_format(style, place(&cell)));
                     };
                     let moved = metadata.filter(|_| maps.cell_metadata > 0);
-                    if new != style || moved.is_some() {
+                    // Most cells only change their format: just its digits are replaced.
+                    let digits = text[start..end].find(" s=\"").map(|at| start + at + 4);
+                    let digits = digits.and_then(|d| Some(d..d + text[d..end].find('"')?));
+                    if let (None, Some(digits)) = (moved, digits.filter(|_| new != style)) {
+                        p.replace(digits, &new.to_string())?;
+                    } else if !styled && new != style && moved.is_none() {
+                        let close = end - if empty { 2 } else { 1 };
+                        p.replace(close..close, &format!(" s=\"{new}\""))?;
+                    } else if new != style || moved.is_some() {
                         let mut set = vec![];
                         set.extend((new != style).then_some(("s", new)));
                         set.extend(moved.map(|m| ("cm", m + maps.cell_metadata)));
