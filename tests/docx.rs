@@ -96,6 +96,7 @@ fn untouched_parts_are_copied_byte_for_byte_and_runs_repeat() {
         .collect();
     let rewritten = |n: &str| {
         n == "[Content_Types].xml"
+            || n == "word/settings.xml"
             || n.starts_with("word/document.xml")
             || n == "word/_rels/document.xml.rels"
             || n.starts_with("word/styles.xml")
@@ -351,4 +352,213 @@ fn only_one_style_is_the_default_of_its_type() {
     let styles = text(&parts, "word/styles.xml");
     let paragraph = r#"<w:style w:type="paragraph" w:default="1""#;
     assert_eq!(count(&styles, paragraph), 1);
+}
+
+/// Each section's references in a body, as (element, type, the part's text).
+fn references(parts: &[(String, Vec<u8>)]) -> Vec<Vec<(String, String, String)>> {
+    let doc = text(parts, "word/document.xml");
+    let rels = text(parts, "word/_rels/document.xml.rels");
+    let target = |id: &str| {
+        let rel = rels
+            .split("<Relationship ")
+            .find(|r| r.contains(&format!("Id=\"{id}\"")))
+            .unwrap_or_else(|| panic!("{id}"));
+        let t = rel.split("Target=\"").nth(1).unwrap();
+        t[..t.find('"').unwrap()].to_string()
+    };
+    doc.split("<w:sectPr")
+        .skip(1)
+        .map(|s| {
+            let s = &s[..s.find("</w:sectPr>").unwrap_or(s.len())];
+            let mut found = vec![];
+            for element in ["headerReference", "footerReference"] {
+                let types = values(s, &format!("w:{element}"), "w:type");
+                let ids = values(s, &format!("w:{element}"), "r:id");
+                for (t, id) in types.into_iter().zip(ids) {
+                    let shown = words(&text(parts, &format!("word/{}", target(&id))));
+                    found.push((element.to_string(), t, shown));
+                }
+            }
+            found
+        })
+        .collect()
+}
+
+fn shown(section: &[(String, String, String)], element: &str, kind: &str) -> String {
+    let found = section.iter().find(|r| r.0 == element && r.1 == kind);
+    let found = found.unwrap_or_else(|| panic!("no {kind} {element}"));
+    found.2.clone()
+}
+
+#[test]
+fn every_document_keeps_its_own_headers_and_shows_nothing_of_the_one_before() {
+    let (_, parts) = merged("headers", &["a.docx", "b.docx", "c.docx"]);
+    let sections = references(&parts);
+    let header = "headerReference";
+    // a had even headers off: its even pages keep showing its default header.
+    assert_eq!(shown(&sections[0], header, "default"), "A header");
+    assert_eq!(shown(&sections[0], header, "even"), "A header");
+    assert_eq!(shown(&sections[0], header, "first"), "A first page header");
+    let page = shown(&sections[0], "footerReference", "default");
+    assert_eq!(shown(&sections[0], "footerReference", "even"), page);
+    assert_eq!(sections[0].len(), 6);
+    assert!(sections[1].is_empty(), "a's second section inherits");
+    assert_eq!(shown(&sections[2], header, "default"), "B odd header");
+    assert_eq!(shown(&sections[2], header, "even"), "B even header");
+    assert_eq!(sections[3].len(), 6);
+    assert!(sections[3].iter().all(|r| r.2.is_empty()), "{sections:?}");
+    assert!(text(&parts, "word/settings.xml").contains("<w:evenAndOddHeaders/>"));
+    let types = text(&parts, "[Content_Types].xml");
+    for (name, _) in parts.iter().filter(|p| p.0.starts_with("word/header")) {
+        assert!(types.contains(&format!("/{name}\"")), "{name}");
+    }
+    let blank = r#"<w:pStyle w:val="Footer"/></w:pPr></w:p></w:ftr>"#;
+    let footers = parts.iter().filter(|p| p.0.starts_with("word/footer"));
+    assert!(
+        footers
+            .map(|p| String::from_utf8_lossy(&p.1))
+            .any(|t| t.contains(blank))
+    );
+}
+
+#[test]
+fn even_headers_stay_off_when_no_document_has_them() {
+    let (_, parts) = merged("headers-off", &["a.docx", "c.docx"]);
+    let sections = references(&parts);
+    assert_eq!(shown(&sections[0], "headerReference", "even"), "");
+    assert_eq!(sections[2].len(), 6);
+    let base = entries(&fixture("a.docx"));
+    assert_eq!(
+        text(&parts, "word/settings.xml"),
+        text(&base, "word/settings.xml")
+    );
+}
+
+const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const OFFICE_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
+
+/// The parts of a Word file of `body` with `extra` parts (name, kind, xml), each related from
+/// the main part as `rId{1…}`.
+fn word_parts(body: &str, extra: &[(&str, &str, &str)]) -> Vec<(String, Vec<u8>)> {
+    let doc = format!(
+        r#"<w:document xmlns:w="{WORD_NS}" xmlns:r="{OFFICE_REL}" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>{body}</w:body></w:document>"#
+    );
+    let types: Vec<String> = extra.iter().map(|e| format!("{WML}{}+xml", e.1)).collect();
+    let typed: Vec<(&str, &str, &str)> = extra
+        .iter()
+        .zip(&types)
+        .map(|(e, t)| (e.0, t.as_str(), e.2))
+        .collect();
+    let mut parts = minimal("docx", &typed);
+    set(&mut parts, "word/document.xml", doc.as_bytes());
+    let list: Vec<(String, String, &str)> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let target = e.0.strip_prefix("word/").unwrap();
+            (
+                format!("rId{}", i + 1),
+                format!("{OFFICE_REL}/{}", e.1),
+                target,
+            )
+        })
+        .collect();
+    let list: Vec<(&str, &str, &str)> = list
+        .iter()
+        .map(|(i, k, t)| (i.as_str(), k.as_str(), *t))
+        .collect();
+    set(
+        &mut parts,
+        "word/_rels/document.xml.rels",
+        rels(&list).as_bytes(),
+    );
+    parts
+}
+
+fn word_file(dir: &Path, name: &str, body: &str, extra: &[(&str, &str, &str)]) -> PathBuf {
+    write(dir, name, &build(&word_parts(body, extra)))
+}
+
+fn merge_files(dir: &Path, files: &[PathBuf]) -> (Report, Vec<(String, Vec<u8>)>) {
+    let out = dir.join("out.docx");
+    let report = merge(files, &out, &Options::default(), None).unwrap();
+    let parts = entries(&out);
+    (report, parts)
+}
+
+#[test]
+fn a_document_with_no_section_break_still_gets_its_slots() {
+    let dir = temp_dir("no-sect");
+    let a = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    let b = word_file(&dir, "b.docx", "<w:p/>", &[]);
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    assert_eq!(references(&parts).last().unwrap().len(), 6);
+}
+
+#[test]
+fn a_picture_in_a_header_keeps_its_relationship_in_the_copy_and_its_twin() {
+    let dir = temp_dir("header-picture");
+    let header = format!(
+        r#"<w:hdr xmlns:w="{WORD_NS}" xmlns:r="{OFFICE_REL}"><w:p><w:r><w:pict r:id="rId2"/><w:t>H</w:t></w:r></w:p></w:hdr>"#
+    );
+    let body = r#"<w:p><w:r><w:pict r:id="rId2"/></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+    let mut parts = word_parts(body, &[("word/header1.xml", "header", &header)]);
+    let image = format!("{OFFICE_REL}/image");
+    let head = format!("{OFFICE_REL}/header");
+    let main_rels = rels(&[
+        ("rId1", head.as_str(), "header1.xml"),
+        ("rId2", image.as_str(), "media/body.png"),
+    ]);
+    set(
+        &mut parts,
+        "word/_rels/document.xml.rels",
+        main_rels.as_bytes(),
+    );
+    // The same id as the body picture's: it stays, as the header keeps its own relationships.
+    let own = rels(&[("rId2", image.as_str(), "media/head.png")]);
+    set(&mut parts, "word/_rels/header1.xml.rels", own.as_bytes());
+    set(&mut parts, "word/media/body.png", b"body picture");
+    set(&mut parts, "word/media/head.png", b"header picture");
+    let b = write(&dir, "b.docx", &build(&parts));
+    let a = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    let settings =
+        format!(r#"<w:settings xmlns:w="{WORD_NS}"><w:evenAndOddHeaders/></w:settings>"#);
+    let c = word_file(
+        &dir,
+        "c.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &settings)],
+    );
+    let (_, parts) = merge_files(&dir, &[a, b, c]);
+    let copies: Vec<_> = parts
+        .iter()
+        .filter(|p| String::from_utf8_lossy(&p.1).contains("<w:t>H</w:t>"))
+        .collect();
+    assert_eq!(copies.len(), 2, "the header and its twin");
+    for (name, xml) in copies {
+        assert!(String::from_utf8_lossy(xml).contains(r#"r:id="rId2""#));
+        let own = text(&parts, &format!("word/_rels/{}.rels", &name[5..]));
+        let target = own.split("Target=\"").nth(1).unwrap();
+        let target = &target[..target.find('"').unwrap()];
+        let picture = parts.iter().find(|p| p.0 == format!("word/{target}"));
+        assert_eq!(picture.unwrap().1, b"header picture");
+    }
+}
+
+#[test]
+fn a_base_with_no_settings_gets_them_for_even_headers() {
+    let dir = temp_dir("new-settings");
+    let settings =
+        format!(r#"<w:settings xmlns:w="{WORD_NS}"><w:evenAndOddHeaders w:val="1"/></w:settings>"#);
+    let a = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    let b = word_file(
+        &dir,
+        "b.docx",
+        "<w:p/>",
+        &[("word/settings.xml", "settings", &settings)],
+    );
+    let (_, parts) = merge_files(&dir, &[a, b]);
+    assert!(text(&parts, "word/settings.xml").contains("<w:evenAndOddHeaders/>"));
+    assert!(text(&parts, "word/_rels/document.xml.rels").contains("settings.xml"));
 }

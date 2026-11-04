@@ -78,7 +78,7 @@ impl Notes {
         let origin = inputs[i].origin.clone();
         let own = inputs[i].rels_of(&doc.part)?;
         let mut rids = HashMap::new();
-        for id in scan(&doc.text, &doc.part, &origin)?.rids {
+        for id in scan(&doc.text, &doc.part, &origin, false)?.rids {
             let Some(r) = own.iter().find(|r| r.id == id) else {
                 let why = format!("{} points to a missing relationship {id}", doc.part);
                 return Err(origin.bad(&why));

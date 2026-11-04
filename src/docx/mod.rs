@@ -3,6 +3,7 @@
 //! notes and comments appended (`notes`), and the parts its content points to copied with new
 //! relationship ids.
 
+mod headers;
 mod notes;
 mod numbering;
 mod styles;
@@ -17,6 +18,7 @@ use crate::package::{MAX_PARSED, MAX_STREAMED, Package, Rel, resolve};
 use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
 use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, start_tag, written};
 use crate::{Origin, Rename, StyleMode};
+use headers::Slot;
 use notes::{KINDS, Notes};
 use numbering::Lists;
 use styles::{Sheet, Source, Theme};
@@ -67,57 +69,141 @@ pub fn merge(
     mode: StyleMode,
     warnings: &mut Warnings,
 ) -> Result<Merged, Error> {
-    let mut plan = Plan::base(&inputs[0], warnings)?;
-    let main = inputs[0].main.clone();
-    let base_rels = inputs[0].rels_of(&main)?;
-    let mut rels = Rels::new(base_rels.clone());
-    let base_styles = held(&mut inputs[0], &main, &base_rels, "styles")?;
-    let mut style_root = Prefixes::of(base_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
-    let base_sheet = Sheet::new(base_styles.as_ref().map(|h| &h.tree));
-    let base_defaults = base_sheet.defaults.clone();
-    let base_p = base_sheet.default_of("paragraph").map(String::from);
-    let base_table = base_sheet.default_of("table").map(String::from);
-    let base_theme = theme(&mut inputs[0], &main, &base_rels)?;
-    let mut out_styles = styles::Output::new(base_sheet);
-    let base_numbering = held(&mut inputs[0], &main, &base_rels, "numbering")?;
-    let mut num_root = Prefixes::of(base_numbering.as_ref().map_or(&[], |h| &h.tree.attrs));
-    let num_part = base_numbering
-        .as_ref()
-        .map_or("word/numbering.xml", |h| &h.part)
-        .to_string();
-    let mut num_rels = Rels::new(inputs[0].rels_of(&num_part)?);
-    let num_rels_before = num_rels.list.len();
-    let mut out_lists =
-        numbering::Output::new(Lists::new(base_numbering.as_ref().map(|h| &h.tree)));
-    let mut next_bookmark = 0;
-    let mut notes = vec![];
-    for kind in KINDS {
-        notes.push(Notes::open(&mut inputs[0], &main, &base_rels, kind)?);
+    let mut m = Merger::new(inputs, mode, warnings)?;
+    m.add_base()?;
+    for i in 1..m.inputs.len() {
+        m.append(i)?;
     }
-    let mut docs = vec![];
-    let mut sections = vec![];
-    let mut renames = vec![];
-    let mut root = Prefixes::default();
-    for i in 0..inputs.len() {
-        let part = inputs[i].main.clone();
-        let origin = inputs[i].origin.clone();
-        let text = inputs[i].text(&part, MAX_STREAMED)?;
-        let mut uses = scan(&text, &part, &origin)?;
-        drop(text);
-        sections.push(uses.sections);
-        let w = prefix_of(&uses.root, W).unwrap_or("w").to_string();
-        if i == 0 {
-            next_bookmark = uses.bookmarks + 1;
-            root = Prefixes::of(&uses.root);
-            docs.push(Rewrite {
-                w,
-                ..Rewrite::default()
-            });
-            continue;
+    m.finish()
+}
+
+/// A header or footer an appended document uses: its relationship id, part and text.
+type Story = (String, String, String);
+
+/// The output as planned so far, with what appended documents are compared with.
+struct Merger<'a> {
+    inputs: &'a mut [Package],
+    warnings: &'a mut Warnings,
+    mode: StyleMode,
+    plan: Plan,
+    main: String,
+    rels: Rels,
+    /// Whether each input's settings have even and odd headers on.
+    evens: Vec<bool>,
+    base_styles: Option<Held>,
+    style_root: Prefixes,
+    base_defaults: Option<Node>,
+    base_p: Option<String>,
+    base_table: Option<String>,
+    base_theme: Option<Theme>,
+    out_styles: styles::Output,
+    base_numbering: Option<Held>,
+    num_root: Prefixes,
+    num_part: String,
+    num_rels: Rels,
+    num_rels_before: usize,
+    out_lists: numbering::Output,
+    next_bookmark: u64,
+    notes: Vec<Notes>,
+    root: Prefixes,
+    docs: Vec<Rewrite>,
+    sections: Vec<usize>,
+    renames: Vec<Rename>,
+}
+
+impl<'a> Merger<'a> {
+    fn new(
+        inputs: &'a mut [Package],
+        mode: StyleMode,
+        warnings: &'a mut Warnings,
+    ) -> Result<Self, Error> {
+        let plan = Plan::base(&inputs[0], warnings)?;
+        let main = inputs[0].main.clone();
+        let base_rels = inputs[0].rels_of(&main)?;
+        let mut evens = vec![];
+        for pkg in inputs.iter_mut() {
+            let part = pkg.main.clone();
+            let rels = pkg.rels_of(&part)?;
+            let settings = held(pkg, &part, &rels, "settings")?;
+            evens.push(settings.is_some_and(|h| headers::even_on(&h.tree)));
         }
-        let own = inputs[i].rels_of(&part)?;
+        let base_styles = held(&mut inputs[0], &main, &base_rels, "styles")?;
+        let base_sheet = Sheet::new(base_styles.as_ref().map(|h| &h.tree));
+        let base_numbering = held(&mut inputs[0], &main, &base_rels, "numbering")?;
+        let num_part = base_numbering
+            .as_ref()
+            .map_or("word/numbering.xml", |h| &h.part)
+            .to_string();
+        let num_rels = Rels::new(inputs[0].rels_of(&num_part)?);
+        let mut notes = vec![];
+        for kind in KINDS {
+            notes.push(Notes::open(&mut inputs[0], &main, &base_rels, kind)?);
+        }
+        Ok(Self {
+            plan,
+            rels: Rels::new(base_rels.clone()),
+            evens,
+            style_root: Prefixes::of(base_styles.as_ref().map_or(&[], |h| &h.tree.attrs)),
+            base_defaults: base_sheet.defaults.clone(),
+            base_p: base_sheet.default_of("paragraph").map(String::from),
+            base_table: base_sheet.default_of("table").map(String::from),
+            base_theme: theme(&mut inputs[0], &main, &base_rels)?,
+            out_styles: styles::Output::new(base_sheet),
+            num_root: Prefixes::of(base_numbering.as_ref().map_or(&[], |h| &h.tree.attrs)),
+            num_rels_before: num_rels.list.len(),
+            num_rels,
+            num_part,
+            out_lists: numbering::Output::new(Lists::new(base_numbering.as_ref().map(|h| &h.tree))),
+            base_styles,
+            base_numbering,
+            next_bookmark: 0,
+            notes,
+            root: Prefixes::default(),
+            docs: vec![],
+            sections: vec![],
+            renames: vec![],
+            main,
+            inputs,
+            warnings,
+            mode,
+        })
+    }
+
+    /// Whether input `i`'s even pages show its default headers, though the output has even
+    /// and odd headers on.
+    fn needs_twins(&self, i: usize) -> bool {
+        !self.evens[i] && self.evens.iter().any(|&e| e)
+    }
+
+    fn add_base(&mut self) -> Result<(), Error> {
+        let origin = self.inputs[0].origin.clone();
+        let main = self.main.clone();
+        let twins = self.needs_twins(0);
+        let text = self.inputs[0].text(&main, MAX_STREAMED)?;
+        let uses = scan(&text, &main, &origin, twins)?;
+        drop(text);
+        self.sections.push(uses.sections);
+        self.next_bookmark = uses.bookmarks + 1;
+        self.root = Prefixes::of(&uses.root);
+        let mut rw = Rewrite {
+            w: prefix_of(&uses.root, W).unwrap_or("w").to_string(),
+            r: prefix_of(&uses.root, R).map(String::from),
+            ..Rewrite::default()
+        };
+        if twins {
+            let own = self.inputs[0].rels_of(&main)?;
+            self.add_twins(0, &own, &uses, &mut rw)?;
+        }
+        self.docs.push(rw);
+        Ok(())
+    }
+
+    /// The headers and footers input `i`'s body points to, with what they use added to `uses`.
+    fn stories(&mut self, i: usize, own: &[Rel], uses: &mut Uses) -> Result<Vec<Story>, Error> {
+        let origin = self.inputs[i].origin.clone();
+        let part = self.inputs[i].main.clone();
         let mut stories = vec![];
-        for id in &uses.rids {
+        for id in &uses.rids.clone() {
             let Some(r) = own.iter().find(|r| &r.id == id) else {
                 return Err(origin.bad(&format!("{part} points to a missing relationship {id}")));
             };
@@ -127,46 +213,56 @@ pub fn merge(
             let Some(target) = resolve(&part, &r.target) else {
                 continue;
             };
-            if inputs[i].has(&target) {
-                let text = inputs[i].text(&target, MAX_PARSED)?;
-                let found = scan(&text, &target, &origin)?;
-                uses.styles.extend(found.styles);
-                uses.nums.extend(found.nums);
-                uses.bookmarks = uses.bookmarks.max(found.bookmarks);
+            if self.inputs[i].has(&target) {
+                let text = self.inputs[i].text(&target, MAX_PARSED)?;
+                uses.add(scan(&text, &target, &origin, false)?);
                 stories.push((id.clone(), target, text));
             }
         }
+        Ok(stories)
+    }
+
+    fn append(&mut self, i: usize) -> Result<(), Error> {
+        let part = self.inputs[i].main.clone();
+        let origin = self.inputs[i].origin.clone();
+        let twins = self.needs_twins(i);
+        let text = self.inputs[i].text(&part, MAX_STREAMED)?;
+        let mut uses = scan(&text, &part, &origin, twins)?;
+        drop(text);
+        self.sections.push(uses.sections);
+        let own = self.inputs[i].rels_of(&part)?;
+        let stories = self.stories(i, &own, &mut uses)?;
         let mut doc_notes = vec![];
         for (kind, _) in KINDS {
-            let h = held(&mut inputs[i], &part, &own, kind)?;
+            let h = held(&mut self.inputs[i], &part, &own, kind)?;
             if let Some(h) = &h {
-                let found = scan(&h.text, &h.part, &origin)?;
-                uses.styles.extend(found.styles);
-                uses.nums.extend(found.nums);
-                uses.bookmarks = uses.bookmarks.max(found.bookmarks);
+                uses.add(scan(&h.text, &h.part, &origin, false)?);
             }
             doc_notes.push(h);
         }
-        let doc_styles = held(&mut inputs[i], &part, &own, "styles")?;
+        let doc_styles = held(&mut self.inputs[i], &part, &own, "styles")?;
         let mut sheet = Sheet::new(doc_styles.as_ref().map(|h| &h.tree));
-        let keep = mode == StyleMode::Keep;
-        if keep && sheet.defaults_differ(base_defaults.as_ref()) {
-            sheet.fold_defaults(base_defaults.as_ref());
+        let keep = self.mode == StyleMode::Keep;
+        if keep && sheet.defaults_differ(self.base_defaults.as_ref()) {
+            sheet.fold_defaults(self.base_defaults.as_ref());
         }
-        let doc_theme = theme(&mut inputs[i], &part, &own)?
-            .filter(|t| keep && base_theme.as_ref().is_some_and(|b| t.differs(b)));
+        let base_theme = self.base_theme.as_ref();
+        let doc_theme = theme(&mut self.inputs[i], &part, &own)?
+            .filter(|t| keep && base_theme.is_some_and(|b| t.differs(b)));
         if doc_theme.is_some() {
-            warnings.push(Warning::theme_differs(i + 1, &origin.name));
+            self.warnings
+                .push(Warning::theme_differs(i + 1, &origin.name));
         }
-        let doc_numbering = held(&mut inputs[i], &part, &own, "numbering")?;
+        let doc_numbering = held(&mut self.inputs[i], &part, &own, "numbering")?;
         let lists = Lists::new(doc_numbering.as_ref().map(|h| &h.tree));
+        let out_lists = &self.out_lists;
         let source = Source {
             sheet: &sheet,
-            mode,
+            mode: self.mode,
             position: i + 1,
             lists: &|n| lists.form(n),
             output_lists: &|n| out_lists.lists.form(n),
-            themes: doc_theme.as_ref().zip(base_theme.as_ref()),
+            themes: doc_theme.as_ref().zip(base_theme),
         };
         let mut seeds = uses.styles.clone();
         seeds.extend(
@@ -176,19 +272,21 @@ pub fn merge(
                 .map(String::from),
         );
         seeds.extend(uses.nums.iter().flat_map(|n| lists.links(n)));
-        let mapped = out_styles.map(&source, &sheet.closure(&seeds, &|n| lists.links(n)))?;
-        renames.extend(mapped.renames.iter().map(|(from, to)| Rename {
-            input: i + 1,
-            kind: "style",
-            from: from.clone(),
-            to: to.clone(),
-        }));
+        let used = sheet.closure(&seeds, &|n| lists.links(n));
+        let mapped = self.out_styles.map(&source, &used)?;
+        self.renames
+            .extend(mapped.renames.iter().map(|(from, to)| Rename {
+                input: i + 1,
+                kind: "style",
+                from: from.clone(),
+                to: to.clone(),
+            }));
         let bare = |kind: &str, output: &Option<String>| {
             let new = mapped.ids.get(sheet.default_of(kind)?)?;
             (Some(new) != output.as_ref()).then(|| new.clone())
         };
         // Lists reached only through a style the output already has stay the output's.
-        for s in &out_styles.styles[mapped.copied.clone()] {
+        for s in &self.out_styles.styles[mapped.copied.clone()] {
             s.walk(&mut |n| {
                 if n.is(W, "numId")
                     && let Some(v) = n.attr(W, "val")
@@ -198,47 +296,47 @@ pub fn merge(
             });
         }
         let num_source = doc_numbering.as_ref().map_or("", |h| h.part.as_str());
-        let num_own = inputs[i].rels_of(num_source)?;
+        let num_own = self.inputs[i].rels_of(num_source)?;
+        let (plan, inputs) = (&mut self.plan, &mut *self.inputs);
+        let (num_part, num_rels) = (&self.num_part, &mut self.num_rels);
         let mut bullet = |old: &str| {
             let Some(r) = num_own.iter().find(|r| r.id == old) else {
                 let why = format!("{num_source} points to a missing relationship {old}");
                 return Err(origin.bad(&why));
             };
-            let new = copy_rel(
-                &mut plan,
-                inputs,
-                i,
-                num_source,
-                r,
-                &num_part,
-                &mut num_rels,
-            )?;
+            let new = copy_rel(plan, inputs, i, num_source, r, num_part, num_rels)?;
             Ok(new.0)
         };
-        let copied = out_lists.copy(&lists, &uses.nums, i + 1, &mut bullet)?;
+        let copied = self
+            .out_lists
+            .copy(&lists, &uses.nums, i + 1, &mut bullet)?;
         let mut rw = Rewrite {
-            rids: Some(HashMap::new()),
             nums: copied.nums,
-            notes: Default::default(),
-            bookmarks: next_bookmark,
-            bare_p: bare("paragraph", &base_p),
-            bare_table: bare("table", &base_table),
+            bookmarks: self.next_bookmark,
+            bare_p: bare("paragraph", &self.base_p),
+            bare_table: bare("table", &self.base_table),
             theme: doc_theme,
             styles: mapped.ids,
-            local: root.merge(&uses.root),
-            w,
+            local: self.root.merge(&uses.root),
+            w: prefix_of(&uses.root, W).unwrap_or("w").to_string(),
+            r: prefix_of(&uses.root, R).map(String::from),
             appended: true,
+            ..Rewrite::default()
         };
-        next_bookmark += uses.bookmarks + 1;
-        let local = style_root.merge(doc_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
-        for s in &mut out_styles.styles[mapped.copied] {
+        self.next_bookmark += uses.bookmarks + 1;
+        let local = self
+            .style_root
+            .merge(doc_styles.as_ref().map_or(&[], |h| &h.tree.attrs));
+        for s in &mut self.out_styles.styles[mapped.copied] {
             s.walk_mut(&mut |n| {
                 rw.attrs(&n.ns, &n.local, &mut n.attrs);
             });
             s.attrs.extend(local.iter().cloned());
         }
-        let local = num_root.merge(doc_numbering.as_ref().map_or(&[], |h| &h.tree.attrs));
-        let added = &mut out_lists.lists;
+        let local = self
+            .num_root
+            .merge(doc_numbering.as_ref().map_or(&[], |h| &h.tree.attrs));
+        let added = &mut self.out_lists.lists;
         for s in &mut added.abstracts[copied.abstracts] {
             s.walk_mut(&mut |n| {
                 rw.attrs(&n.ns, &n.local, &mut n.attrs);
@@ -253,88 +351,136 @@ pub fn merge(
         }
         for (k, h) in doc_notes.iter().enumerate() {
             if let Some(h) = h {
-                rw.notes[k] = notes[k].add(&mut plan, inputs, i, h, &mut rw)?;
+                rw.notes[k] = self.notes[k].add(&mut self.plan, self.inputs, i, h, &mut rw)?;
             }
         }
+        self.copy_body_rels(i, &own, &uses, &stories, &mut rw)?;
+        if twins {
+            self.add_twins(i, &own, &uses, &mut rw)?;
+        }
+        self.fill_slots(&uses, &mut rw, twins);
+        self.docs.push(rw);
+        Ok(())
+    }
+
+    /// Copies what input `i`'s body points to, each header and footer with the rewrite applied.
+    fn copy_body_rels(
+        &mut self,
+        i: usize,
+        own: &[Rel],
+        uses: &Uses,
+        stories: &[Story],
+        rw: &mut Rewrite,
+    ) -> Result<(), Error> {
+        let part = self.inputs[i].main.clone();
+        let origin = self.inputs[i].origin.clone();
+        let mut rids = HashMap::new();
         let mut done = HashSet::new();
         for id in &uses.rids {
             let Some(r) = own.iter().find(|r| &r.id == id) else {
                 continue;
             };
-            let (new, copied) = copy_rel(&mut plan, inputs, i, &part, r, &main, &mut rels)?;
-            rw.rids.as_mut().unwrap().insert(id.clone(), new);
+            let (plan, inputs) = (&mut self.plan, &mut *self.inputs);
+            let (new, copied) = copy_rel(plan, inputs, i, &part, r, &self.main, &mut self.rels)?;
+            rids.insert(id.clone(), new);
             if let Some((_, source, text)) = stories.iter().find(|s| &s.0 == id)
                 && let Some(copied) = copied
                 && done.insert(copied.clone())
             {
-                let body = story(text, source, &origin, &rw)?;
-                plan.replace(&copied, Body::Data(body));
+                let body = story(text, source, &origin, rw)?;
+                self.plan.replace(&copied, Body::Data(body));
             }
         }
-        docs.push(rw);
+        rw.rids = Some(rids);
+        Ok(())
     }
-    let origin = inputs[0].origin.clone();
-    let parts = Parts {
-        main: &main,
-        kind: "styles",
-    };
-    let inserts: [(&[&str], &str); 1] = [(&[], &written(out_styles.added()))];
-    let base = base_styles.as_ref();
-    registry(
-        &mut plan,
-        &mut rels,
-        &parts,
-        base,
-        &style_root,
-        &inserts,
-        &origin,
-    )?;
-    let [bullets, abstracts, nums] = out_lists.added().map(written);
-    let inserts: [(&[&str], &str); 3] = [
-        (&["abstractNum", "num", "numIdMacAtCleanup"], &bullets),
-        (&["num", "numIdMacAtCleanup"], &abstracts),
-        (&["numIdMacAtCleanup"], &nums),
-    ];
-    let parts = Parts {
-        main: &main,
-        kind: "numbering",
-    };
-    let base = base_numbering.as_ref();
-    registry(
-        &mut plan, &mut rels, &parts, base, &num_root, &inserts, &origin,
-    )?;
-    if num_rels.list.len() > num_rels_before {
-        rels_part(&mut plan, &inputs[0], &num_part, &num_rels);
+
+    fn finish(mut self) -> Result<Merged, Error> {
+        let origin = self.inputs[0].origin.clone();
+        let main = self.main.clone();
+        let parts = Parts {
+            main: &main,
+            kind: "styles",
+        };
+        let inserts: [(&[&str], &str); 1] = [(&[], &written(self.out_styles.added()))];
+        let base = self.base_styles.as_ref();
+        registry(
+            &mut self.plan,
+            &mut self.rels,
+            &parts,
+            base,
+            &self.style_root,
+            &inserts,
+            &origin,
+        )?;
+        let [bullets, abstracts, nums] = self.out_lists.added().map(written);
+        let inserts: [(&[&str], &str); 3] = [
+            (&["abstractNum", "num", "numIdMacAtCleanup"], &bullets),
+            (&["num", "numIdMacAtCleanup"], &abstracts),
+            (&["numIdMacAtCleanup"], &nums),
+        ];
+        let parts = Parts {
+            main: &main,
+            kind: "numbering",
+        };
+        let base = self.base_numbering.as_ref();
+        registry(
+            &mut self.plan,
+            &mut self.rels,
+            &parts,
+            base,
+            &self.num_root,
+            &inserts,
+            &origin,
+        )?;
+        if self.num_rels.list.len() > self.num_rels_before {
+            rels_part(
+                &mut self.plan,
+                &self.inputs[0],
+                &self.num_part,
+                &self.num_rels,
+            );
+        }
+        for n in &self.notes {
+            n.finish(
+                &mut self.plan,
+                &mut self.rels,
+                &self.inputs[0],
+                &main,
+                &origin,
+            )?;
+        }
+        if self.needs_twins(0) {
+            self.even_setting(&origin)?;
+        }
+        let root_attrs = self.root.attrs;
+        let count = self.inputs.len();
+        let docs = self.docs;
+        self.plan.replace(
+            &main,
+            Body::Stream(Box::new(move |out, inputs| {
+                let mut tail = String::new();
+                for (i, rw) in docs.iter().enumerate() {
+                    let part = inputs[i].main.clone();
+                    let origin = inputs[i].origin.clone();
+                    let text = inputs[i].text(&part, MAX_STREAMED)?;
+                    let role = Role {
+                        base: i == 0,
+                        last: i + 1 == count,
+                        root: &root_attrs,
+                    };
+                    tail = body(&text, &part, &origin, rw, &role, out)?.unwrap_or(tail);
+                }
+                out.write_all(tail.as_bytes()).map_err(io)
+            })),
+        );
+        rels_part(&mut self.plan, &self.inputs[0], &main, &self.rels);
+        Ok(Merged {
+            plan: self.plan,
+            sections: self.sections,
+            renames: self.renames,
+        })
     }
-    for n in &notes {
-        n.finish(&mut plan, &mut rels, &inputs[0], &main, &origin)?;
-    }
-    let root_attrs = root.attrs;
-    let count = inputs.len();
-    plan.replace(
-        &main,
-        Body::Stream(Box::new(move |out, inputs| {
-            let mut tail = String::new();
-            for (i, rw) in docs.iter().enumerate() {
-                let part = inputs[i].main.clone();
-                let origin = inputs[i].origin.clone();
-                let text = inputs[i].text(&part, MAX_STREAMED)?;
-                let role = Role {
-                    base: i == 0,
-                    last: i + 1 == count,
-                    root: &root_attrs,
-                };
-                tail = body(&text, &part, &origin, rw, &role, out)?.unwrap_or(tail);
-            }
-            out.write_all(tail.as_bytes()).map_err(io)
-        })),
-    );
-    rels_part(&mut plan, &inputs[0], &main, &rels);
-    Ok(Merged {
-        plan,
-        sections,
-        renames,
-    })
 }
 
 /// A document's theme, read with its `w:themeFontLang`.
@@ -444,18 +590,17 @@ fn extend(
 fn story(text: &str, part: &str, origin: &Origin, rw: &Rewrite) -> Result<Vec<u8>, Error> {
     let mut r = Reader::new(text, part, origin);
     let mut buf = Vec::with_capacity(text.len());
-    let mut bare = Bare::default();
+    let mut walk = Walk::default();
     loop {
         let event = r.event()?;
         match &event {
             Event::Eof => return Ok(buf),
             Event::Start(e) | Event::Empty(e) => {
                 let empty = matches!(event, Event::Empty(_));
-                let place = Place::Inner;
-                element(&mut r, e, empty, rw, &mut false, place, &mut bare, &mut buf)?;
+                element(&mut r, e, empty, rw, &mut walk, Place::Inner, &mut buf)?;
             }
             Event::End(_) => {
-                bare.end(rw, &mut buf);
+                walk.bare.end(rw, &mut buf);
                 put(&mut buf, &event);
             }
             _ => put(&mut buf, &event),
@@ -547,6 +692,19 @@ struct Uses {
     bookmarks: u64,
     sections: usize,
     root: Vec<Attr>,
+    /// Relationship ids of the default header and footer references of every section.
+    defaults: Vec<String>,
+    /// Which references the first section has: (element name, type).
+    first_slots: HashSet<(&'static str, String)>,
+}
+
+impl Uses {
+    /// Adds what a header, footer or notes part of the same document uses.
+    fn add(&mut self, other: Uses) {
+        self.styles.extend(other.styles);
+        self.nums.extend(other.nums);
+        self.bookmarks = self.bookmarks.max(other.bookmarks);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -576,7 +734,8 @@ fn is_rid(a: &Attr) -> bool {
     (a.ns == R || (a.ns == O && a.local == "relid")) && !a.value.is_empty()
 }
 
-fn scan(text: &str, part: &str, origin: &Origin) -> Result<Uses, Error> {
+/// What a part uses; `twins` leaves out its even header and footer references.
+fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Error> {
     let mut r = Reader::new(text, part, origin);
     let mut uses = Uses::default();
     let mut seen = HashSet::new();
@@ -621,6 +780,21 @@ fn scan(text: &str, part: &str, origin: &Origin) -> Result<Uses, Error> {
         {
             uses.bookmarks = uses.bookmarks.max(a.value.parse().unwrap_or(0));
         }
+        let reference = headers::reference(r.element_ns(e), e.local_name().as_ref());
+        if let Some(local) = reference.filter(|_| stack.last() == Some(&Tag::SectPr)) {
+            let kind = attrs.iter().find(|a| a.ns == W && a.local == "type");
+            let kind = kind.map_or("default", |a| a.value.as_str());
+            if twins && kind == "even" {
+                continue;
+            }
+            if uses.sections == 1 {
+                uses.first_slots.insert((local, kind.to_string()));
+            }
+            if kind == "default" {
+                let rid = attrs.iter().find(|a| is_rid(a));
+                uses.defaults.extend(rid.map(|a| a.value.clone()));
+            }
+        }
         for a in attrs.iter().filter(|a| is_rid(a)) {
             if seen.insert(a.value.clone()) {
                 uses.rids.push(a.value.clone());
@@ -655,9 +829,16 @@ struct Rewrite {
     /// Declarations each top-level element brings because the output root binds their prefix
     /// to another namespace.
     local: Vec<Attr>,
-    /// This document's prefix for the main namespace.
+    /// This document's prefix for the main namespace, and for relationships if it has one.
     w: String,
+    r: Option<String>,
     appended: bool,
+    /// Set when this document's even references go, each default one getting a twin: old
+    /// relationship ids to the twins' new ones.
+    twin: bool,
+    twins: HashMap<String, String>,
+    /// What the first section gets for the slots it leaves open.
+    fill: Vec<Slot>,
 }
 
 impl Rewrite {
@@ -773,8 +954,10 @@ fn body(
     let mut mark: Option<Mark> = None;
     let mut plain = true;
     let mut sect: Option<Vec<u8>> = None;
-    let mut first_sect = rw.appended;
-    let mut bare = Bare::default();
+    let mut walk = Walk {
+        first_sect: rw.appended,
+        ..Walk::default()
+    };
     loop {
         let event = r.event()?;
         let depth = stack.len();
@@ -818,17 +1001,7 @@ fn body(
                 let parent = stack.last().copied();
                 if depth == b && t == Tag::SectPr {
                     let mut s = vec![];
-                    let top = Place::Top;
-                    element(
-                        &mut r,
-                        e,
-                        empty,
-                        rw,
-                        &mut first_sect,
-                        top,
-                        &mut bare,
-                        &mut s,
-                    )?;
+                    element(&mut r, e, empty, rw, &mut walk, Place::Top, &mut s)?;
                     sect = Some(s);
                     continue;
                 }
@@ -841,20 +1014,10 @@ fn body(
                     mark = None;
                     plain = true;
                     if t == Tag::P && empty {
-                        let top = Place::Top;
-                        element(
-                            &mut r,
-                            e,
-                            false,
-                            rw,
-                            &mut first_sect,
-                            top,
-                            &mut bare,
-                            &mut buf,
-                        )?;
+                        element(&mut r, e, false, rw, &mut walk, Place::Top, &mut buf)?;
                         let mut m = Mark::Wrap(buf.len());
-                        bare.end(rw, &mut buf);
-                        if let Some(at) = bare.made.take() {
+                        walk.bare.end(rw, &mut buf);
+                        if let Some(at) = walk.bare.made.take() {
                             m = Mark::Insert(at);
                         }
                         buf.extend(format!("</{}>", e.name().as_ref()).as_bytes());
@@ -870,16 +1033,7 @@ fn body(
                     plain &= t != Tag::SectPr;
                 }
                 let place = if depth == b { Place::Top } else { Place::Inner };
-                let whole = element(
-                    &mut r,
-                    e,
-                    empty,
-                    rw,
-                    &mut first_sect,
-                    place,
-                    &mut bare,
-                    &mut buf,
-                )?;
+                let whole = element(&mut r, e, empty, rw, &mut walk, place, &mut buf)?;
                 let top_p = depth == b + 1 && stack[b] == Tag::P;
                 match t {
                     Tag::P if depth == b && !empty => mark = Some(Mark::Wrap(buf.len())),
@@ -887,7 +1041,7 @@ fn body(
                     Tag::PPr if top_p => mark = None,
                     _ => {}
                 }
-                if let Some(at) = bare.made.take()
+                if let Some(at) = walk.bare.made.take()
                     && top_p
                 {
                     mark = Some(Mark::Insert(at));
@@ -902,7 +1056,7 @@ fn body(
                 if t == Tag::Body {
                     let s = sect
                         .take()
-                        .unwrap_or_else(|| format!("<{w}:sectPr/>").into_bytes());
+                        .unwrap_or_else(|| headers::missing_section(rw, walk.first_sect));
                     match held.take() {
                         Some((p, _)) if role.last => out.write_all(&[p, buf, s].concat()),
                         None if role.last => out.write_all(&[buf, s].concat()),
@@ -919,8 +1073,8 @@ fn body(
                         .base
                         .then(|| text[end.unwrap_or(text.len())..].to_string()));
                 }
-                bare.end(rw, &mut buf);
-                if let Some(at) = bare.made.take()
+                walk.bare.end(rw, &mut buf);
+                if let Some(at) = walk.bare.made.take()
                     && t == Tag::P
                     && depth == b
                 {
@@ -967,6 +1121,14 @@ enum Place {
 enum Block {
     P,
     Table,
+}
+
+/// What a walk over one part keeps between elements.
+#[derive(Default)]
+struct Walk {
+    bare: Bare,
+    /// Whether the next section break is an appended document's first.
+    first_sect: bool,
 }
 
 /// Gives paragraphs and tables with no style their document's default one, when that isn't the
@@ -1064,19 +1226,16 @@ fn splice(mut p: Vec<u8>, m: Mark, s: &[u8], w: &str) -> Vec<u8> {
     p
 }
 
-/// Writes an element's start tag with the rewrite applied. A section break is written whole,
-/// and the first one of an appended document starts a new page. An appended content control
-/// loses its data binding, or Word could refill it from the base's data. Returns true when the
-/// element's content has been dealt with too.
-#[allow(clippy::too_many_arguments)]
+/// Writes an element's start tag with the rewrite applied. A section break is written whole.
+/// An appended content control loses its data binding, or Word could refill it from the base's
+/// data. Returns true when the element's content has been dealt with too.
 fn element<'a>(
     r: &mut Reader<'a>,
     e: &BytesStart<'a>,
     empty: bool,
     rw: &Rewrite,
-    first_sect: &mut bool,
+    walk: &mut Walk,
     place: Place,
-    bare: &mut Bare,
     buf: &mut Vec<u8>,
 ) -> Result<bool, Error> {
     let ns = r.element_ns(e);
@@ -1087,34 +1246,12 @@ fn element<'a>(
         }
         return Ok(true);
     }
-    let sect = tag(ns, e.local_name().as_ref().as_bytes()) == Tag::SectPr;
-    let first = sect && std::mem::take(first_sect);
-    start(r, e, empty, rw, place, bare, buf)?;
-    if !sect || empty {
-        return Ok(false);
+    if tag(ns, e.local_name().as_ref().as_bytes()) == Tag::SectPr {
+        headers::section(r, e, empty, rw, walk, place, buf)?;
+        return Ok(true);
     }
-    let depth = r.depth();
-    loop {
-        let event = r.event()?;
-        match &event {
-            Event::Start(e) | Event::Empty(e) => {
-                let empty = matches!(event, Event::Empty(_));
-                let child = first && r.depth() == depth + usize::from(!empty);
-                let place = if child {
-                    Place::FirstSection
-                } else {
-                    Place::Inner
-                };
-                start(r, e, empty, rw, place, bare, buf)?;
-            }
-            Event::End(_) if r.depth() < depth => {
-                put(buf, &event);
-                return Ok(true);
-            }
-            Event::Eof => return Ok(true),
-            _ => put(buf, &event),
-        }
-    }
+    start(r, e, empty, rw, place, &mut walk.bare, buf)?;
+    Ok(false)
 }
 
 /// One start tag, rebuilt only when the rewrite changes it.

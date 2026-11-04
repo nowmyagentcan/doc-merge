@@ -221,6 +221,12 @@ impl Output {
         self.styles.push(s);
     }
 
+    /// The id of the output's style of a type and (lower-case) name.
+    pub fn id_named(&self, kind: &str, name: &str) -> Option<&str> {
+        let key = (kind.to_string(), name.to_string());
+        self.names.get(&key).map(|&i| id_of(&self.styles[i]))
+    }
+
     /// The styles copied so far.
     pub fn added(&self) -> &[Node] {
         &self.styles[self.base..]
