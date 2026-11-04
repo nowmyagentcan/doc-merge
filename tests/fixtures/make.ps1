@@ -4,7 +4,7 @@
 # the file is opened and saved again by its app. Names are scrubbed last: document authors
 # become doc-merge, comment authors Author A / Author B. Only the Office processes this script
 # started are stopped.
-param([Parameter(Mandatory)][ValidateSet('word')][string]$Family)
+param([Parameter(Mandatory)][ValidateSet('word', 'excel')][string]$Family)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing, System.IO.Compression, System.IO.Compression.FileSystem
 $out = $PSScriptRoot
@@ -85,6 +85,12 @@ function Scrub([string]$name, [string]$text, [string]$author) {
       $initials = ($author -split ' ' | ForEach-Object { $_[0] }) -join ''
       return $text -replace 'w:author="[^"]*"', "w:author=""$author""" -replace 'w:initials="[^"]*"', "w:initials=""$initials"""
     }
+    'xl/comments\d*\.xml$' { return $text -replace '<author>(?!tc=)[^<]*</author>', "<author>$author</author>" }
+    'xl/persons/person\.xml$' {
+      return $text -replace 'displayName="[^"]*"', "displayName=""$author""" -replace 'userId="[^"]*"', "userId=""$author""" -replace 'providerId="[^"]*"', 'providerId="None"'
+    }
+    'pivotCacheDefinition\d*\.xml$' { return $text -replace 'refreshedBy="[^"]*"', 'refreshedBy="doc-merge"' }
+    'externalLink\d+\.xml\.rels$' { return $text -replace 'Target="[^"]*ext\.xlsx"', 'Target="ext.xlsx"' }
     'people\.xml$' {
       return $text -replace '<w15:person w15:author="[^"]*">.*?</w15:person>', "<w15:person w15:author=""$author""><w15:presenceInfo w15:providerId=""None"" w15:userId=""$author""/></w15:person>"
     }
@@ -276,8 +282,140 @@ function Word-Docs {
   }
 }
 
+function Excel-Books {
+  $none = [Type]::Missing
+  $xl = Track @('EXCEL') { New-Object -ComObject Excel.Application }
+  $xl.Visible = $false
+  $xl.DisplayAlerts = $false
+  $xl.AskToUpdateLinks = $false
+  try {
+    # Fills $sheet from row $row with the rows of $table (arrays of cell values).
+    function Rows($sheet, [int]$row, [object[]]$table) {
+      foreach ($line in $table) {
+        for ($c = 0; $c -lt $line.Count; $c++) { $sheet.Cells.Item($row, $c + 1).Formula = [string]$line[$c] }
+        $row++
+      }
+    }
+
+    # a.xlsx: sheets Data and Summary, a custom number format, the name Total, the table
+    # Sales, a chart, a conditional format, a validation, a note and a threaded comment.
+    $wb = $xl.Workbooks.Add()
+    $wb.ApplyTheme("$themes\Office 2013 - 2022 Theme.thmx")
+    $data = $wb.Worksheets.Item(1); $data.Name = 'Data'
+    Rows $data 1 @(@('Item', 'Amount', 'Qty'), @('Apple', 12.5, 3), @('Pear', 30, 4), @('Plum', 7.25, 9), @('Fig', 41, 2))
+    $data.ListObjects.Add(1, $data.Range('A1:C5'), $none, 1).Name = 'Sales'
+    $data.Range('B2:B5').NumberFormat = '0.00" kg"'
+    Step chart
+    $chart = $data.Shapes.AddChart2(201, 51, 320, 10, 280, 180)
+    $chart.Chart.SetSourceData($data.Range('A1:B5'))
+    $cf = $data.Range('B2:B5').FormatConditions.Add(1, 5, '=25')
+    $cf.Interior.Color = 0xCEC7FF; $cf.Font.Bold = $true
+    $data.Range('E2').Validation.Add(3, 1, 1, 'Apple,Pear,Plum') | Out-Null
+    $data.Range('E1').Value2 = 'Pick'
+    $summary = $wb.Worksheets.Add($none, $data); $summary.Name = 'Summary'
+    Rows $summary 1 @(@(1, 'first'), @('Total', 0))
+    $summary.Range('B2').Formula = '=SUM(Sales[Amount])'
+    $wb.Names.Add('Total', '=Summary!$B$2') | Out-Null
+    $summary.Range('C2').Formula = '=Total*3'
+    $summary.Range('C3').Formula = '=Data!B2+1'
+    $summary.Range('D2').AddComment('A note by A.') | Out-Null
+    Step threaded
+    $summary.Range('D3').AddCommentThreaded('A threaded comment by A.') | Out-Null
+    $data.Activate()
+    $wb.SaveAs([string](Join-Path $out 'a.xlsx'), 51)
+    $wb.Close($false)
+
+    # The workbook b.xlsx links to.
+    $wb = $xl.Workbooks.Add()
+    $wb.Worksheets.Item(1).Range('A1').Value2 = 99
+    $ext = [string](Join-Path $tmp 'ext.xlsx')
+    $wb.SaveAs($ext, 51)
+    $wb.Close($false)
+
+    # b.xlsx: another theme with theme colours in fills, fonts and the tab, the clashing sheet
+    # Summary, table Sales, name Total and number format id, the formulas of the merge cases,
+    # sparklines, a spilling FILTER, a check box, an external link, and each kind of formula
+    # text: a conditional format, a validation, a hyperlink, a calculated column, a local name.
+    $wb = $xl.Workbooks.Add()
+    $wb.ApplyTheme("$themes\Facet.thmx")
+    $summary = $wb.Worksheets.Item(1); $summary.Name = 'Summary'
+    Rows $summary 1 @(@(10, 'one'), @(20, 7.5), @(30, 'plain'))
+    $summary.Range('B2').NumberFormat = '#,##0.0" units"'
+    $summary.Range('A1:B1').Interior.ThemeColor = 6
+    $summary.Range('A1:B1').Interior.TintAndShade = 0.6
+    $summary.Range('A2').Interior.ThemeColor = 9
+    $summary.Range('A1').Font.ThemeColor = 5
+    $summary.Range('B1').Font.ThemeColor = 10
+    $summary.Range('B1').Font.TintAndShade = -0.25
+    $summary.Range('B2').Interior.ThemeColor = 4
+    $summary.Range('A3').Font.Name = 'Consolas'
+    $summary.Range('A3').Font.Color = 0x0000FF
+    $summary.Tab.ThemeColor = 7
+    $detail = $wb.Worksheets.Add($none, $summary); $detail.Name = 'Detail'
+    $detail.Range('A1').Value2 = 5
+    Rows $detail 3 @(@('Item', 'Amount', 'Double'), @('Rope', 4, 0), @('Nail', 1, 0), @('Bolt', 6, 0))
+    $list = $detail.ListObjects.Add(1, $detail.Range('A3:C6'), $none, 1); $list.Name = 'Sales'
+    $list.ListColumns.Item(3).DataBodyRange.Formula = '=[@Amount]*2'
+    $list.ShowTotals = $true
+    $wb.Names.Add('Total', '=Detail!$B$4') | Out-Null
+    $detail.Names.Add('Local', '=Summary!$A$2') | Out-Null
+    $detail.Range('E1').Formula = '=Summary!B2'
+    $detail.Range('E2').Formula = '=SUM(Sales[Amount])'
+    $detail.Range('E3').Formula = '=Total*2'
+    $detail.Range('E4').Formula = '=SUM(Detail:Summary!A1)'
+    $detail.Range('E5').Formula = '=Local+1'
+    $detail.Range('E6').Formula = "='" + $tmp + "\[ext.xlsx]Sheet1'!`$A`$1"
+    Step sparklines
+    $detail.Range('F4').SparklineGroups.Add(1, 'Detail!B4:B6') | Out-Null
+    $detail.Range('F4').SparklineGroups.Item(1).SeriesColor.ThemeColor = 6
+    $detail.Range('G1').Formula2 = '=FILTER(Sales[Item],Sales[Amount]>2)'
+    Step controls
+    $box = $detail.CheckBoxes().Add(420, 10, 90, 18)
+    $box.LinkedCell = 'Summary!$D$1'
+    $box.Value = 1
+    $cf = $detail.Range('B4:B6').FormatConditions.Add(2, 0, '=B4>Summary!$A$1/5')
+    $cf.Interior.Color = 0x9CE6FF; $cf.Font.Italic = $true
+    $cf = $detail.Range('A1').FormatConditions.Add(1, 5, '=3')
+    $cf.Font.ThemeColor = 6; $cf.Font.Bold = $true
+    $detail.Range('H1').Validation.Add(3, 1, 1, '=Summary!$A$1:$A$3') | Out-Null
+    $detail.Hyperlinks.Add($detail.Range('H2'), '', 'Summary!A1', '', 'Back') | Out-Null
+    $summary.PageSetup.PrintArea = '$A$1:$B$3'
+    $summary.Activate()
+    $wb.SaveAs([string](Join-Path $out 'b.xlsx'), 51)
+    $wb.Close($false)
+
+    # c.xlsx: the 1904 date system.
+    $wb = $xl.Workbooks.Add()
+    $wb.Date1904 = $true
+    $s = $wb.Worksheets.Item(1); $s.Name = 'Dates'
+    $s.Range('A1').Formula = '=DATE(2024,1,2)'
+    $s.Range('A1').NumberFormat = 'yyyy-mm-dd'
+    $wb.SaveAs([string](Join-Path $out 'c.xlsx'), 51)
+    $wb.Close($false)
+
+    # p.xlsx: a pivot table.
+    $wb = $xl.Workbooks.Add()
+    $s = $wb.Worksheets.Item(1); $s.Name = 'Facts'
+    Rows $s 1 @(@('Item', 'Amount'), @('Apple', 3), @('Pear', 4), @('Apple', 5))
+    $report = $wb.Worksheets.Add($none, $s); $report.Name = 'Report'
+    $pivot = $wb.PivotCaches().Create(1, 'Facts!R1C1:R4C2').CreatePivotTable('Report!R3C1', 'Pivot1')
+    $pivot.PivotFields('Item').Orientation = 1
+    $pivot.AddDataField($pivot.PivotFields('Amount')) | Out-Null
+    $wb.SaveAs([string](Join-Path $out 'p.xlsx'), 51)
+    $wb.Close($false)
+  } finally {
+    try { $xl.Quit() } catch {}
+    Start-Sleep -Seconds 2
+    Stop-Mine
+  }
+  foreach ($n in 'a', 'b', 'c', 'p') {
+    $author = if ($n -eq 'b') { 'Author B' } else { 'Author A' }
+    Edit-Package (Join-Path $out "$n.xlsx") { param($name, $text) Scrub $name $text $author }.GetNewClosure()
+  }
+}
+
 try {
-  switch ($Family) { 'word' { Word-Docs } }
+  switch ($Family) { 'word' { Word-Docs } 'excel' { Excel-Books } }
 } catch {
   $_.InvocationInfo.PositionMessage
   throw
@@ -285,4 +423,5 @@ try {
   Stop-Mine
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
-Get-ChildItem $out -Filter *.docx | ForEach-Object { "{0} {1:N0} bytes" -f $_.Name, $_.Length }
+$files = @{ word = '*.docx'; excel = '*.xlsx' }[$Family]
+Get-ChildItem $out -Filter $files | ForEach-Object { "{0} {1:N0} bytes" -f $_.Name, $_.Length }
