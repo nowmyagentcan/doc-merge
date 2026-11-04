@@ -15,7 +15,7 @@ const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessin
 
 /// The highest value Word takes for a drawing's id, used as the top of every pool.
 const MAX_ID: i64 = 2_147_483_646;
-/// The value Word gives `w14:textId` when it tracks nothing, on most paragraphs of a document.
+/// The `w14:textId` Word gives every paragraph with no text, so it repeats within one file.
 const NO_TEXT_ID: u32 = 0x7777_7777;
 /// Bookmark names longer than this are refused by Word.
 const MAX_BOOKMARK: usize = 40;
@@ -349,7 +349,8 @@ fn tokens(s: &str) -> Vec<Range<usize>> {
 }
 
 /// Field names that a bare `{ name }` field of a bookmark can't be.
-const FIELDS: &str = "\n     ADDRESSBLOCK ADVANCE AUTHOR AUTONUM AUTONUMLGL AUTONUMOUT AUTOTEXT AUTOTEXTLIST BARCODE \
+const FIELDS: &str = "\
+     ADDRESSBLOCK ADVANCE AUTHOR AUTONUM AUTONUMLGL AUTONUMOUT AUTOTEXT AUTOTEXTLIST BARCODE \
      BIBLIOGRAPHY BIDIOUTLINE CITATION COMMENTS COMPARE CREATEDATE DATABASE DATE DISPLAYBARCODE \
      DOCPROPERTY DOCVARIABLE EDITTIME EMBED EQ FILENAME FILESIZE FILLIN FORMCHECKBOX \
      FORMDROPDOWN FORMTEXT GREETINGLINE IF INCLUDEPICTURE INCLUDETEXT INDEX INFO KEYWORDS \
