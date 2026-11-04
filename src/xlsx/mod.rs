@@ -3,6 +3,7 @@
 
 pub mod a1;
 mod drawings;
+mod refuse;
 mod styles;
 
 use std::borrow::Cow;
@@ -39,8 +40,15 @@ pub struct Merged {
 }
 
 pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, Error> {
+    let books: Result<Vec<Book>, Error> = inputs.iter_mut().map(Book::read).collect();
+    let mut books = books?.into_iter();
+    let base = books.next().expect("a first workbook");
+    let books: Vec<Book> = books.collect();
+    let first = inputs[0].origin.name.clone();
+    for (pkg, book) in inputs[1..].iter_mut().zip(&books) {
+        refuse::check(pkg, book, &base, &first)?;
+    }
     let mut plan = Plan::base(&inputs[0], warnings)?;
-    let base = Book::read(&mut inputs[0])?;
     let mut sheets = vec![
         base.sheets
             .iter()
@@ -52,8 +60,8 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
     ];
     let mut out = Output::new(base, &mut inputs[0])?;
     let mut renames = vec![];
-    for i in 1..inputs.len() {
-        sheets.push(out.append(&mut plan, inputs, i, &mut renames, warnings)?);
+    for (book, i) in books.into_iter().zip(1..) {
+        sheets.push(out.append(&mut plan, inputs, i, book, &mut renames, warnings)?);
     }
     out.finish(&mut plan, &inputs[0])?;
     Ok(Merged {
@@ -839,10 +847,10 @@ impl Output {
         plan: &mut Plan,
         inputs: &mut [Package],
         i: usize,
+        book: Book,
         renames: &mut Vec<Rename>,
         warnings: &mut Warnings,
     ) -> Result<Vec<SheetName>, Error> {
-        let book = Book::read(&mut inputs[i])?;
         let origin = inputs[i].origin.clone();
         self.sheet_count += book.sheets.len();
         if self.sheet_count > MAX_SHEETS {
@@ -1253,6 +1261,11 @@ impl SheetJob<'_> {
                                 styled = true;
                             }
                             "cm" => metadata = a.value.parse::<u32>().ok(),
+                            "vm" => {
+                                let variant = "images in cells";
+                                let e = Error::unsupported_variant(&origin.name, variant);
+                                return Err(e.at(origin.input));
+                            }
                             _ => {}
                         }
                     }

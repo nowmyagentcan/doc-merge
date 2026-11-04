@@ -1452,3 +1452,221 @@ fn people_merge_by_id_and_replies_keep_their_parent() {
     assert_eq!(attribute_values(&copy, "personId"), [one, two]);
     assert!(copy.contains("Hi {there}"), "{copy}");
 }
+
+/// Adds a part with an override.
+fn with_part(parts: &mut Vec<(String, Vec<u8>)>, name: &str, content_type: &str, body: &[u8]) {
+    set(parts, name, body);
+    let types = text(parts, "[Content_Types].xml").replace(
+        "</Types>",
+        &format!(r#"<Override PartName="/{name}" ContentType="{content_type}"/></Types>"#),
+    );
+    set(parts, "[Content_Types].xml", types.as_bytes());
+}
+
+/// Merges a plain workbook and `parts`, expects `parts` refused as `variant` with no output,
+/// then the other way round, which must merge.
+fn refused_only_when_appended(test: &str, parts: &[(String, Vec<u8>)], variant: &str) {
+    let dir = temp_dir(test);
+    let plain = book_file(&dir, "plain.xlsx", &book(&[("Plain", "")], None));
+    let held = book_file(&dir, "held.xlsx", parts);
+    let out = dir.join("out.xlsx");
+    let inputs = [plain.clone(), held.clone()];
+    let e = merge(&inputs, &out, &Options::default(), None).unwrap_err();
+    assert_eq!(e.code, "unsupported_variant", "{test}");
+    assert_eq!(e.input, Some(2), "{test}");
+    let expected = format!("'held.xlsx' has {variant}, which doc-merge can't merge yet.");
+    assert_eq!(e.message, expected);
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+    assert_eq!(left.len(), 2, "{test}: {left:?}");
+    merge(&[held, plain], &out, &Options::default(), None).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn each_refused_part_names_its_variant() {
+    let ms = "application/vnd.ms-excel.";
+    let list = [
+        (
+            "xl/pivotTables/pivotTable1.xml",
+            format!("{SML}pivotTable+xml"),
+            "pivot tables",
+        ),
+        (
+            "xl/pivotCache/pivotCacheDefinition1.xml",
+            format!("{SML}pivotCacheDefinition+xml"),
+            "pivot tables",
+        ),
+        (
+            "xl/elsewhere/p.xml",
+            format!("{SML}pivotTable+xml"),
+            "pivot tables",
+        ),
+        (
+            "xl/slicers/slicer1.xml",
+            format!("{ms}slicer+xml"),
+            "slicers",
+        ),
+        (
+            "xl/slicerCaches/slicerCache1.xml",
+            format!("{ms}slicerCache+xml"),
+            "slicers",
+        ),
+        (
+            "xl/timelines/timeline1.xml",
+            format!("{ms}timeline+xml"),
+            "timelines",
+        ),
+        (
+            "xl/timelineCaches/timelineCache1.xml",
+            format!("{ms}timelineCache+xml"),
+            "timelines",
+        ),
+        (
+            "xl/model/item.data",
+            "application/vnd.openxmlformats-officedocument.model+data".into(),
+            "a data model",
+        ),
+        (
+            "xl/connections.xml",
+            format!("{SML}connections+xml"),
+            "data connections",
+        ),
+        (
+            "xl/queryTables/queryTable1.xml",
+            format!("{SML}queryTable+xml"),
+            "query tables",
+        ),
+        (
+            "xl/richData/rdrichvalue.xml",
+            format!("{ms}rdrichvalue+xml"),
+            "images in cells",
+        ),
+        (
+            "xl/revisions/revisionHeaders.xml",
+            format!("{SML}revisionHeaders+xml"),
+            "shared-workbook revision history",
+        ),
+        (
+            "xl/dialogsheets/sheet1.xml",
+            format!("{SML}dialogsheet+xml"),
+            "dialog sheets",
+        ),
+    ];
+    for (name, content_type, variant) in list {
+        let mut parts = book(&[("Sheet1", "")], None);
+        with_part(&mut parts, name, &content_type, b"<x/>");
+        refused_only_when_appended(name, &parts, variant);
+    }
+}
+
+#[test]
+fn xml_maps_show_in_the_workbook_s_relationships() {
+    let mut parts = book(&[("Sheet1", "")], None);
+    set(&mut parts, "xl/xmlMaps.xml", b"<MapInfo/>");
+    let list = text(&parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        &format!(
+            r#"<Relationship Id="rId80" Type="{REL}xmlMaps" Target="xmlMaps.xml"/></Relationships>"#
+        ),
+    );
+    set(&mut parts, "xl/_rels/workbook.xml.rels", list.as_bytes());
+    refused_only_when_appended("xml-maps", &parts, "XML maps");
+}
+
+#[test]
+fn a_mashup_is_found_in_utf_16_custom_xml() {
+    let mut body = vec![0xFF, 0xFE];
+    let xml = r#"<?xml version="1.0" encoding="utf-16"?><DataMashup xmlns="http://schemas.microsoft.com/DataMashup">AAAA</DataMashup>"#;
+    body.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut parts = book(&[("Sheet1", "")], None);
+    with_part(&mut parts, "customXml/item1.xml", "application/xml", &body);
+    refused_only_when_appended("mashup", &parts, "Power Query queries");
+}
+
+#[test]
+fn other_custom_xml_is_no_refusal() {
+    let dir = temp_dir("custom-xml");
+    let mut parts = book(&[("Sheet1", "")], None);
+    let body = b"<?xml version=\"1.0\"?><!-- DataMashup --><root>DataMashup</root>";
+    with_part(&mut parts, "customXml/item1.xml", "application/xml", body);
+    with_part(
+        &mut parts,
+        "customXml/item2.xml",
+        "application/xml",
+        b"<broken",
+    );
+    let held = book_file(&dir, "held.xlsx", &parts);
+    let plain = book_file(&dir, "plain.xlsx", &book(&[("Plain", "")], None));
+    merged_files("custom-xml-out", &[plain, held]);
+}
+
+fn with_metadata(parts: &mut Vec<(String, Vec<u8>)>, types: &str) {
+    let body = format!(
+        r#"<metadata {SML_NS}><metadataTypes count="1">{types}</metadataTypes></metadata>"#
+    );
+    with_part(
+        parts,
+        "xl/metadata.xml",
+        &format!("{SML}sheetMetadata+xml"),
+        body.as_bytes(),
+    );
+    let list = text(parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        &format!(r#"<Relationship Id="rId80" Type="{REL}sheetMetadata" Target="metadata.xml"/></Relationships>"#),
+    );
+    set(parts, "xl/_rels/workbook.xml.rels", list.as_bytes());
+}
+
+#[test]
+fn only_dynamic_array_metadata_comes_along() {
+    let mut parts = book(&[("Sheet1", "")], None);
+    with_metadata(
+        &mut parts,
+        r#"<metadataType name="XLRICHVALUE" minSupportedVersion="120000"/>"#,
+    );
+    refused_only_when_appended(
+        "metadata-type",
+        &parts,
+        "cell metadata other than dynamic arrays",
+    );
+}
+
+#[test]
+fn a_cell_with_value_metadata_is_an_image_in_a_cell() {
+    let cell = r#"<row r="1"><c r="A1" t="e" vm="1"><v>#VALUE!</v></c></row>"#;
+    let parts = book(&[("Sheet1", cell)], None);
+    refused_only_when_appended("vm", &parts, "images in cells");
+}
+
+#[test]
+fn the_fixtures_show_the_two_refusals() {
+    let dir = temp_dir("refusals");
+    let out = dir.join("out.xlsx");
+    let run = |names: [&str; 2]| {
+        let paths = names.map(fixture);
+        merge(&paths, &out, &Options::default(), None).unwrap_err()
+    };
+    let e = run(["a.xlsx", "p.xlsx"]);
+    assert_eq!((e.code, e.input), ("unsupported_variant", Some(2)));
+    assert!(e.message.contains("has pivot tables"), "{}", e.message);
+    assert!(e.hint.unwrap().contains("paste their values"));
+    let e = run(["a.xlsx", "c.xlsx"]);
+    assert_eq!((e.code, e.input), ("date_system_differs", Some(2)));
+    assert_eq!(
+        e.message,
+        "'c.xlsx' uses the 1904 date system and 'a.xlsx' uses the 1900 one; its dates would shift by four years."
+    );
+    let e = run(["c.xlsx", "a.xlsx"]);
+    assert_eq!((e.code, e.input), ("date_system_differs", Some(2)));
+    assert!(e.message.starts_with("'a.xlsx' uses the 1900 date system"));
+    assert!(!out.exists());
+}
+
+#[test]
+fn a_pivot_in_the_base_stays_as_it_is() {
+    let (_, parts) = merged("pivot-base", &["p.xlsx", "a.xlsx"]);
+    let p = entries(&fixture("p.xlsx"));
+    for part in p.iter().filter(|e| e.0.contains("pivot")) {
+        assert_eq!(&text_or_bytes(&parts, &part.0), &part.1, "{}", part.0);
+    }
+}
