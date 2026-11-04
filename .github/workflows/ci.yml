@@ -35,7 +35,7 @@ jobs:
       - name: LibreOffice converts every merged file
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui libreoffice-calc-nogui
+          sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui
           soffice --headless --convert-to pdf --outdir "$RUNNER_TEMP/pdf" "$RUNNER_TEMP/out"/*
           for f in "$RUNNER_TEMP/out"/*; do
             test -s "$RUNNER_TEMP/pdf/$(basename "${f%.*}").pdf"
@@ -52,13 +52,16 @@ jobs:
           var validator = new OpenXmlValidator(FileFormatVersions.Microsoft365);
           List<(string Text, string Where)> Errors(string path)
           {
-              using OpenXmlPackage doc = path.EndsWith(".xlsx")
-                  ? SpreadsheetDocument.Open(path, false)
-                  : WordprocessingDocument.Open(path, false);
+              using OpenXmlPackage doc = Path.GetExtension(path) switch
+              {
+                  ".xlsx" => SpreadsheetDocument.Open(path, false),
+                  ".pptx" => PresentationDocument.Open(path, false),
+                  _ => WordprocessingDocument.Open(path, false),
+              };
               return validator.Validate(doc)
                   .Select(e => (e.Description, $"{e.Part?.Uri} {e.Path?.XPath}")).ToList();
           }
-          var known = new[] { "*.docx", "*.xlsx" }
+          var known = new[] { "*.docx", "*.xlsx", "*.pptx" }
               .SelectMany(p => Directory.GetFiles(args[0], p)).SelectMany(Errors)
               .Select(e => e.Text).ToHashSet();
           var failed = false;

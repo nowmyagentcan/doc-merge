@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use doc_merge::{Options, StyleMode, merge};
 
 const MERGES: &[(&str, &[&str], StyleMode)] = &[
+    ("abc.pptx", &["a.pptx", "b.pptx", "c.pptx"], StyleMode::Keep),
+    ("aa.pptx", &["a.pptx", "a.pptx"], StyleMode::Keep),
+    ("ca.pptx", &["c.pptx", "a.pptx"], StyleMode::Keep),
+    ("ba.pptx", &["b.pptx", "a.pptx"], StyleMode::Keep),
     ("ab.xlsx", &["a.xlsx", "b.xlsx"], StyleMode::Keep),
     ("abb.xlsx", &["a.xlsx", "b.xlsx", "b.xlsx"], StyleMode::Keep),
     ("bb.xlsx", &["b.xlsx", "b.xlsx"], StyleMode::Keep),
