@@ -808,3 +808,181 @@ fn the_fixtures_keep_their_formats() {
     let (fonts, body) = count("fonts");
     assert_eq!(fonts, body.matches("<font>").count());
 }
+
+#[test]
+fn another_theme_turns_into_literal_colours_and_fonts() {
+    let (report, parts) = merged("theme", &["a.xlsx", "b.xlsx"]);
+    let codes: Vec<&str> = report.warnings.list().iter().map(|w| w.code).collect();
+    assert_eq!(codes, ["theme_differs"]);
+    assert_eq!(report.warnings.list()[0].input, Some(2));
+    let theme = text(&entries(&fixture("b.xlsx")), "xl/theme/theme1.xml");
+    let srgb = |name: &str| {
+        let at = theme.find(&format!("<a:{name}>")).unwrap();
+        let v = theme[at..].split("srgbClr val=\"").nth(1).unwrap();
+        v[..6].to_string()
+    };
+    let out = text(&parts, "xl/styles.xml");
+    let (accent1, accent2, accent6) = (srgb("accent1"), srgb("accent2"), srgb("accent6"));
+    assert!(
+        out.contains(&format!(
+            r#"<color rgb="FF{accent1}"/><name val="Trebuchet MS"/><family val="2"/></font>"#
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            r#"<color rgb="FF{accent6}" tint="-0.249977111117893"/>"#
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            r#"<fgColor rgb="FF{accent2}" tint="0.59999389629810485"/>"#
+        )),
+        "{out}"
+    );
+    let a = text(&entries(&fixture("a.xlsx")), "xl/styles.xml");
+    let fonts = |s: &str| s[s.find("<fonts").unwrap()..s.find("</fonts>").unwrap()].to_string();
+    assert!(
+        fonts(&out).starts_with(
+            fonts(&a)
+                .trim_end_matches("</fonts>")
+                .split("count")
+                .next()
+                .unwrap()
+        )
+    );
+    // The base's fonts keep their links; the appended ones have none.
+    assert_eq!(
+        fonts(&out).matches("<scheme ").count(),
+        fonts(&a).matches("<scheme ").count()
+    );
+    let first = text(&parts, "xl/worksheets/sheet3.xml");
+    let accent3 = srgb("accent3");
+    assert!(
+        first.contains(&format!(r#"<tabColor rgb="FF{accent3}"/>"#)),
+        "{first}"
+    );
+    let detail = text(&parts, "xl/worksheets/sheet4.xml");
+    assert!(
+        detail.contains(&format!(r#"<x14:colorSeries rgb="FF{accent2}"/>"#)),
+        "{detail}"
+    );
+}
+
+#[test]
+fn the_same_theme_and_palette_keep_their_links() {
+    let (report, parts) = merged("same-theme", &["a.xlsx", "a.xlsx"]);
+    assert!(report.warnings.list().is_empty());
+    let a = text(&entries(&fixture("a.xlsx")), "xl/styles.xml");
+    assert_eq!(text(&parts, "xl/styles.xml"), a);
+}
+
+/// `theme` as a theme part of the workbook with its colours and fonts.
+fn with_theme(parts: &mut Vec<(String, Vec<u8>)>, dark: &str, minor: &str) {
+    let theme = format!(
+        r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C"><a:dk1><a:sysClr val="windowText" lastClr="{dark}"/></a:dk1><a:lt1><a:srgbClr val="FEFEFE"/></a:lt1><a:dk2><a:srgbClr val="010203"/></a:dk2><a:lt2><a:srgbClr val="040506"/></a:lt2><a:accent1><a:srgbClr val="AA0001"/></a:accent1><a:accent2><a:srgbClr val="AA0002"/></a:accent2><a:accent3><a:srgbClr val="AA0003"/></a:accent3><a:accent4><a:srgbClr val="AA0004"/></a:accent4><a:accent5><a:srgbClr val="AA0005"/></a:accent5><a:accent6><a:srgbClr val="AA0006"/></a:accent6><a:hlink><a:srgbClr val="AA0007"/></a:hlink><a:folHlink><a:srgbClr val="AA0008"/></a:folHlink></a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Major Face"/></a:majorFont><a:minorFont><a:latin typeface="{minor}"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
+    );
+    set(parts, "xl/theme/theme1.xml", theme.as_bytes());
+    let types = text(parts, "[Content_Types].xml").replace(
+        "</Types>",
+        r#"<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>"#,
+    );
+    set(parts, "[Content_Types].xml", types.as_bytes());
+    let rels = text(parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        &format!(r#"<Relationship Id="rId81" Type="{REL}theme" Target="theme/theme1.xml"/></Relationships>"#),
+    );
+    set(parts, "xl/_rels/workbook.xml.rels", rels.as_bytes());
+}
+
+#[test]
+fn colours_resolve_by_theme_index_with_their_tint() {
+    let dir = temp_dir("theme-index");
+    let mut a = book(&[("A", "")], None);
+    with_styles(&mut a, &plain_styles("0.0", ""));
+    with_theme(&mut a, "000000", "Calibri");
+    let colours: String = (0..14)
+        .map(|i| {
+            format!(
+                r#"<font><sz val="{}"/><color theme="{i}" tint="0.5"/><name val="N"/></font>"#,
+                10 + i
+            )
+        })
+        .collect();
+    let fonts = format!(
+        r#"<fonts count="16"><font><sz val="9"/><name val="old"/><scheme val="minor"/></font><font><sz val="8"/><scheme val="major"/></font>{colours}</fonts>"#
+    );
+    let dxfs = r#"<dxfs count="1"><dxf><font><color theme="4"/></font><fill><gradientFill><stop position="0"><color theme="5"/></stop></gradientFill></fill></dxf></dxfs>"#;
+    let lists = plain_styles("0.0", dxfs).replace(FONTS_A, &fonts);
+    let mut b = book(&[("B", "")], None);
+    with_styles(&mut b, &lists);
+    with_theme(&mut b, "111111", "Minor Face");
+    let sheet = format!(
+        r#"<worksheet {SML_NS}><sheetPr><tabColor theme="9" tint="0.2"/></sheetPr><sheetData/><conditionalFormatting sqref="A1"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="formula" val="B!$A$1"/><color theme="4"/><color rgb="FF000000"/></colorScale></cfRule></conditionalFormatting></worksheet>"#
+    );
+    set(&mut b, "xl/worksheets/sheet1.xml", sheet.as_bytes());
+    let paths = [book_file(&dir, "a.xlsx", &a), book_file(&dir, "b.xlsx", &b)];
+    let (_, parts) = merged_files("theme-index-out", &paths);
+    let out = text(&parts, "xl/styles.xml");
+    assert!(
+        out.contains(r#"<font><sz val="9"/><name val="Minor Face"/></font>"#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<font><sz val="8"/><name val="Major Face"/></font>"#),
+        "{out}"
+    );
+    for (i, rgb) in [
+        "FEFEFE", "111111", "040506", "010203", "AA0001", "AA0002", "AA0003", "AA0004", "AA0005",
+        "AA0006", "AA0007", "AA0008",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let want = format!(r#"<sz val="{}"/><color rgb="FF{rgb}" tint="0.5"/>"#, 10 + i);
+        assert!(out.contains(&want), "{want} in {out}");
+    }
+    // Past the twelve there is nothing to resolve to.
+    assert!(out.contains(r#"<color theme="12" tint="0.5"/>"#));
+    assert!(
+        out.contains(r#"<dxf><font><color rgb="FFAA0001"/></font>"#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<stop position="0"><color rgb="FFAA0002"/></stop>"#),
+        "{out}"
+    );
+    let sheet = text(&parts, "xl/worksheets/sheet2.xml");
+    assert!(
+        sheet.contains(r#"<tabColor rgb="FFAA0006" tint="0.2"/>"#),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains(r#"<color rgb="FFAA0001"/><color rgb="FF000000"/>"#),
+        "{sheet}"
+    );
+}
+
+#[test]
+fn a_custom_palette_resolves_on_either_side() {
+    let fills = r#"<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor indexed="2"/><bgColor indexed="64"/></patternFill></fill></fills>"#;
+    let palette = r#"<colors><indexedColors><rgbColor rgb="00123456"/><rgbColor rgb="00123457"/><rgbColor rgb="00ABCDEF"/></indexedColors></colors>"#;
+    let plain = plain_styles("0.0", "").replace(FILLS, fills);
+    let custom = plain_styles("0.0", palette).replace(FILLS, fills);
+    let (_, parts) = styled_pair("palette-own", &plain, &custom, "");
+    let out = text(&parts, "xl/styles.xml");
+    assert!(
+        out.contains(r#"<fgColor rgb="FFABCDEF"/><bgColor indexed="64"/>"#),
+        "{out}"
+    );
+    let (_, parts) = styled_pair("palette-base", &custom, &plain, "");
+    let out = text(&parts, "xl/styles.xml");
+    assert!(
+        out.contains(r#"<fgColor rgb="FFFF0000"/><bgColor indexed="64"/>"#),
+        "{out}"
+    );
+    let (_, parts) = styled_pair("palette-same", &custom, &custom, "");
+    let out = text(&parts, "xl/styles.xml");
+    assert!(!out.contains(r#"rgb="FFABCDEF""#), "{out}");
+}

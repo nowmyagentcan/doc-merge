@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
 
-use crate::error::{Error, Warnings, thousands};
+use crate::error::{Error, Warning, Warnings, thousands};
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, Rel, resolve};
 use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
 use crate::xml::{self, Attr, Node, Reader, declaration, prefix_of, start_tag};
@@ -22,6 +22,7 @@ const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relatio
 const SML: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.";
 const DECLARATION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n";
 const XM: &str = "http://schemas.microsoft.com/office/excel/2006/main";
+const X14: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
 const MAX_SHEETS: usize = 10_000;
 const NAME_ROUNDS: usize = 8;
 /// Excel's limit, counted in UTF-16 units.
@@ -50,7 +51,7 @@ pub fn merge(inputs: &mut [Package], warnings: &mut Warnings) -> Result<Merged, 
     let mut out = Output::new(base, &mut inputs[0])?;
     let mut renames = vec![];
     for i in 1..inputs.len() {
-        sheets.push(out.append(&mut plan, inputs, i, &mut renames)?);
+        sheets.push(out.append(&mut plan, inputs, i, &mut renames, warnings)?);
     }
     out.finish(&mut plan, &inputs[0])?;
     Ok(Merged {
@@ -391,6 +392,7 @@ struct Output {
     links: u32,
     styles: styles::Output,
     base_styles: Option<Held>,
+    base_theme: Option<Held>,
 }
 
 /// A table part as read.
@@ -494,6 +496,7 @@ impl Output {
             .map_or(0, |n| n.nodes().count());
         let strings = SharedStrings::new(pkg, book.related(pkg, "sharedStrings")?)?;
         let base_styles = book.held(pkg, "styles")?;
+        let base_theme = book.held(pkg, "theme")?;
         let mut used = HashMap::new();
         for d in defined_names(&book, &pkg.origin)? {
             if d.sheet.is_none() {
@@ -518,6 +521,7 @@ impl Output {
             links: links as u32,
             styles: styles::Output::new(base_styles.as_ref().map(|h| h.tree.clone())),
             base_styles,
+            base_theme,
             book,
         })
     }
@@ -655,6 +659,7 @@ impl Output {
         inputs: &mut [Package],
         i: usize,
         renames: &mut Vec<Rename>,
+        warnings: &mut Warnings,
     ) -> Result<Vec<SheetName>, Error> {
         let book = Book::read(&mut inputs[i])?;
         let origin = inputs[i].origin.clone();
@@ -712,11 +717,24 @@ impl Output {
         };
         let sheet = book.held(&mut inputs[i], "styles")?;
         let sheet = sheet.as_ref().map(|h| &h.tree);
-        let styles = self.styles.add(sheet, &origin, &mut found.list)?;
+        let theme = book.held(&mut inputs[i], "theme")?;
+        let colours = styles::Colours::new(
+            theme.as_ref().map(|h| &h.tree),
+            self.base_theme.as_ref().map(|h| &h.tree),
+            sheet,
+            self.base_styles.as_ref().map(|h| &h.tree),
+        );
+        if colours.as_ref().is_some_and(styles::Colours::themed) {
+            warnings.push(Warning::theme_differs(i + 1, &origin.name));
+        }
+        let styles = self
+            .styles
+            .add(sheet, colours.as_ref(), &origin, &mut found.list)?;
         renames.append(&mut found.list);
         let maps = Rc::new(Maps {
             strings,
             styles,
+            colours,
             views: self.views,
             renames: found.renames,
             locals: found.locals,
@@ -894,6 +912,8 @@ struct Maps {
     /// Shared-string indices.
     strings: Vec<u32>,
     styles: styles::Map,
+    /// Set when the appended workbook's theme or palette isn't the output's.
+    colours: Option<styles::Colours>,
     views: usize,
     renames: a1::Renames,
     /// Per sheet, the lower-case names of its sheet-scope names.
@@ -1121,7 +1141,19 @@ impl SheetJob<'_> {
                         p.replace(start..end, &start_tag(e.name().as_ref(), &attrs, empty))?;
                     }
                 }
-                _ => {}
+                local => {
+                    let ns = r.element_ns(e);
+                    let colour = ns == X14
+                        || (ns == S
+                            && ["tabColor", "color", "fgColor", "bgColor"].contains(&local));
+                    if let Some(c) = maps.colours.as_ref().filter(|_| colour) {
+                        let mut attrs = r.attrs(e)?;
+                        if c.resolve(&mut attrs) {
+                            let tag = start_tag(e.name().as_ref(), &attrs, empty);
+                            p.replace(start..end, &tag)?;
+                        }
+                    }
+                }
             }
         }
     }
