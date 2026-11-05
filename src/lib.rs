@@ -25,8 +25,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};
 
 use error::{Error, Warnings, mib};
-use package::{Family, Kind, Package};
+use package::{Family, Kind, MAX_PARSED, Package, Upload};
 use paths::Target;
+use writer::Plan;
 
 /// Set on Ctrl+C: a run under way ends at its next look at the clock, removing its temp file.
 pub static STOP: AtomicBool = AtomicBool::new(false);
@@ -88,14 +89,19 @@ pub fn open_inputs(
     for (i, p) in paths.iter().enumerate().skip(1) {
         pkgs.push(Package::open(p, i + 1, run)?);
     }
+    one_family(&pkgs)?;
+    Ok(pkgs)
+}
+
+fn one_family(pkgs: &[Package]) -> Result<(), Error> {
     let mut counts = [0; 3];
-    for p in &pkgs {
+    for p in pkgs {
         counts[p.kind.family() as usize] += 1;
     }
     if counts.iter().filter(|&&n| n > 0).count() > 1 {
         return Err(Error::mixed_formats(counts));
     }
-    Ok(pkgs)
+    Ok(())
 }
 
 /// The most bytes one run inflates, over all its inputs.
@@ -255,6 +261,100 @@ pub struct Options {
     pub styles: StyleMode,
 }
 
+/// A merge planned from opened inputs, and what its report will say.
+struct Planned {
+    /// Taken when the merge is written.
+    plan: Option<Plan>,
+    family: Family,
+    listed: Vec<Input>,
+    renames: Vec<Rename>,
+    warnings: Warnings,
+}
+
+impl Planned {
+    fn new(inputs: &mut [Package], options: &Options) -> Result<Self, Error> {
+        let mut warnings = Warnings::default();
+        let family = inputs[0].kind.family();
+        let mut listed: Vec<Input> = inputs
+            .iter()
+            .map(|p| Input {
+                path: p.path.clone(),
+                kind: p.kind,
+                sections: None,
+                output_sections: None,
+                slides: None,
+                output_slides: None,
+                sheets: None,
+            })
+            .collect();
+        let (plan, renames) = match family {
+            Family::Word => {
+                let m = docx::merge(inputs, options.styles, &mut warnings)?;
+                let mut next = 1;
+                for (input, n) in listed.iter_mut().zip(m.sections) {
+                    input.sections = Some(n);
+                    input.output_sections = Some([next, next + n - 1]);
+                    next += n;
+                }
+                (m.plan, m.renames)
+            }
+            Family::Excel => {
+                let m = xlsx::merge(inputs, &mut warnings)?;
+                for (input, sheets) in listed.iter_mut().zip(m.sheets) {
+                    input.sheets = Some(sheets);
+                }
+                (m.plan, m.renames)
+            }
+            Family::PowerPoint => {
+                let m = pptx::merge(inputs, &mut warnings)?;
+                let mut next = 1;
+                for (input, n) in listed.iter_mut().zip(m.slides) {
+                    input.slides = Some(n);
+                    input.output_slides = Some(if n == 0 { [0, 0] } else { [next, next + n - 1] });
+                    next += n;
+                }
+                (m.plan, m.renames)
+            }
+        };
+        Ok(Self {
+            plan: Some(plan),
+            family,
+            listed,
+            renames,
+            warnings,
+        })
+    }
+
+    /// The report once `bytes` went to `path`; `times` says when the merge started, had opened
+    /// its inputs and had planned.
+    fn report(self, path: PathBuf, bytes: u64, times: [Instant; 3]) -> Report {
+        let done = Instant::now();
+        let ms = |from: Instant, to: Instant| (to - from).as_millis() as u64;
+        let mut renames = self.renames;
+        renames.sort_by_key(|r| r.input);
+        let renames_omitted = renames.len().saturating_sub(MAX_RENAMES);
+        renames.truncate(MAX_RENAMES);
+        let [started, opened, planned] = times;
+        Report {
+            output: Output {
+                path,
+                kind: self.family.output(),
+                bytes,
+            },
+            inputs: self.listed,
+            renames,
+            renames_omitted,
+            warnings: self.warnings,
+            elapsed_ms: ms(started, done),
+            steps: [
+                ("open", ms(started, opened)),
+                ("plan", ms(opened, planned)),
+                ("write", ms(planned, done)),
+            ],
+        }
+    }
+}
+
 /// Merges `paths` (at least one; the first is the base) into a new file where `target` says.
 /// The first file settles what kind the output is, so a wrong `-o` is found before a refusal
 /// of a later file, as its exit code is higher.
@@ -276,73 +376,83 @@ pub fn merge(
     let place = target.place(paths, first.kind.family())?;
     let mut inputs = open_inputs(first, paths, &run)?;
     let opened = Instant::now();
-    let mut warnings = Warnings::default();
-    let family = inputs[0].kind.family();
-    let mut listed: Vec<Input> = inputs
-        .iter()
-        .map(|p| Input {
-            path: std::path::absolute(&p.path).unwrap_or_else(|_| p.path.clone()),
-            kind: p.kind,
-            sections: None,
-            output_sections: None,
-            slides: None,
-            output_slides: None,
-            sheets: None,
-        })
-        .collect();
-    let (plan, mut renames) = match family {
-        Family::Word => {
-            let m = docx::merge(&mut inputs, options.styles, &mut warnings)?;
-            let mut next = 1;
-            for (input, n) in listed.iter_mut().zip(m.sections) {
-                input.sections = Some(n);
-                input.output_sections = Some([next, next + n - 1]);
-                next += n;
-            }
-            (m.plan, m.renames)
-        }
-        Family::Excel => {
-            let m = xlsx::merge(&mut inputs, &mut warnings)?;
-            for (input, sheets) in listed.iter_mut().zip(m.sheets) {
-                input.sheets = Some(sheets);
-            }
-            (m.plan, m.renames)
-        }
-        Family::PowerPoint => {
-            let m = pptx::merge(&mut inputs, &mut warnings)?;
-            let mut next = 1;
-            for (input, n) in listed.iter_mut().zip(m.slides) {
-                input.slides = Some(n);
-                input.output_slides = Some(if n == 0 { [0, 0] } else { [next, next + n - 1] });
-                next += n;
-            }
-            (m.plan, m.renames)
-        }
-    };
+    let mut merge = Planned::new(&mut inputs, options)?;
     let planned = Instant::now();
+    for input in &mut merge.listed {
+        if let Ok(full) = std::path::absolute(&input.path) {
+            input.path = full;
+        }
+    }
+    let plan = merge.plan.take().expect("planned above");
     let (bytes, output) = writer::write(plan, &mut inputs, &place)?;
-    let done = Instant::now();
-    let ms = |from: Instant, to: Instant| (to - from).as_millis() as u64;
-    renames.sort_by_key(|r| r.input);
-    let renames_omitted = renames.len().saturating_sub(MAX_RENAMES);
-    renames.truncate(MAX_RENAMES);
-    Ok(Report {
-        output: Output {
-            path: std::path::absolute(&output).unwrap_or(output),
-            kind: family.output(),
-            bytes,
-        },
-        inputs: listed,
-        renames,
-        renames_omitted,
-        warnings,
-        elapsed_ms: ms(started, done),
-        steps: [
-            ("open", ms(started, opened)),
-            ("plan", ms(opened, planned)),
-            ("write", ms(planned, done)),
-        ],
+    let output = std::path::absolute(&output).unwrap_or(output);
+    Ok(merge.report(output, bytes, [started, opened, planned]))
+}
+
+/// Merges uploads (name and bytes, the first is the base) in memory, for a download called
+/// `name`, by default `merged.<ext>`. In the report, paths are these names.
+pub fn merge_uploads(
+    files: &[(String, Upload)],
+    name: Option<&str>,
+    options: &Options,
+    deadline: Option<Instant>,
+) -> Result<(Report, Family, Vec<u8>), Error> {
+    let started = Instant::now();
+    let run = Run::new(deadline);
+    let mut inputs = vec![];
+    for (i, (file, bytes)) in files.iter().enumerate() {
+        inputs.push(Package::from_upload(file, bytes.clone(), i + 1, &run)?);
+    }
+    one_family(&inputs)?;
+    let family = inputs[0].kind.family();
+    let ext = family.extension();
+    let output = match name.filter(|n| !n.is_empty()) {
+        Some(n) if paths::has_extension(Path::new(n), ext) => n.to_owned(),
+        Some(n) => {
+            let stem = Path::new(n).file_stem().unwrap_or_default();
+            return Err(Error::bad_extension(ext, &stem.to_string_lossy()));
+        }
+        None => format!("merged.{ext}"),
+    };
+    let opened = Instant::now();
+    let mut merge = Planned::new(&mut inputs, options)?;
+    let planned = Instant::now();
+    let plan = merge.plan.take().expect("planned above");
+    let bytes = writer::write_to_memory(plan, &mut inputs)?;
+    let size = bytes.len() as u64;
+    let report = merge.report(output.into(), size, [started, opened, planned]);
+    Ok((report, family, bytes))
+}
+
+/// What the page's list says of an upload: its kind and how many `unit` it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub kind: Kind,
+    pub unit: &'static str,
+    pub count: usize,
+}
+
+/// Opens an upload as a merge would, and counts what it holds.
+pub fn inspect(name: &str, bytes: Upload, deadline: Option<Instant>) -> Result<Summary, Error> {
+    let mut pkg = Package::from_upload(name, bytes, 1, &Run::new(deadline))?;
+    let (unit, count) = match pkg.kind.family() {
+        Family::Word => ("sections", docx::sections(&mut pkg)?),
+        Family::PowerPoint => ("slides", children(&mut pkg, "sldIdLst")?),
+        Family::Excel => ("sheets", children(&mut pkg, "sheets")?),
+    };
+    Ok(Summary {
+        kind: pkg.kind,
+        unit,
+        count,
     })
+}
+
+/// How many children the main part's `list` element has.
+fn children(pkg: &mut Package, list: &str) -> Result<usize, Error> {
+    let text = pkg.text(&pkg.main.clone(), MAX_PARSED)?;
+    let root = xml::tree(&text, &pkg.main, &pkg.origin)?;
+    let found = root.nodes().find(|n| n.local == list);
+    Ok(found.map_or(0, |n| n.nodes().count()))
 }
 
 #[cfg(test)]

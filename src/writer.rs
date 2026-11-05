@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufWriter, ErrorKind, Write};
+use std::io::{self, BufWriter, Cursor, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -647,6 +647,17 @@ fn too_big(what: &str, n: u64) -> Error {
     Error::limit_exceeded(what, &mib(n), "2,047 MiB")
 }
 
+/// Checks the plan and writes it in memory.
+pub fn write_to_memory(plan: Plan, inputs: &mut [Package]) -> Result<Vec<u8>, Error> {
+    check(&plan, inputs)?;
+    let failed = |e: io::Error| Error::write_failed("the merged file", &e);
+    let bytes = assemble(plan, inputs, Cursor::new(vec![]), &failed)?.into_inner();
+    if bytes.len() as u64 > MAX_OUTPUT {
+        return Err(too_big("The merged file", bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
 /// Checks the plan, writes it to a temp file in `place`'s folder and renames that into place.
 /// Returns the output's size and path.
 pub fn write(plan: Plan, inputs: &mut [Package], place: &Place) -> Result<(u64, PathBuf), Error> {
@@ -668,7 +679,34 @@ pub fn write(plan: Plan, inputs: &mut [Package], place: &Place) -> Result<(u64, 
     ));
     let file = File::create_new(&temp_path).map_err(failed)?;
     let mut temp = Temp(Some(temp_path));
-    let mut zip = ZipWriter::new(BufWriter::with_capacity(BUFFER, file));
+    let file = BufWriter::with_capacity(BUFFER, file);
+    let file = assemble(plan, inputs, file, &failed)?;
+    let file = file.into_inner().map_err(|e| failed(e.into_error()))?;
+    let size = file.metadata().map_err(failed)?.len();
+    drop(file);
+    if size > MAX_OUTPUT {
+        return Err(too_big("The merged file", size));
+    }
+    let mut taken = None;
+    for path in place.paths() {
+        match temp.publish(&path, place.replaces()) {
+            Ok(()) => return Ok((size, path)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => taken = Some(path),
+            Err(e) => return Err(Error::write_failed(&path.to_string_lossy(), &e)),
+        }
+    }
+    let taken = taken.unwrap_or_default();
+    Err(Error::output_exists(&taken.to_string_lossy()))
+}
+
+/// Writes the plan's package to `out`, which is handed back flushed.
+fn assemble<W: Write + Seek>(
+    plan: Plan,
+    inputs: &mut [Package],
+    out: W,
+    failed: &dyn Fn(io::Error) -> Error,
+) -> Result<W, Error> {
+    let mut zip = ZipWriter::new(out);
     let options = |time: Option<DateTime>| {
         SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
@@ -724,24 +762,9 @@ pub fn write(plan: Plan, inputs: &mut [Package], place: &Place) -> Result<(u64, 
             }
         }
     }
-    let mut file = zip.finish().map_err(zip_failed)?;
-    file.flush().map_err(failed)?;
-    let file = file.into_inner().map_err(|e| failed(e.into_error()))?;
-    let size = file.metadata().map_err(failed)?.len();
-    drop(file);
-    if size > MAX_OUTPUT {
-        return Err(too_big("The merged file", size));
-    }
-    let mut taken = None;
-    for path in place.paths() {
-        match temp.publish(&path, place.replaces()) {
-            Ok(()) => return Ok((size, path)),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => taken = Some(path),
-            Err(e) => return Err(Error::write_failed(&path.to_string_lossy(), &e)),
-        }
-    }
-    let taken = taken.unwrap_or_default();
-    Err(Error::output_exists(&taken.to_string_lossy()))
+    let mut out = zip.finish().map_err(zip_failed)?;
+    out.flush().map_err(failed)?;
+    Ok(out)
 }
 
 #[cfg(test)]

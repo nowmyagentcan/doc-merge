@@ -868,6 +868,12 @@ fn is_rid(a: &Attr) -> bool {
     (a.ns == R || (a.ns == O && a.local == "relid")) && !a.value.is_empty()
 }
 
+/// How many sections a document has.
+pub fn sections(pkg: &mut Package) -> Result<usize, Error> {
+    let text = pkg.text(&pkg.main.clone(), MAX_STREAMED)?;
+    Ok(scan(&text, &pkg.main, &pkg.origin, false)?.sections)
+}
+
 /// What a part uses; `twins` leaves out its even header and footer references.
 fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Error> {
     let mut r = Reader::new(text, part, origin);

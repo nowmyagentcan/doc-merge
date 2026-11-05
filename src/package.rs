@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use quick_xml::events::Event;
 use schemars::JsonSchema;
@@ -288,6 +289,21 @@ pub fn parse_rels(text: &str, part: &str, origin: &Origin) -> Result<Vec<Rel>, E
     }
 }
 
+/// Where an input's bytes come from: a file, or an upload held in memory.
+pub trait Source: Read + Seek {}
+impl<T: Read + Seek> Source for T {}
+
+/// A file's bytes, shared between the page's list and a merge under way.
+pub type Upload = Arc<Vec<u8>>;
+
+struct Held(Upload);
+
+impl AsRef<[u8]> for Held {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// A ZIP entry that is a part (folder entries are left out).
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -315,7 +331,7 @@ pub struct Package {
     /// In ZIP order.
     pub entries: Vec<Entry>,
     by_name: HashMap<String, usize>,
-    zip: ZipArchive<BufReader<File>>,
+    zip: ZipArchive<Box<dyn Source>>,
 }
 
 impl std::fmt::Debug for Package {
@@ -339,17 +355,12 @@ impl Package {
     /// Opens the `input`-th (1-based) file and runs every check that needs no part beyond the
     /// content types and the package relationships.
     pub fn open(path: &Path, input: usize, run: &Rc<Run>) -> Result<Package, Error> {
-        let origin = Origin {
-            name: display_name(path).into(),
-            input,
-            run: run.clone(),
-        };
-        let name = &*origin.name.clone();
+        let name = display_name(path);
         let at = |e: Error| e.at(input);
         let meta = std::fs::metadata(path)
             .map_err(|_| at(Error::file_not_found(&path.to_string_lossy())))?;
         if !meta.is_file() {
-            return Err(at(Error::not_office_file(name)));
+            return Err(at(Error::not_office_file(&name)));
         }
         if meta.len() > MAX_FILE {
             return Err(at(Error::limit_exceeded(
@@ -358,14 +369,44 @@ impl Package {
                 "512 MiB",
             )));
         }
-        let mut file =
+        let file =
             File::open(path).map_err(|_| at(Error::file_not_found(&path.to_string_lossy())))?;
+        let source = Box::new(BufReader::new(file));
+        Self::read_zip(source, meta.len(), path, &name, input, run)
+    }
+
+    /// Opens an upload called `name` as the `input`-th (1-based) file, with the same checks.
+    pub fn from_upload(
+        name: &str,
+        bytes: Upload,
+        input: usize,
+        run: &Rc<Run>,
+    ) -> Result<Package, Error> {
+        let len = bytes.len() as u64;
+        let source = Box::new(Cursor::new(Held(bytes)));
+        Self::read_zip(source, len, Path::new(name), name, input, run)
+    }
+
+    fn read_zip(
+        mut file: Box<dyn Source>,
+        len: u64,
+        path: &Path,
+        name: &str,
+        input: usize,
+        run: &Rc<Run>,
+    ) -> Result<Package, Error> {
+        let origin = Origin {
+            name: name.into(),
+            input,
+            run: run.clone(),
+        };
+        let at = |e: Error| e.at(input);
         let mut head = [0u8; 8];
         let n = file.read(&mut head).unwrap_or(0);
         if head[..n] == CFB {
             return Err(at(Error::legacy_or_encrypted(name)));
         }
-        match declared_entries(&mut file, meta.len()) {
+        match declared_entries(&mut file, len) {
             None => return Err(at(Error::not_office_file(name))),
             Some(n) if n > MAX_ENTRIES => {
                 return Err(at(Error::limit_exceeded(
@@ -379,7 +420,7 @@ impl Package {
         let unreadable =
             |e: &dyn std::error::Error| origin.bad("its zip structure can't be read").because(e);
         file.seek(SeekFrom::Start(0)).map_err(|e| unreadable(&e))?;
-        let mut zip = ZipArchive::new(BufReader::new(file)).map_err(|e| unreadable(&e))?;
+        let mut zip = ZipArchive::new(file).map_err(|e| unreadable(&e))?;
 
         let mut entries = vec![];
         let mut by_name = HashMap::new();
@@ -563,7 +604,7 @@ impl Package {
     }
 
     /// The entry as stored, for copying it without inflating.
-    pub fn raw(&mut self, entry: &Entry) -> Result<zip::read::ZipFile<'_, BufReader<File>>, Error> {
+    pub fn raw(&mut self, entry: &Entry) -> Result<zip::read::ZipFile<'_, Box<dyn Source>>, Error> {
         let bad = |_| {
             self.origin
                 .bad(&format!("part {} can't be read", entry.name))
@@ -598,7 +639,7 @@ fn allowed_name(part: &str) -> bool {
 /// The entry count the end-of-central-directory record or the ZIP64 record after it declares,
 /// read before the directory itself so a hostile count is refused without parsing it; none
 /// when there is no record to read it from.
-fn declared_entries(file: &mut File, len: u64) -> Option<u64> {
+fn declared_entries(file: &mut impl Source, len: u64) -> Option<u64> {
     const LOCATOR: usize = 20;
     const ZIP64_END: usize = 56;
     let tail = len.min(22 + 0xFFFF + (LOCATOR + ZIP64_END) as u64);

@@ -54,6 +54,12 @@ impl Place {
     }
 }
 
+/// Whether a path ends in `.ext`, in any case.
+pub fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
 fn folder_of(path: &Path) -> &Path {
     path.parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -89,10 +95,7 @@ impl Target {
             };
             return Ok(Place::Free { dir, ext });
         }
-        if !output
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
-        {
+        if !has_extension(output, ext) {
             let stem = output.file_stem().unwrap_or_default().to_string_lossy();
             return Err(Error::bad_extension(ext, &stem));
         }
