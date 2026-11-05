@@ -163,6 +163,11 @@ fn catch_interrupts() {
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     let bare = args.len() == 1;
+    if bare && double_clicked() {
+        let dot = Look::stdout().pick("·", "-");
+        let stop = format!(" {dot} close this window to stop.");
+        return served(ui::serve(0, true, &stop));
+    }
     // Only an exact first argument is a command: `./merge` is a file.
     match args.get(1).and_then(|a| a.to_str()) {
         Some("ui") => {
@@ -220,6 +225,20 @@ fn main() -> ExitCode {
         // A reader that hung up ends the run quietly with the code earned so far.
         _ => ExitCode::from(code),
     }
+}
+
+/// Whether Explorer started us: no other process shares this console, so no shell waits on it.
+#[cfg(windows)]
+fn double_clicked() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut ids = [0u32; 2];
+    // SAFETY: the call writes at most `ids.len()` process ids into `ids`.
+    io::stdin().is_terminal() && unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 2) == 1 }
+}
+
+#[cfg(not(windows))]
+fn double_clicked() -> bool {
+    false
 }
 
 /// The arguments of `ui` or `mcp`, or the code to end with once they are dealt with.
