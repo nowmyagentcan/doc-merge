@@ -863,6 +863,15 @@ fn tag(ns: &str, local: &[u8]) -> Tag {
     }
 }
 
+/// An element's tag, with its namespace looked up only when the name is one we follow: most
+/// elements aren't, and the lookup is the dearest step of reading them.
+fn tag_of(r: &Reader, e: &BytesStart) -> Tag {
+    match tag(W, e.local_name().as_ref().as_bytes()) {
+        Tag::Other => Tag::Other,
+        _ => tag(r.element_ns(e), e.local_name().as_ref().as_bytes()),
+    }
+}
+
 /// Whether an attribute holds a relationship id of the part it is in.
 fn is_rid(a: &Attr) -> bool {
     (a.ns == R || (a.ns == O && a.local == "relid")) && !a.value.is_empty()
@@ -903,7 +912,8 @@ fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Er
             Event::Eof => break,
             _ => continue,
         };
-        let t = tag(r.element_ns(e), e.local_name().as_ref().as_bytes());
+        let ns = r.element_ns(e);
+        let t = tag(ns, e.local_name().as_ref().as_bytes());
         let attrs = r.attrs(e)?;
         if stack.is_empty() {
             uses.root = attrs.clone();
@@ -912,30 +922,29 @@ fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Er
             uses.sections += 1;
             body_sect |= stack.last() == Some(&Tag::Body);
         }
-        if r.element_ns(e) == W
+        if ns == W
             && matches!(e.local_name().as_ref(), "pStyle" | "rStyle" | "tblStyle")
             && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "val")
         {
             uses.styles.insert(a.value.clone());
         }
-        if r.element_ns(e) == W
+        if ns == W
             && e.local_name().as_ref() == "numId"
             && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "val")
             && a.value != "0"
         {
             uses.nums.insert(a.value.clone());
         }
-        if r.element_ns(e) == W
+        if ns == W
             && e.local_name().as_ref() == "bookmarkStart"
             && let Some(a) = attrs.iter().find(|a| a.ns == W && a.local == "name")
         {
             uses.names.push(a.value.clone());
         }
-        uses.tally
-            .see(r.element_ns(e), e.local_name().as_ref(), &attrs);
+        uses.tally.see(ns, e.local_name().as_ref(), &attrs);
         uses.paras
             .extend(attrs.iter().filter_map(ids::paragraph_id));
-        if r.element_ns(e) == W {
+        if ns == W {
             match e.local_name().as_ref() {
                 "fldChar" => uses.toc |= instr.take().is_some_and(|s| is_toc(&s)),
                 "fldSimple" => {
@@ -949,7 +958,7 @@ fn scan(text: &str, part: &str, origin: &Origin, twins: bool) -> Result<Uses, Er
                 _ => {}
             }
         }
-        let reference = headers::reference(r.element_ns(e), e.local_name().as_ref());
+        let reference = headers::reference(ns, e.local_name().as_ref());
         if let Some(local) = reference.filter(|_| stack.last() == Some(&Tag::SectPr)) {
             let kind = attrs.iter().find(|a| a.ns == W && a.local == "type");
             let kind = kind.map_or("default", |a| a.value.as_str());
@@ -1170,7 +1179,7 @@ fn body(
                 Event::Eof => break,
                 Event::Start(e) | Event::Empty(e) => {
                     let empty = matches!(event, Event::Empty(_));
-                    let t = tag(r.element_ns(e), e.local_name().as_ref().as_bytes());
+                    let t = tag_of(&r, e);
                     if role.base && depth == 0 {
                         let s = start_tag(e.name().as_ref(), role.root, empty);
                         out.write_all(s.as_bytes()).map_err(io)?;
@@ -1200,7 +1209,7 @@ fn body(
         match &event {
             Event::Start(e) | Event::Empty(e) => {
                 let empty = matches!(event, Event::Empty(_));
-                let t = tag(r.element_ns(e), e.local_name().as_ref().as_bytes());
+                let t = tag_of(&r, e);
                 let parent = stack.last().copied();
                 if depth == b && t == Tag::SectPr {
                     let mut s = vec![];
@@ -1455,28 +1464,26 @@ fn element<'a>(
     place: Place,
     buf: &mut Vec<u8>,
 ) -> Result<bool, Error> {
-    let ns = r.element_ns(e);
-    if rw.appended && (ns == W || ns == W15) && e.local_name().as_ref() == "dataBinding" {
-        let depth = r.depth();
-        while !empty && r.depth() >= depth {
-            r.event()?;
-        }
-        return Ok(true);
-    }
     let local = e.local_name();
     let local: &str = local.as_ref();
-    if rw.appended
-        && ns == W
-        && matches!(local, "bookmarkStart" | "bookmarkEnd")
-        && walk.local.leaves_out(local, &r.attrs(e)?, rw.copying)
-    {
-        let depth = r.depth();
-        while !empty && r.depth() >= depth {
-            r.event()?;
+    let binding = local == "dataBinding";
+    let bookmark = matches!(local, "bookmarkStart" | "bookmarkEnd");
+    if rw.appended && (binding || bookmark) {
+        let ns = r.element_ns(e);
+        let dropped = if binding {
+            ns == W || ns == W15
+        } else {
+            ns == W && walk.local.leaves_out(local, &r.attrs(e)?, rw.copying)
+        };
+        if dropped {
+            let depth = r.depth();
+            while !empty && r.depth() >= depth {
+                r.event()?;
+            }
+            return Ok(true);
         }
-        return Ok(true);
     }
-    if tag(ns, local.as_bytes()) == Tag::SectPr {
+    if tag_of(r, e) == Tag::SectPr {
         headers::section(r, e, empty, rw, walk, place, buf)?;
         return Ok(true);
     }
