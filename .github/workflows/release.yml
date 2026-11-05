@@ -83,6 +83,10 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+          sparse-checkout: tests/fixtures
       - uses: actions/download-artifact@v8
         with:
           name: dist
@@ -98,13 +102,23 @@ jobs:
             if [ "$RUNNER_OS" = Linux ]; then file doc-merge | grep -E 'static(-pie|ally) linked'; fi
           fi
           test -s LICENSE
-          test -s THIRD-PARTY-LICENSES.txt
-          ./doc-merge --version
+          test -s README.md
+          grep -qF 'Phosphor Icons' THIRD-PARTY-LICENSES.txt
+          ./doc-merge --version | grep -Ex 'doc-merge [0-9]+[.][0-9]+[.][0-9]+'
           bin=$(ls doc-merge*)
           zip=$(ls ../dist/*-${{ matrix.target }}.*)
           echo "binary $(wc -c < $bin) bytes, archive $(wc -c < $zip) bytes"
           test $(wc -c < $bin) -le 6291456
           test $(wc -c < $zip) -le 3145728
+          f=../src/tests/fixtures
+          merged() { tr -d ' \n\r' | grep -F "$1"; }
+          ./doc-merge $f/a.docx $f/b.docx -o ab.docx --json | merged '"output_sections":[3,3]'
+          ./doc-merge $f/a.pptx $f/b.pptx $f/c.pptx -o abc.pptx --json | merged '"output_slides":[8,10]'
+          ./doc-merge $f/a.xlsx $f/b.xlsx -o ab.xlsx --json | merged '"output_name":"Summary(2)"'
+          test -s ab.docx && test -s abc.pptx && test -s ab.xlsx
+          if ./doc-merge $f/a.docx $f/m.docm -o no.docx --json > refused.json; then exit 1; fi
+          merged '"code":"macro_enabled"' < refused.json
+          test ! -e no.docx
       - name: Copy the files with wrong checksums
         run: mkdir bad && cp dist/* bad/ && sed -i.bak 's/^./x/' bad/SHA256SUMS
       - name: install.sh with sh, bash and zsh
@@ -138,6 +152,13 @@ jobs:
           }
           # A new shell finds it through the user PATH alone.
           powershell -NoProfile -Command '$env:Path = [Environment]::GetEnvironmentVariable(''Path'', ''User''); doc-merge --version'
+          # An upgrade works while the page runs, and a later one clears the moved copy.
+          $p = Start-Process "$dir\doc-merge.exe" 'ui --no-open' -PassThru -WindowStyle Hidden
+          Start-Sleep 1
+          if ($p.HasExited) { throw 'doc-merge ui stopped' }
+          powershell -NoProfile -File dist/install.ps1
+          if ($LASTEXITCODE) { throw 'upgrade failed while doc-merge ui ran' }
+          Stop-Process $p.Id; $p.WaitForExit()
           # Other files in the folder stay.
           Set-Content "$dir\notes.old" 'kept'
           powershell -NoProfile -File dist/install.ps1

@@ -77,6 +77,19 @@ fn refused(dir: &Path, args: &[&str], code: &str, exit: i32, message: &str, hint
 }
 
 #[test]
+fn the_committed_macro_file_is_refused() {
+    let dir = folder("macro", &["a.docx", "m.docm"]);
+    refused(
+        &dir,
+        &["a.docx", "m.docm"],
+        "macro_enabled",
+        1,
+        "'m.docm' contains macros, which doc-merge doesn't merge.",
+        Some("Save a copy without macros (.docx, .pptx or .xlsx) and merge that."),
+    );
+}
+
+#[test]
 fn version_prints_name_and_version() {
     for flag in ["--version", "-V"] {
         let out = bin().arg(flag).output().unwrap();
