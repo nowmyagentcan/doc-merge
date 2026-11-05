@@ -80,7 +80,7 @@ What it doesn't do, or hasn't proven:
 - PowerPoint: legacy and modern comment authors stay in their own lists. Handout masters of later decks are left out. When a deck is scaled, SmartArt and charts scale as a frame and keep their inner sizes. A master shared between decks keeps its own links.
 - Tested less: zoom refusal only on hand-built files, as PowerPoint can't be scripted to write one. OLE and ActiveX objects are copied by the same rules but were never opened in Office here, for lack of a test file. A custom table style's fill didn't draw in a test deck even in the source deck alone, so its look in a merge is unproven; PowerPoint does report the style by name.
 - Closing the console window during a merge can leave a `.doc-merge-*.tmp` file beside the output; Ctrl+C doesn't.
-- An extreme file can use a few gigabytes of memory; running out ends the process, including `ui` and `mcp`.
+- Running out of memory ends the process, `ui` and `mcp` included, and can't be turned into an error. Four Word files of 500 MiB of XML each merged within 3 GB.
 
 It makes no network requests: no update check, no telemetry. `ui` listens on 127.0.0.1 only and keeps everything in memory, and `mcp` speaks only on stdin and stdout.
 
