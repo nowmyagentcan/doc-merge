@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use doc_merge::error::{Error, mib};
-use doc_merge::package::{Family, MAX_FILE, Upload};
+use doc_merge::package::{Family, Kind, MAX_FILE, Upload};
 use doc_merge::paths::MAX_FILES;
 use doc_merge::{Options, Report, StyleMode, TIME_LIMIT, guarded, inspect, merge_uploads};
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ struct File {
 /// The last merged file.
 struct Merged {
     name: String,
-    family: Family,
+    kind: Kind,
     bytes: Arc<Vec<u8>>,
 }
 
@@ -424,12 +424,12 @@ fn merged(request: MergeRequest, deadline: Instant) -> Reply {
 }
 
 /// The report, with the file held for `GET /api/result`, or the error object.
-fn answer(merged: Result<(Report, Family, Vec<u8>), Error>) -> Reply {
+fn answer(merged: Result<(Report, Vec<u8>), Error>) -> Reply {
     match merged {
-        Ok((report, family, bytes)) => {
+        Ok((report, bytes)) => {
             state().result = Some(Merged {
                 name: report.output.path.to_string_lossy().into_owned(),
-                family,
+                kind: report.output.kind,
                 bytes: Arc::new(bytes),
             });
             Reply::json(&report)
@@ -464,7 +464,7 @@ fn result() -> Reply {
     let Some(merged) = &state.result else {
         return Reply::not_found();
     };
-    let kind = match merged.family {
+    let kind = match merged.kind.family() {
         Family::Word => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         Family::PowerPoint => {
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"

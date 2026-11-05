@@ -261,10 +261,8 @@ pub struct Options {
     pub styles: StyleMode,
 }
 
-/// A merge planned from opened inputs, and what its report will say.
+/// What the report of a planned merge will say.
 struct Planned {
-    /// Taken when the merge is written.
-    plan: Option<Plan>,
     family: Family,
     listed: Vec<Input>,
     renames: Vec<Rename>,
@@ -272,7 +270,7 @@ struct Planned {
 }
 
 impl Planned {
-    fn new(inputs: &mut [Package], options: &Options) -> Result<Self, Error> {
+    fn new(inputs: &mut [Package], options: &Options) -> Result<(Plan, Self), Error> {
         let mut warnings = Warnings::default();
         let family = inputs[0].kind.family();
         let mut listed: Vec<Input> = inputs
@@ -316,13 +314,13 @@ impl Planned {
                 (m.plan, m.renames)
             }
         };
-        Ok(Self {
-            plan: Some(plan),
+        let planned = Self {
             family,
             listed,
             renames,
             warnings,
-        })
+        };
+        Ok((plan, planned))
     }
 
     /// The report once `bytes` went to `path`; `times` says when the merge started, had opened
@@ -376,14 +374,13 @@ pub fn merge(
     let place = target.place(paths, first.kind.family())?;
     let mut inputs = open_inputs(first, paths, &run)?;
     let opened = Instant::now();
-    let mut merge = Planned::new(&mut inputs, options)?;
+    let (plan, mut merge) = Planned::new(&mut inputs, options)?;
     let planned = Instant::now();
     for input in &mut merge.listed {
         if let Ok(full) = std::path::absolute(&input.path) {
             input.path = full;
         }
     }
-    let plan = merge.plan.take().expect("planned above");
     let (bytes, output) = writer::write(plan, &mut inputs, &place)?;
     let output = std::path::absolute(&output).unwrap_or(output);
     Ok(merge.report(output, bytes, [started, opened, planned]))
@@ -396,7 +393,7 @@ pub fn merge_uploads(
     name: Option<&str>,
     options: &Options,
     deadline: Option<Instant>,
-) -> Result<(Report, Family, Vec<u8>), Error> {
+) -> Result<(Report, Vec<u8>), Error> {
     let started = Instant::now();
     let run = Run::new(deadline);
     let mut inputs = vec![];
@@ -415,13 +412,12 @@ pub fn merge_uploads(
         None => format!("merged.{ext}"),
     };
     let opened = Instant::now();
-    let mut merge = Planned::new(&mut inputs, options)?;
+    let (plan, merge) = Planned::new(&mut inputs, options)?;
     let planned = Instant::now();
-    let plan = merge.plan.take().expect("planned above");
     let bytes = writer::write_to_memory(plan, &mut inputs)?;
     let size = bytes.len() as u64;
     let report = merge.report(output.into(), size, [started, opened, planned]);
-    Ok((report, family, bytes))
+    Ok((report, bytes))
 }
 
 /// What the page's list says of an upload: its kind and how many `unit` it holds.
