@@ -285,28 +285,10 @@ fn unsafe_zips_are_refused() {
         "part word/x.png uses compression method 12."
     );
 
-    // A second entry hidden inside the first one's data.
-    let inner = raw("word/b.png", b"bbbb");
-    let mut hidden = local_header(&inner);
-    hidden.extend(&inner.data);
-    let outer = raw("word/a.png", &hidden);
-    let mut bytes = vec![];
-    let mut cd = vec![];
-    for (n, d) in &base {
-        let e = raw(n, d);
-        cd.extend(central_header(&e, bytes.len() as u32));
-        bytes.extend(local_header(&e));
-        bytes.extend(&e.data);
-    }
-    cd.extend(central_header(&outer, bytes.len() as u32));
-    let inner_at = bytes.len() + local_header(&outer).len();
-    cd.extend(central_header(&inner, inner_at as u32));
-    bytes.extend(local_header(&outer));
-    bytes.extend(&outer.data);
-    let at = bytes.len() as u32;
-    bytes.extend(&cd);
-    bytes.extend(end_record(5, cd.len() as u32, at));
-    assert_eq!(reason("overlap", bytes), "zip entries overlap.");
+    assert_eq!(
+        reason("overlap", overlapping(&base)),
+        "zip entries overlap."
+    );
 
     // The local header names another part than the directory does.
     let mut mismatch = entries(vec![raw("word/a.png", b"x")]);

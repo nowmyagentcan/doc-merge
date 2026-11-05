@@ -167,6 +167,7 @@ name = "doc-merge"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "quick-xml",
  "rmcp",
  "schemars",

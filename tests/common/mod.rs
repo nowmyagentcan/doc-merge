@@ -175,6 +175,31 @@ pub fn build(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
     zip(&list)
 }
 
+/// A package of `parts` with a second entry hidden inside the first one's data.
+pub fn overlapping(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let inner = raw("word/b.png", b"bbbb");
+    let mut hidden = local_header(&inner);
+    hidden.extend(&inner.data);
+    let outer = raw("word/a.png", &hidden);
+    let mut bytes = vec![];
+    let mut cd = vec![];
+    for (n, d) in parts {
+        let e = raw(n, d);
+        cd.extend(central_header(&e, bytes.len() as u32));
+        bytes.extend(local_header(&e));
+        bytes.extend(&e.data);
+    }
+    cd.extend(central_header(&outer, bytes.len() as u32));
+    let inner_at = bytes.len() + local_header(&outer).len();
+    cd.extend(central_header(&inner, inner_at as u32));
+    bytes.extend(local_header(&outer));
+    bytes.extend(&outer.data);
+    let at = bytes.len() as u32;
+    bytes.extend(&cd);
+    bytes.extend(end_record(parts.len() as u16 + 2, cd.len() as u32, at));
+    bytes
+}
+
 /// Word files no merge gets past, each with the name it goes by and the code that refuses it.
 pub fn hostile() -> Vec<(&'static str, Vec<u8>, &'static str)> {
     let word = |main: &str| {
@@ -220,6 +245,11 @@ pub fn hostile() -> Vec<(&'static str, Vec<u8>, &'static str)> {
         ("macros.docx", build(&macros), "macro_enabled"),
         ("claims.docx", claims, "limit_exceeded"),
         ("lies.docx", lies, "bad_package"),
+        (
+            "overlap.docx",
+            overlapping(&minimal("docx", &[])),
+            "bad_package",
+        ),
         ("deep.docx", word(&body(&deep)), "bad_package"),
         (
             "laughs.docx",

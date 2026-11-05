@@ -32,3 +32,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1.34"
+
+# tests/speed.rs reads child processes' peak memory.
+[target."cfg(windows)".dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus"] }
+
+[target."cfg(unix)".dev-dependencies]
+libc = "0.2.191"
