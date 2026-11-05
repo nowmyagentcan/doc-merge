@@ -19,9 +19,10 @@ use std::rc::Rc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use serde::{Serialize, Serializer};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize, Serializer};
 
 use error::{Error, Warnings, mib};
 use package::{Family, Kind, Package};
@@ -29,6 +30,9 @@ use paths::Target;
 
 /// Set on Ctrl+C: a run under way ends at its next look at the clock, removing its temp file.
 pub static STOP: AtomicBool = AtomicBool::new(false);
+
+/// How long `ui` and `mcp` give one merge.
+pub const TIME_LIMIT: Duration = Duration::from_secs(600);
 
 const WORKER: &str = "doc-merge worker";
 /// XML nests at most 256 deep and nothing else recurses, so this is many times what a run needs.
@@ -174,7 +178,7 @@ fn lossy<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
 }
 
 /// The merged file.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Output {
     #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
@@ -183,7 +187,7 @@ pub struct Output {
 }
 
 /// One input and where its content landed.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Input {
     #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
@@ -203,14 +207,14 @@ pub struct Input {
 }
 
 /// A sheet of an input and what it is called in the output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SheetName {
     pub name: String,
     pub output_name: String,
 }
 
 /// A name the merge changed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Rename {
     pub input: usize,
     pub kind: &'static str,
@@ -222,7 +226,7 @@ pub struct Rename {
 const MAX_RENAMES: usize = 1_000;
 
 /// What a merge did, in the shape `--json` prints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Report {
     pub output: Output,
     pub inputs: Vec<Input>,
@@ -236,7 +240,8 @@ pub struct Report {
 }
 
 /// How clashing Word styles are settled.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum StyleMode {
     /// Each document keeps its look; clashing styles are copied under new names.
     #[default]

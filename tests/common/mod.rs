@@ -175,6 +175,52 @@ pub fn build(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
     zip(&list)
 }
 
+/// Word files no merge gets past, each with the name it goes by and the code that refuses it.
+pub fn hostile() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+    let word = |main: &str| {
+        let mut parts = minimal("docx", &[]);
+        set(&mut parts, "word/document.xml", main.as_bytes());
+        build(&parts)
+    };
+    let body = |inner: &str| {
+        let ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        format!("<w:document xmlns:w=\"{ns}\"><w:body>{inner}</w:body></w:document>")
+    };
+    let deep = "<w:p>".repeat(100_000) + &"</w:p>".repeat(100_000);
+    let laughs = "<!DOCTYPE d [<!ENTITY a \"aaaaaaaaaa\"><!ENTITY b \"&a;&a;&a;&a;\">]>";
+    let mut claims = build(&minimal("docx", &[]));
+    patch_size(&mut claims, "word/document.xml", 1 << 30);
+    let mut lies = build(&minimal("docx", &[]));
+    patch_size(&mut lies, "word/document.xml", 10);
+    let mut macros = minimal(
+        "docx",
+        &[(
+            "word/vbaProject.bin",
+            "application/vnd.ms-office.vbaProject",
+            "x",
+        )],
+    );
+    set(&mut macros, "word/document.xml", body("").as_bytes());
+    vec![
+        ("garbage.docx", vec![0x55; 4096], "not_office_file"),
+        (
+            "old.doc",
+            b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1 and more".to_vec(),
+            "legacy_or_encrypted",
+        ),
+        ("macros.docx", build(&macros), "macro_enabled"),
+        ("claims.docx", claims, "limit_exceeded"),
+        ("lies.docx", lies, "bad_package"),
+        ("deep.docx", word(&body(&deep)), "bad_package"),
+        (
+            "laughs.docx",
+            word(&(laughs.to_string() + &body("<w:p/>"))),
+            "bad_package",
+        ),
+        ("broken.docx", word("<w:document><w:body>"), "bad_package"),
+    ]
+}
+
 /// Replaces part `name` (or adds it at the end).
 pub fn set(parts: &mut Vec<(String, Vec<u8>)>, name: &str, data: &[u8]) {
     match parts.iter_mut().find(|p| p.0 == name) {

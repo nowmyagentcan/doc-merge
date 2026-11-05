@@ -1,6 +1,7 @@
 //! Every error and warning a merge can end with: a stable code, one line saying what failed,
 //! one line saying how to fix it, and the exit code it earns.
 
+use schemars::JsonSchema;
 use serde::Serialize;
 
 /// A failure, shown as two lines in text mode and as `{"error": …}` with `--json`.
@@ -45,6 +46,11 @@ pub enum Foreign {
 pub type FamilyCounts = [usize; 3];
 
 impl Error {
+    /// The `{"error": …}` object `--json`, the MCP server and the page all answer with.
+    pub fn to_json(&self) -> String {
+        serde_json::json!({ "error": self }).to_string()
+    }
+
     /// The same error, blamed on the 1-based input `n`.
     pub fn at(mut self, n: usize) -> Self {
         self.input = Some(n);
@@ -272,7 +278,7 @@ pub fn thousands(n: u64) -> String {
 }
 
 /// Something the merge did that the user should know about; the exit code stays 0.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Warning {
     pub code: &'static str,
     pub input: Option<usize>,
@@ -353,7 +359,7 @@ impl Warning {
 
 /// The warnings of one run, in the order they were first met; a second warning with the same
 /// code and input as an earlier one is left out.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Warnings(Vec<Warning>);
 

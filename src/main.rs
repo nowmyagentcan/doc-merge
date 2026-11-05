@@ -1,6 +1,7 @@
 //! The command line: `doc-merge [merge] <PATH>... [OPTIONS]`.
 
 mod interactive;
+mod mcp;
 mod text;
 
 use std::ffi::OsString;
@@ -163,8 +164,21 @@ fn main() -> ExitCode {
     let bare = args.len() == 1;
     // Only an exact first argument is a command: `./merge` is a file.
     match args.get(1).and_then(|a| a.to_str()) {
-        Some("ui") => return command::<Ui>(&args[1..], "ui"),
-        Some("mcp") => return command::<Mcp>(&args[1..], "mcp"),
+        Some("ui") => {
+            return match parsed::<Ui>(&args[1..]) {
+                Ok(_) => fail(&Error::internal("ui isn't in this build"), false),
+                Err(code) => code,
+            };
+        }
+        Some("mcp") => {
+            return match parsed::<Mcp>(&args[1..]) {
+                Ok(_) => {
+                    catch_interrupts();
+                    served(mcp::serve())
+                }
+                Err(code) => code,
+            };
+        }
         Some("merge") => drop(args.remove(1)),
         _ => {}
     }
@@ -203,19 +217,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// `ui` or `mcp`, once its arguments are read.
-fn command<T: Parser>(args: &[OsString], name: &str) -> ExitCode {
-    match T::try_parse_from(args) {
-        Ok(_) => fail(
-            &Error::internal(&format!("{name} isn't in this build")),
-            false,
-        ),
-        Err(e) if e.use_stderr() => fail(&usage(&e), false),
-        Err(e) => {
-            let _ = e.print();
-            ExitCode::SUCCESS
+/// The arguments of `ui` or `mcp`, or the code to end with once they are dealt with.
+fn parsed<T: Parser>(args: &[OsString]) -> Result<T, ExitCode> {
+    T::try_parse_from(args).map_err(|e| {
+        if e.use_stderr() {
+            return fail(&usage(&e), false);
         }
-    }
+        let _ = e.print();
+        ExitCode::SUCCESS
+    })
+}
+
+/// How a server ended.
+fn served(ended: Result<(), Error>) -> ExitCode {
+    ended.map_or_else(|e| fail(&e, false), |()| ExitCode::SUCCESS)
+}
+
+/// Runs `work` so that a Ctrl+C asks it to stop.
+fn merging<T>(work: impl FnOnce() -> T) -> T {
+    MERGING.store(true, Ordering::SeqCst);
+    let done = work();
+    MERGING.store(false, Ordering::SeqCst);
+    done
 }
 
 /// One line of interactive mode: merged with the defaults, whatever exit code it earns; only a
@@ -263,12 +286,7 @@ fn run(
         _ => e,
     });
     let merged = expanded.and_then(|files| {
-        let work = || {
-            MERGING.store(true, Ordering::SeqCst);
-            let merged = guarded(|| merge(&files, &target, &options, None));
-            MERGING.store(false, Ordering::SeqCst);
-            merged
-        };
+        let work = || merging(|| guarded(|| merge(&files, &target, &options, None)));
         if cli.json {
             return work();
         }
@@ -282,7 +300,7 @@ fn run(
     match merged {
         Ok(report) if cli.json => print_json(&mut out.w, &report),
         Ok(report) => text::report(out, &report),
-        Err(e) if cli.json => print_json(&mut out.w, &Failed { error: &e }),
+        Err(e) if cli.json => print_failed(&mut out.w, &e),
         Err(e) => text::error(err, &e),
     }
 }
@@ -304,15 +322,14 @@ fn debug(err: &mut impl Write, merged: &Result<Report, Error>) -> io::Result<()>
     Ok(())
 }
 
-#[derive(Serialize)]
-struct Failed<'a> {
-    error: &'a Error,
-}
-
 fn print_json(out: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut *out, value)?;
     writeln!(out)?;
     out.flush()
+}
+
+fn print_failed(out: &mut impl Write, e: &Error) -> io::Result<()> {
+    print_json(out, &serde_json::json!({ "error": e }))
 }
 
 /// A clap error as our usage error: `Unknown option --x.` or clap's own sentence.
@@ -336,7 +353,7 @@ fn usage(e: &clap::Error) -> Error {
 /// Reports an error that stops the run, as two lines on stderr or as JSON on stdout.
 fn fail(e: &Error, json: bool) -> ExitCode {
     let _ = if json {
-        print_json(&mut io::stdout(), &Failed { error: e })
+        print_failed(&mut io::stdout(), e)
     } else {
         text::error(&mut Out::new(io::stderr(), Look::stderr()), e)
     };
