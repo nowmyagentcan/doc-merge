@@ -3,6 +3,7 @@
 mod interactive;
 mod mcp;
 mod text;
+mod ui;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
@@ -166,7 +167,11 @@ fn main() -> ExitCode {
     match args.get(1).and_then(|a| a.to_str()) {
         Some("ui") => {
             return match parsed::<Ui>(&args[1..]) {
-                Ok(_) => fail(&Error::internal("ui isn't in this build"), false),
+                Ok(ui) => served(ui::serve(
+                    ui.port.unwrap_or(0),
+                    !ui.no_open,
+                    "  (Ctrl+C to stop)",
+                )),
                 Err(code) => code,
             };
         }

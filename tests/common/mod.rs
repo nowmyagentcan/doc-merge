@@ -201,6 +201,15 @@ pub fn hostile() -> Vec<(&'static str, Vec<u8>, &'static str)> {
         )],
     );
     set(&mut macros, "word/document.xml", body("").as_bytes());
+    // Good until its styles are read, which only a merge does.
+    let styles_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
+    let styles_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+    let mut styles = minimal("docx", &[("word/styles.xml", styles_type, "<w:styles")]);
+    set(
+        &mut styles,
+        "word/_rels/document.xml.rels",
+        rels(&[("rId1", styles_rel, "styles.xml")]).as_bytes(),
+    );
     vec![
         ("garbage.docx", vec![0x55; 4096], "not_office_file"),
         (
@@ -218,6 +227,7 @@ pub fn hostile() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             "bad_package",
         ),
         ("broken.docx", word("<w:document><w:body>"), "bad_package"),
+        ("styles.docx", build(&styles), "bad_package"),
     ]
 }
 

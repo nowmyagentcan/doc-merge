@@ -280,62 +280,11 @@ addEventListener("keydown", e => {
   else if (e.key === "Enter" && e.target === document.body) { e.preventDefault(); start(); }
 });
 
-// Stand-ins for the four server calls (POST /api/files, DELETE /api/files/<id>, POST /api/merge, GET /api/result),
-// answering in the server's shapes from sample data until the page talks to it.
-const pause = ms => new Promise(r => setTimeout(r, ms));
-const samples = new Map();
-let uploads = 0;
-const SLIDES = { "deck-a.pptx": 12, "deck-b.pptx": 8, "old-4x3.pptx": 5 };
-
-async function upload(file) {
-  await pause(300);
-  const ext = file.name.split(".").pop().toLowerCase(), kind = FAMILY[ext];
-  if (/^(docm|dotm|pptm|potm|ppsm|xlsm|xltm)$/.test(ext))
-    return { error: { code: "macro_enabled", message: `'${file.name}' contains macros, which doc-merge doesn't merge.`, hint: "Save a copy without macros (.docx, .pptx or .xlsx) and merge that.", input: null } };
-  if (!kind)
-    return { error: { code: "not_office_file", message: `'${file.name}' isn't a Word, PowerPoint or Excel file.`, hint: "Use .docx, .pptx or .xlsx files (or .dotx, .potx, .ppsx, .xltx).", input: null } };
-  const id = String(++uploads), info = { id, name: file.name, kind: ext, bytes: file.size };
-  if (kind === "powerpoint") info.slides = SLIDES[file.name] || 3 + file.name.length % 9;
-  if (kind === "excel") info.sheets = 2;
-  if (kind === "word") info.sections = 1 + file.name.length % 3;
-  samples.set(id, info);
-  return info;
-}
-
-async function forget(id) { samples.delete(id); }
-
-async function merge(ids, styles, name) {
-  await pause(1200);
-  const files = ids.map(id => samples.get(id)), fams = files.map(i => FAMILY[i.kind]);
-  if (new Set(fams).size > 1) {
-    const n = f => plural(fams.filter(x => x === f).length, KINDS[f][1]);
-    return { error: { code: "mixed_formats", message: `The files mix ${[...new Set(fams)].map(n).join(" and ")}; doc-merge merges one kind at a time.`, hint: `Merge Word, PowerPoint and Excel files separately, e.g. doc-merge "folder\\*.pptx".`, input: null } };
-  }
-  const k = files.findIndex((i, n) => n > 0 && /pivot/i.test(i.name));
-  if (k > 0)
-    return { error: { code: "unsupported_variant", message: `'${files[k].name}' has pivot tables, which doc-merge can't merge yet.`, hint: "Remove the pivot tables (or paste their values) in Excel, save, and merge again.", input: k + 1 } };
-  let at = 1;
-  const r = { output: { path: name, kind: KINDS[fams[0]][2], bytes: files.reduce((n, i) => n + i.bytes, 0) }, inputs: [], renames: [], renames_omitted: 0, warnings: [], elapsed_ms: 120 + 60 * files.length };
-  files.forEach((i, n) => {
-    const input = { path: i.name, kind: i.kind };
-    if (i.slides) { input.slides = i.slides; input.output_slides = [at, at += i.slides - 1]; at++; }
-    if (i.sections) { input.sections = i.sections; input.output_sections = [at, at += i.sections - 1]; at++; }
-    if (i.sheets) input.sheets = ["Summary", "Data"].map(s => ({ name: s, output_name: n ? `${s} (${n + 1})` : s }));
-    if (i.sheets && n) r.renames.push(...input.sheets.map(s => ({ input: n + 1, kind: "sheet", from: s.name, to: s.output_name })));
-    if (/4x3/.test(i.name)) r.warnings.push({ code: "slides_scaled", input: n + 1, message: `Slides from ${i.name} (4:3) were scaled to fit the 16:9 slide size and centred.` });
-    r.inputs.push(input);
-  });
-  if (files.map(i => i.name).join() === "deck-a.pptx,deck-b.pptx,old-4x3.pptx") Object.assign(r, { elapsed_ms: 1180, output: { ...r.output, bytes: 2481102 }, renames: [{ input: 3, kind: "custom_show", from: "Short", to: "Short (3)" }] });
-  if (fams[0] === "word" && files.length > 1) r.warnings.push({ code: "theme_differs", input: 2, message: `Shapes and charts from ${files[1].name} use the first file's theme colours and fonts.` });
-  return r;
-}
-
-function download(name) {
-  const a = el("a");
-  a.href = URL.createObjectURL(new Blob(["sample"]));
-  a.download = name;
-  a.click();
-}
+const answer = r => r.json();
+const upload = file => fetch("/api/files", { method: "POST", headers: { "X-File-Name": encodeURIComponent(file.name) }, body: file }).then(answer);
+const forget = id => fetch("/api/files/" + encodeURIComponent(id), { method: "DELETE" });
+const merge = (ids, styles, name) => fetch("/api/merge", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ files: ids, styles, name }) }).then(answer);
+function download(name) { const a = el("a"); a.href = "/api/result"; a.download = name; a.click(); }
 
 render();
 </script>
