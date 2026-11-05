@@ -249,8 +249,10 @@ fn outputs_get_a_free_name_and_never_overwrite_without_asking() {
     let path = |o: &Output| PathBuf::from(json(o)["output"]["path"].as_str().unwrap());
     let args = ["a.pptx", "b.pptx", "--json"];
     let first = run_in(&dir, &args);
-    let at = std::path::absolute(dir.join("merged.pptx")).unwrap();
-    assert_eq!(path(&first), at);
+    // Compared as files: the temp folder can be behind a symlink, as /var is on macOS.
+    let at = dir.join("merged.pptx").canonicalize().unwrap();
+    assert!(path(&first).is_absolute());
+    assert_eq!(path(&first).canonicalize().unwrap(), at);
     assert_eq!(
         path(&run_in(&dir, &args)).file_name().unwrap(),
         "merged-2.pptx"
@@ -262,7 +264,7 @@ fn outputs_get_a_free_name_and_never_overwrite_without_asking() {
         &dir,
         &[&args[..], &["-o", "merged.pptx", "--overwrite"]].concat(),
     );
-    assert_eq!(path(&replaced), at);
+    assert_eq!(path(&replaced).canonicalize().unwrap(), at);
 
     std::fs::create_dir(dir.join("sub")).unwrap();
     let out = run_in(&dir, &[&args[..], &["-o", "sub"]].concat());
