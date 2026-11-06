@@ -519,6 +519,6 @@ fn a_part_name_with_a_character_across_byte_15_opens() {
 #[test]
 fn a_backslash_in_a_raw_zip_name_is_refused() {
     let mut list: Vec<Raw> = docx().iter().map(|(n, d)| raw(n, d)).collect();
-    list.push(raw("word\bad.xml", b"<a/>"));
+    list.push(raw(r"word\bad.xml", b"<a/>"));
     assert_eq!(refused("backslash", &raw_zip(&list)).code, "bad_package");
 }
