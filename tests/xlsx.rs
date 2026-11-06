@@ -1687,3 +1687,159 @@ fn a_cell_with_metadata_its_workbook_lacks_is_damage() {
     );
     assert!(!out.exists());
 }
+
+#[test]
+fn quotes_and_strings_in_formulas_keep_their_meaning() {
+    let cells = |f: &str| format!(r#"<row r="1"><c r="A1"><f>{f}</f></c></row>"#);
+    let f = r#"'It''s'!A1&amp;"It's!A1"&amp;"'It''s'!A1"&amp;SUM('It''s:Z'!B2)"#;
+    let dir = temp_dir("quotes");
+    let sheets = |c: &str| book(&[("It&apos;s", c), ("Z", "")], None);
+    let paths = [
+        book_file(&dir, "a.xlsx", &sheets("")),
+        book_file(&dir, "b.xlsx", &sheets(&cells(f))),
+    ];
+    let (_, parts) = merged_files("quotes-out", &paths);
+    let out = text(&parts, "xl/worksheets/sheet3.xml");
+    assert!(
+        out.contains(
+            r#"'It''s (2)'!A1&amp;"It's!A1"&amp;"'It''s'!A1"&amp;SUM('It''s (2):Z (2)'!B2)"#
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_base_spelling_every_element_with_a_prefix_gets_sheets_spelled_the_same() {
+    const S: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let dir = temp_dir("x-prefix");
+    let mut first = book(&[("A", "")], None);
+    let workbook = format!(
+        r#"<x:workbook xmlns:x="{S}" xmlns:rel="{R}"><x:sheets><x:sheet name="A" sheetId="1" rel:id="rId1"/></x:sheets></x:workbook>"#
+    );
+    set(&mut first, "xl/workbook.xml", workbook.as_bytes());
+    let sheet = format!(r#"<x:worksheet xmlns:x="{S}"><x:sheetData/></x:worksheet>"#);
+    set(&mut first, "xl/worksheets/sheet1.xml", sheet.as_bytes());
+    let paths = [
+        book_file(&dir, "a.xlsx", &first),
+        book_file(&dir, "b.xlsx", &book(&[("B", "")], None)),
+    ];
+    let (_, parts) = merged_files("x-prefix-out", &paths);
+    let out = text(&parts, "xl/workbook.xml");
+    assert_prefixes_bound(&out);
+    assert!(
+        out.contains(r#"<x:sheet name="B" sheetId="2" rel:id="#),
+        "{out}"
+    );
+}
+
+#[test]
+#[ignore = "known bug: DM15"]
+fn a_base_declaring_its_relationship_prefix_on_each_sheet_takes_more_sheets() {
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let dir = temp_dir("sheet-prefix");
+    let mut first = book(&[("A", "")], None);
+    let workbook = format!(
+        r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet xmlns:r="{R}" name="A" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    set(&mut first, "xl/workbook.xml", workbook.as_bytes());
+    let paths = [book_file(&dir, "a.xlsx", &first), fixture("a.xlsx")];
+    let (_, parts) = merged_files("sheet-prefix-out", &paths);
+    assert_prefixes_bound(&text(&parts, "xl/workbook.xml"));
+}
+
+/// The `name` attributes of the defined names in `workbook`.
+fn defined(workbook: &str) -> Vec<String> {
+    let names = workbook.split("<definedName name=\"").skip(1);
+    names
+        .map(|s| s[..s.find('"').unwrap()].to_string())
+        .collect()
+}
+
+#[test]
+#[ignore = "known bug: DM01"]
+fn a_long_chain_of_names_keeps_both_workbooks_results() {
+    let chain = |end: u32| {
+        let links =
+            (0..12).map(|i| format!(r#"<definedName name="N{i:02}">N{:02}</definedName>"#, i + 1));
+        let last = format!(r#"<definedName name="N12">{end}</definedName>"#);
+        links.collect::<String>() + &last
+    };
+    let cells = r#"<row r="1"><c r="A1"><f>N00</f></c></row>"#;
+    let dir = temp_dir("chain");
+    let paths = [
+        book_file(&dir, "a.xlsx", &named_book(cells, &chain(1))),
+        book_file(&dir, "b.xlsx", &named_book(cells, &chain(2))),
+    ];
+    let (_, parts) = merged_files("chain-out", &paths);
+    let workbook = text(&parts, "xl/workbook.xml");
+    let names = defined(&workbook);
+    let unique: std::collections::HashSet<&String> = names.iter().collect();
+    assert_eq!(unique.len(), names.len(), "{workbook}");
+    assert_eq!(names.len(), 26, "{workbook}");
+    let appended = text(&parts, "xl/worksheets/sheet3.xml");
+    assert!(appended.contains("<f>N00_2</f>"), "{appended}");
+}
+
+#[test]
+#[ignore = "known bug: DM05"]
+fn a_name_at_the_length_limit_stays_within_it_when_renamed() {
+    let long = "L".repeat(255);
+    let names = |v: u32| format!(r#"<definedName name="{long}">{v}</definedName>"#);
+    let dir = temp_dir("long-name");
+    let paths = [
+        book_file(&dir, "a.xlsx", &named_book("", &names(1))),
+        book_file(&dir, "b.xlsx", &named_book("", &names(2))),
+    ];
+    let (_, parts) = merged_files("long-name-out", &paths);
+    let workbook = text(&parts, "xl/workbook.xml");
+    for name in defined(&workbook) {
+        assert!(name.len() <= 255, "{} characters", name.len());
+    }
+}
+
+#[test]
+#[ignore = "known bug: DM04"]
+fn a_theme_font_with_no_cached_name_gets_it_in_schema_order() {
+    let lists = |font: &str| {
+        format!(
+            r#"<fonts count="1"><font>{font}</font></fonts>{FILLS}{BORDERS}<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>"#
+        )
+    };
+    let dir = temp_dir("font-order");
+    let mut first = book(&[("A", "")], None);
+    with_styles(&mut first, &lists(r#"<sz val="11"/><name val="Arial"/>"#));
+    with_theme(&mut first, "000000", "11", "Arial");
+    let mut second = book(
+        &[("B", r#"<row r="1"><c r="A1" s="0"><v>1</v></c></row>"#)],
+        None,
+    );
+    with_styles(
+        &mut second,
+        &lists(r#"<sz val="20"/><family val="2"/><scheme val="minor"/>"#),
+    );
+    with_theme(&mut second, "000000", "22", "Trebuchet MS");
+    let paths = [
+        book_file(&dir, "a.xlsx", &first),
+        book_file(&dir, "b.xlsx", &second),
+    ];
+    let (_, parts) = merged_files("font-order-out", &paths);
+    let out = text(&parts, "xl/styles.xml");
+    assert!(
+        out.contains(r#"<name val="Trebuchet MS"/><family val="2"/>"#),
+        "{out}"
+    );
+}
+
+#[test]
+#[ignore = "known bug: DM06"]
+fn a_cell_keeping_its_font_under_the_bases_named_style_says_so() {
+    let a = plain_styles("0.0", "");
+    let b = plain_styles("0.0", "").replace("Calibri", "Arial");
+    let cells = r#"<row r="1"><c r="A1" s="0"><v>1</v></c></row>"#;
+    let (_, parts) = styled_pair("apply-font", &a, &b, cells);
+    let sheet = text(&parts, "xl/styles.xml");
+    let xfs = sheet.split("<cellXfs").nth(1).unwrap();
+    let copied = xfs.split("<xf ").nth(4).unwrap();
+    assert!(copied.contains(r#"applyFont="1""#), "{sheet}");
+}

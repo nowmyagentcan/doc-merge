@@ -484,3 +484,53 @@ fn fixtures_carry_no_personal_data() {
         }
     }
 }
+
+#[test]
+fn a_zip_written_as_a_stream_opens() {
+    let mut w = zip::ZipWriter::new_stream(Vec::new());
+    for (name, data) in docx() {
+        w.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut w, &data).unwrap();
+    }
+    let bytes = w.finish().unwrap().into_inner();
+    assert!(open(&write(&temp_dir("stream"), "a.docx", &bytes)).is_ok());
+}
+
+#[test]
+#[ignore = "known bug: DM17"]
+fn a_time_that_differs_between_the_two_zip_headers_is_no_damage() {
+    let mut bytes = build(&docx());
+    let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    bytes[central + 12] ^= 1;
+    let opened = open(&write(&temp_dir("time"), "a.docx", &bytes));
+    assert!(opened.is_ok(), "{:?}", opened.err().map(|e| e.message));
+}
+
+#[test]
+#[ignore = "known bug: DM10"]
+fn a_part_name_with_a_character_across_byte_15_opens() {
+    let mut parts = docx();
+    set(&mut parts, "customXml/测试文档.xml", b"<a/>");
+    let opened = open(&write(&temp_dir("wide"), "a.docx", &build(&parts)));
+    assert!(opened.is_ok(), "{:?}", opened.err().map(|e| e.message));
+}
+
+#[test]
+fn a_backslash_in_a_raw_zip_name_is_refused() {
+    let source = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/c.docx"
+    ))
+    .unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(source)).unwrap();
+    let mut list = vec![raw("word\\bad.xml", b"<a/>")];
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let mut data = vec![];
+        std::io::Read::read_to_end(&mut f, &mut data).unwrap();
+        list.push(raw(&f.name().unwrap(), &data));
+    }
+    list.rotate_left(1);
+    assert_eq!(refused("backslash", &raw_zip(&list)).code, "bad_package");
+}

@@ -1113,3 +1113,43 @@ fn part_names_with_spaces_are_followed_and_kept_escaped() {
     let copy = rels_of(&slides(&parts)[1]);
     assert!(text(&parts, &copy).contains("../media/my%20pic1.png"));
 }
+
+#[test]
+#[ignore = "known bug: DM16"]
+fn a_notes_master_only_related_and_not_listed_is_still_the_decks_one() {
+    let dir = temp_dir("unlisted-notes");
+    let mut base = entries(&fixture("a.pptx"));
+    let main = text(&base, "ppt/presentation.xml");
+    let from = main.find("<p:notesMasterIdLst").unwrap();
+    let to = main.find("</p:notesMasterIdLst>").unwrap() + "</p:notesMasterIdLst>".len();
+    let unlisted = format!("{}{}", &main[..from], &main[to..]);
+    set(&mut base, "ppt/presentation.xml", unlisted.as_bytes());
+    let paths = [file(&dir, "a.pptx", &base), fixture("b.pptx")];
+    let (_, parts) = merged_files("unlisted-notes-out", &paths);
+    let rels = text(&parts, "ppt/_rels/presentation.xml.rels");
+    assert_eq!(
+        rels.matches("relationships/notesMaster\"").count(),
+        1,
+        "{rels}"
+    );
+    assert_eq!(names(&parts, "ppt/notesMasters/notesMaster").len(), 1);
+    let main = text(&parts, "ppt/presentation.xml");
+    assert_eq!(main.matches("<p:notesMasterId ").count(), 1, "{main}");
+}
+
+#[test]
+#[ignore = "known bug: DM18"]
+fn a_base_part_pointing_at_nothing_is_not_a_fault_of_ours() {
+    let dir = temp_dir("dangling");
+    let mut second = entries(&fixture("b.pptx"));
+    let name = "ppt/slides/_rels/slide1.xml.rels";
+    let rels = text(&second, name).replace(
+        "</Relationships>",
+        &format!(r#"<Relationship Id="rId99" Type="{R}/image" Target="/"/></Relationships>"#),
+    );
+    set(&mut second, name, rels.as_bytes());
+    let paths = [file(&dir, "b.pptx", &second), fixture("a.pptx")];
+    let merged = merge(&paths, &dir.join("o.pptx"), &Options::default(), None);
+    let code = merged.err().map(|e| e.code);
+    assert_ne!(code.as_deref(), Some("internal"));
+}

@@ -920,3 +920,30 @@ fn no_arguments_without_a_terminal_are_a_usage_error() {
         "✗ No files given.\n  Try: doc-merge a.pptx b.pptx -o all.pptx\n"
     );
 }
+
+#[test]
+fn runs_side_by_side_each_get_their_own_automatic_name() {
+    let dir = folder("side-by-side", &["a.docx", "b.docx"]);
+    let runs: Vec<_> = (0..6)
+        .map(|_| {
+            let dir = dir.clone();
+            std::thread::spawn(move || run_in(&dir, &["a.docx", "b.docx", "--json"]))
+        })
+        .collect();
+    let mut seen: Vec<String> = runs
+        .into_iter()
+        .map(|r| {
+            let o = r.join().unwrap();
+            assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+            json(&o)["output"]["path"].as_str().unwrap().to_string()
+        })
+        .collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 6, "{seen:?}");
+    let written = names_in(&dir)
+        .iter()
+        .filter(|n| n.starts_with("merged"))
+        .count();
+    assert_eq!(written, 6);
+}

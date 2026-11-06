@@ -422,3 +422,34 @@ pub fn text(entries: &[(String, Vec<u8>)], name: &str) -> String {
         .unwrap_or_else(|| panic!("no part {name}"));
     String::from_utf8(e.1.clone()).unwrap()
 }
+
+/// Panics when an element or attribute of `xml` uses a prefix no declaration in scope binds.
+pub fn assert_prefixes_bound(xml: &str) {
+    use quick_xml::NsReader;
+    use quick_xml::events::Event;
+    use quick_xml::name::ResolveResult;
+    let mut r = NsReader::from_str(xml);
+    loop {
+        match r.read_event().unwrap() {
+            Event::Eof => return,
+            Event::Start(e) | Event::Empty(e) => {
+                let (ns, _) = r.resolver().resolve_element(e.name());
+                assert!(
+                    !matches!(ns, ResolveResult::Unknown(_)),
+                    "unbound element in {xml}"
+                );
+                for a in e.attributes() {
+                    let a = a.unwrap();
+                    if a.key.as_namespace_binding().is_none() {
+                        let (ns, _) = r.resolver().resolve_attribute(a.key);
+                        assert!(
+                            !matches!(ns, ResolveResult::Unknown(_)),
+                            "unbound attribute in {xml}"
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}

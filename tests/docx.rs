@@ -1217,3 +1217,132 @@ fn even_headers_take_their_schema_place_in_the_bases_settings() {
         assert_eq!(count(&merged, "evenAndOddHeaders"), 1);
     }
 }
+
+#[test]
+fn every_word_of_each_input_comes_through_in_order() {
+    let (_, parts) = merged("all-words", &["a.docx", "b.docx", "c.docx"]);
+    let out = words(&text(&parts, "word/document.xml"));
+    let mut from = 0;
+    for name in ["a.docx", "b.docx", "c.docx"] {
+        let own = words(&text(&entries(&fixture(name)), "word/document.xml"));
+        let at = out[from..].find(&own).unwrap_or_else(|| panic!("{name}"));
+        from += at + own.len();
+    }
+    assert_eq!(from, out.len());
+}
+
+/// A notes part with its two separators and one note marked by `mark`, holding `say`.
+fn notes_part(kind: &str, item: &str, mark: &str, say: &str) -> String {
+    format!(
+        r#"<w:{kind} xmlns:w="{WORD_NS}"><w:{item} w:type="separator" w:id="-1"><w:p/></w:{item}><w:{item} w:type="continuationSeparator" w:id="0"><w:p/></w:{item}><w:{item} {mark} w:id="1"><w:p><w:r><w:t>{say}</w:t></w:r></w:p></w:{item}></w:{kind}>"#
+    )
+}
+
+#[test]
+#[ignore = "known bug: DM02"]
+fn notes_marked_normal_are_copied_like_unmarked_ones() {
+    for (kind, item, reference) in [
+        ("footnotes", "footnote", "footnoteReference"),
+        ("endnotes", "endnote", "endnoteReference"),
+    ] {
+        let dir = temp_dir("normal-notes");
+        let body = format!(r#"<w:p><w:r><w:{reference} w:id="1"/></w:r></w:p>"#);
+        let part = format!("word/{kind}.xml");
+        let base = notes_part(kind, item, "", "from the base");
+        let other = notes_part(kind, item, r#"w:type="normal""#, "from the second");
+        let files = [
+            word_file(&dir, "a.docx", &body, &[(&part, kind, &base)]),
+            word_file(&dir, "b.docx", &body, &[(&part, kind, &other)]),
+        ];
+        let (_, parts) = merge_files(&dir, &files);
+        let notes = text(&parts, &part);
+        assert!(notes.contains("from the base"), "{notes}");
+        assert!(notes.contains("from the second"), "{notes}");
+        let doc = text(&parts, "word/document.xml");
+        assert_eq!(values(&doc, reference, "w:id"), ["1", "2"], "{doc}");
+    }
+}
+
+#[test]
+#[ignore = "known bug: DM03"]
+fn a_colour_only_the_bases_defaults_set_stays_out_of_the_next_document() {
+    let styles = |defaults: &str| {
+        format!(
+            r#"<w:styles xmlns:w="{WORD_NS}"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/>{defaults}</w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style></w:styles>"#
+        )
+    };
+    let dir = temp_dir("default-colour");
+    let body = "<w:p><w:r><w:t>x</w:t></w:r></w:p>";
+    let (base, other) = (styles(r#"<w:color w:val="595959"/>"#), styles(""));
+    let files = [
+        word_file(
+            &dir,
+            "a.docx",
+            body,
+            &[("word/styles.xml", "styles", &base)],
+        ),
+        word_file(
+            &dir,
+            "b.docx",
+            body,
+            &[("word/styles.xml", "styles", &other)],
+        ),
+    ];
+    let (_, parts) = merge_files(&dir, &files);
+    let out = text(&parts, "word/styles.xml");
+    let copy = out.split("Normal (2)").nth(1).expect("a renamed Normal");
+    assert!(copy.contains(r#"<w:color w:val="auto""#), "{out}");
+}
+
+#[test]
+#[ignore = "known bug: DM07"]
+fn a_control_character_in_a_part_is_refused() {
+    let dir = temp_dir("control");
+    let plain = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    for (i, body) in [
+        "<w:p><w:r><w:t>a\u{1}b</w:t></w:r></w:p>",
+        "<w:p w:rsidR=\"\u{1}\"/>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let bad = word_file(&dir, &format!("b{i}.docx"), body, &[]);
+        let files = [plain.clone(), bad];
+        let e = merge(&files, &dir.join("o.docx"), &Options::default(), None).unwrap_err();
+        assert_eq!(e.code, "bad_package", "{body}");
+    }
+}
+
+#[test]
+#[ignore = "known bug: DM08"]
+fn a_prefix_nothing_declares_is_refused() {
+    let dir = temp_dir("unbound");
+    let plain = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    for (i, body) in ["<bogus:p/>", r#"<w:p qa:x="1"/>"#].iter().enumerate() {
+        let bad = word_file(&dir, &format!("b{i}.docx"), body, &[]);
+        let files = [plain.clone(), bad];
+        let e = merge(&files, &dir.join("o.docx"), &Options::default(), None).unwrap_err();
+        assert_eq!(e.code, "bad_package", "{body}");
+    }
+}
+
+#[test]
+#[ignore = "known bug: DM09"]
+fn a_doctype_in_a_part_copied_unread_is_refused() {
+    let dir = temp_dir("raw-doctype");
+    let plain = word_file(&dir, "a.docx", "<w:p/>", &[]);
+    let extra = [(
+        "word/data.xml",
+        "data",
+        r#"<!DOCTYPE a [<!ENTITY x "x">]><a/>"#,
+    )];
+    let bad = word_file(&dir, "b.docx", r#"<w:p r:id="rId1"/>"#, &extra);
+    let e = merge(
+        &[plain, bad],
+        &dir.join("o.docx"),
+        &Options::default(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "bad_package", "{}", e.message);
+}
