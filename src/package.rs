@@ -3,7 +3,7 @@
 //! decided from the package and never from the file name. Parts are inflated only when asked
 //! for, each within its cap and the run's allowance.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use quick_xml::events::Event;
 use schemars::JsonSchema;
 use serde::Serialize;
+use zip::result::ZipError;
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::error::{Error, Foreign, mib, thousands};
@@ -424,8 +425,13 @@ impl Package {
 
         let mut entries = vec![];
         let mut by_name = HashMap::new();
+        let mut times = BTreeMap::new();
         for index in 0..zip.len() {
             let e = zip.by_index_data(index).map_err(|e| unreadable(&e))?;
+            if let Some(t) = e.last_modified().filter(|_| e.header_start() < len) {
+                let bytes = [t.timepart().to_le_bytes(), t.datepart().to_le_bytes()].concat();
+                times.extend((e.header_start() + 10..).zip(bytes));
+            }
             let part = e.name().map_err(|e| unreadable(&e))?.into_owned();
             if part.ends_with('/') && e.size() == 0 {
                 continue;
@@ -459,14 +465,20 @@ impl Package {
                 time: e.last_modified(),
             });
         }
-        zip.validate_header_consistency().map_err(|e| {
+        let damaged = |e: ZipError| {
             let overlap = e.to_string().contains("overlapping");
             origin.bad(if overlap {
                 "zip entries overlap"
             } else {
                 "its zip index doesn't match its contents"
             })
-        })?;
+        };
+        match zip.validate_header_consistency() {
+            Err(e) if e.to_string().contains("last modified time") => {
+                zip = with_central_times(zip, times).map_err(damaged)?;
+            }
+            other => other.map_err(damaged)?,
+        }
 
         let mut pkg = Package {
             origin: origin.clone(),
@@ -613,6 +625,47 @@ impl Package {
     }
 }
 
+/// `zip` once its headers agree in all but the time: Office's own templates differ there,
+/// which changes nothing in the package.
+fn with_central_times(
+    zip: ZipArchive<Box<dyn Source>>,
+    times: BTreeMap<u64, u8>,
+) -> Result<ZipArchive<Box<dyn Source>>, ZipError> {
+    let source = zip.into_inner();
+    let mut view = ZipArchive::new(CentralTimes {
+        source,
+        times,
+        at: 0,
+    })?;
+    view.validate_header_consistency()?;
+    ZipArchive::new(view.into_inner().source)
+}
+
+/// A source read as if each local zip header had the central directory's time.
+struct CentralTimes {
+    source: Box<dyn Source>,
+    times: BTreeMap<u64, u8>,
+    at: u64,
+}
+
+impl Read for CentralTimes {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.source.read(buf)?;
+        for (at, byte) in self.times.range(self.at..self.at + n as u64) {
+            buf[(at - self.at) as usize] = *byte;
+        }
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for CentralTimes {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.at = self.source.seek(to)?;
+        Ok(self.at)
+    }
+}
+
 fn too_big(part: &str, origin: &Origin, size: u64, limit: &str) -> Error {
     let what = format!("Part {part} of '{}'", origin.name);
     Error::limit_exceeded(&what, &mib(size), limit).at(origin.input)
@@ -620,7 +673,9 @@ fn too_big(part: &str, origin: &Origin, size: u64, limit: &str) -> Error {
 
 /// Whether a part belongs to a digital signature.
 pub fn is_signature(part: &str) -> bool {
-    part.len() > 15 && part[..15].eq_ignore_ascii_case("_xmlsignatures/")
+    part.as_bytes()
+        .get(..15)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"_xmlsignatures/"))
 }
 
 /// OPC part-name rules: no empty name, leading `/`, `\`, empty, `.` or `..` segments, drive

@@ -498,7 +498,6 @@ fn a_zip_written_as_a_stream_opens() {
 }
 
 #[test]
-#[ignore = "known bug: DM17"]
 fn a_time_that_differs_between_the_two_zip_headers_is_no_damage() {
     let mut bytes = build(&docx());
     let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
@@ -508,7 +507,6 @@ fn a_time_that_differs_between_the_two_zip_headers_is_no_damage() {
 }
 
 #[test]
-#[ignore = "known bug: DM10"]
 fn a_part_name_with_a_character_across_byte_15_opens() {
     let mut parts = docx();
     set(&mut parts, "customXml/测试文档.xml", b"<a/>");
