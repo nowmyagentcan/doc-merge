@@ -1151,5 +1151,5 @@ fn a_base_part_pointing_at_nothing_is_not_a_fault_of_ours() {
     let paths = [file(&dir, "b.pptx", &second), fixture("a.pptx")];
     let merged = merge(&paths, &dir.join("o.pptx"), &Options::default(), None);
     let code = merged.err().map(|e| e.code);
-    assert_ne!(code.as_deref(), Some("internal"));
+    assert_ne!(code, Some("internal"));
 }
