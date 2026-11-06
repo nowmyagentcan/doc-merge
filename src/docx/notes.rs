@@ -133,7 +133,7 @@ impl Notes {
         let adopt = self.base.is_none() && !self.adopted;
         self.adopted = true;
         let items = || tree.nodes().filter(|n| n.is(W, self.item));
-        let typed = |n: &&xml::Node| n.attr(W, "type").is_some();
+        let typed = |n: &&xml::Node| n.attr(W, "type").is_some_and(|t| t != "normal");
         if adopt && let Some(m) = items().filter(typed).map(number).max() {
             self.next = self.next.max(m + 1);
         }

@@ -1239,7 +1239,6 @@ fn notes_part(kind: &str, item: &str, mark: &str, say: &str) -> String {
 }
 
 #[test]
-#[ignore = "known bug: DM02"]
 fn notes_marked_normal_are_copied_like_unmarked_ones() {
     for (kind, item, reference) in [
         ("footnotes", "footnote", "footnoteReference"),
@@ -1259,7 +1258,8 @@ fn notes_marked_normal_are_copied_like_unmarked_ones() {
         assert!(notes.contains("from the base"), "{notes}");
         assert!(notes.contains("from the second"), "{notes}");
         let doc = text(&parts, "word/document.xml");
-        assert_eq!(values(&doc, reference, "w:id"), ["1", "2"], "{doc}");
+        let found = values(&doc, &format!("w:{reference}"), "w:id");
+        assert_eq!(found, ["1", "2"], "{doc}");
     }
 }
 
