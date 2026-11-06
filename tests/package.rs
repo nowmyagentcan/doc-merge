@@ -518,19 +518,7 @@ fn a_part_name_with_a_character_across_byte_15_opens() {
 
 #[test]
 fn a_backslash_in_a_raw_zip_name_is_refused() {
-    let source = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/c.docx"
-    ))
-    .unwrap();
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(source)).unwrap();
-    let mut list = vec![raw("word\\bad.xml", b"<a/>")];
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).unwrap();
-        let mut data = vec![];
-        std::io::Read::read_to_end(&mut f, &mut data).unwrap();
-        list.push(raw(&f.name().unwrap(), &data));
-    }
-    list.rotate_left(1);
+    let mut list: Vec<Raw> = docx().iter().map(|(n, d)| raw(n, d)).collect();
+    list.push(raw("word\bad.xml", b"<a/>"));
     assert_eq!(refused("backslash", &raw_zip(&list)).code, "bad_package");
 }
