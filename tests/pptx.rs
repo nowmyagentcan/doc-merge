@@ -1115,7 +1115,6 @@ fn part_names_with_spaces_are_followed_and_kept_escaped() {
 }
 
 #[test]
-#[ignore = "known bug: DM16"]
 fn a_notes_master_only_related_and_not_listed_is_still_the_decks_one() {
     let dir = temp_dir("unlisted-notes");
     let mut base = entries(&fixture("a.pptx"));

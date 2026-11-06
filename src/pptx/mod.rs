@@ -13,7 +13,7 @@ use crate::Rename;
 use crate::error::{Error, Warning, Warnings, thousands};
 use crate::package::{Entry, MAX_PARSED, Package, Rel, parse_rels, rels_name, resolve, unescape};
 use crate::writer::{Body, Part, Plan, R, Rels, guid, planned_text, relative, rels_part};
-use crate::xml::{self, A, Attr, Child, Node, Prefixes, XMLNS, declaration, prefix_of};
+use crate::xml::{self, A, Attr, Child, Node, Prefixes, XMLNS, declaration, declared_prefix};
 use masters::{Design, Fit, Units, ratio};
 
 pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
@@ -260,8 +260,13 @@ impl Deck {
                 layouts,
             });
         }
-        let notes_master = listed(&root, "notesMasterIdLst").next();
-        let notes_master = notes_master.map(|n| part(pkg, n)).transpose()?;
+        let related = rels.iter().find(|r| kind(r) == "notesMaster");
+        let notes_master = match listed(&root, "notesMasterIdLst").next() {
+            Some(n) => Some(part(pkg, n)?),
+            None => related
+                .map(|r| target(pkg, &main, &rels, &r.id))
+                .transpose()?,
+        };
         let mut slides = vec![];
         for n in listed(&root, "sldIdLst") {
             let slide = part(pkg, n)?;
@@ -527,24 +532,6 @@ fn prefix(root: &Node) -> String {
     root.name[..root.name.len() - root.local.len()].to_string()
 }
 
-/// The prefix of the relationships namespace on `root`, declared there when missing.
-fn rel_prefix(root: &mut Node) -> String {
-    if let Some(p) = prefix_of(&root.attrs, R) {
-        return format!("{p}:");
-    }
-    let mut name = String::from("r");
-    while root
-        .attrs
-        .iter()
-        .any(|a| a.is_declaration() && a.local == name)
-    {
-        name.push('r');
-    }
-    root.attrs
-        .push(Attr::new(&format!("xmlns:{name}"), XMLNS, R));
-    format!("{name}:")
-}
-
 /// A child list of the main part, added in its schema place when missing.
 fn list<'a>(root: &'a mut Node, local: &str) -> &'a mut Node {
     let at = ORDER
@@ -642,6 +629,11 @@ impl Output {
         };
         let same = deck.slides.iter().map(|s| (s.id, s.id)).collect();
         out.add_sections(deck, 0, &same);
+        if listed(&deck.root, "notesMasterIdLst").next().is_none()
+            && let Some(r) = deck.rels.iter().find(|r| kind(r) == "notesMaster")
+        {
+            out.list_entry("notesMasterIdLst", "notesMasterId", None, &r.id);
+        }
         Ok(out)
     }
 
@@ -882,15 +874,20 @@ impl Output {
     ) -> String {
         let target = relative(&self.main, part);
         let rid = self.rels.add(&format!("{REL}{kind}"), target, false);
-        let (p, r) = (prefix(&self.root), rel_prefix(&mut self.root));
+        self.list_entry(of, local, id, &rid);
+        rid
+    }
+
+    /// Adds an entry for the relationship `rid` to the list `of` of the main part.
+    fn list_entry(&mut self, of: &str, local: &str, id: Option<u32>, rid: &str) {
+        let (p, r) = (prefix(&self.root), declared_prefix(&mut self.root, R, "r"));
         let mut attrs: Vec<Attr> = id
             .iter()
             .map(|id| Attr::new("id", "", &id.to_string()))
             .collect();
-        attrs.push(Attr::new(&format!("{r}id"), R, &rid));
+        attrs.push(Attr::new(&format!("{r}:id"), R, rid));
         let entry = Node::new(&format!("{p}{local}"), P, attrs);
         list(&mut self.root, of).children.push(Child::Node(entry));
-        rid
     }
 
     /// Copies a master with its layouts, theme and pictures under new ids, fitted to the
