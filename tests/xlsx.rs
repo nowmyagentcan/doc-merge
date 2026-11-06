@@ -1734,7 +1734,6 @@ fn a_base_spelling_every_element_with_a_prefix_gets_sheets_spelled_the_same() {
 }
 
 #[test]
-#[ignore = "known bug: DM15"]
 fn a_base_declaring_its_relationship_prefix_on_each_sheet_takes_more_sheets() {
     const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     let dir = temp_dir("sheet-prefix");
@@ -1757,15 +1756,18 @@ fn defined(workbook: &str) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "known bug: DM01"]
 fn a_long_chain_of_names_keeps_both_workbooks_results() {
     let chain = |end: u32| {
-        let links =
-            (0..12).map(|i| format!(r#"<definedName name="N{i:02}">N{:02}</definedName>"#, i + 1));
-        let last = format!(r#"<definedName name="N12">{end}</definedName>"#);
+        let links = (0..12).map(|i| {
+            format!(
+                r#"<definedName name="QA_N{i:02}">QA_N{:02}</definedName>"#,
+                i + 1
+            )
+        });
+        let last = format!(r#"<definedName name="QA_N12">{end}</definedName>"#);
         links.collect::<String>() + &last
     };
-    let cells = r#"<row r="1"><c r="A1"><f>N00</f></c></row>"#;
+    let cells = r#"<row r="1"><c r="A1"><f>QA_N00</f></c></row>"#;
     let dir = temp_dir("chain");
     let paths = [
         book_file(&dir, "a.xlsx", &named_book(cells, &chain(1))),
@@ -1778,7 +1780,7 @@ fn a_long_chain_of_names_keeps_both_workbooks_results() {
     assert_eq!(unique.len(), names.len(), "{workbook}");
     assert_eq!(names.len(), 26, "{workbook}");
     let appended = text(&parts, "xl/worksheets/sheet3.xml");
-    assert!(appended.contains("<f>N00_2</f>"), "{appended}");
+    assert!(appended.contains("<f>QA_N00_2</f>"), "{appended}");
 }
 
 #[test]

@@ -14,10 +14,11 @@ use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
 
+use crate::Run;
 use crate::error::{Error, Warning, Warnings, thousands};
 use crate::package::{MAX_PARSED, MAX_STREAMED, Package, Rel, resolve};
 use crate::writer::{Body, Plan, R, Rels, relative, rels_part};
-use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, prefix_of, start_tag};
+use crate::xml::{self, Attr, Node, Prefixes, Reader, declaration, declared_prefix, start_tag};
 use crate::{Origin, Rename, SheetName};
 
 pub const S: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -28,7 +29,6 @@ const XM: &str = "http://schemas.microsoft.com/office/excel/2006/main";
 const X14: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
 const DYNAMIC_ARRAYS: &str = "XLDAPR";
 const MAX_SHEETS: usize = 10_000;
-const NAME_ROUNDS: usize = 8;
 /// Excel's limit, counted in UTF-16 units.
 const MAX_SHEET_NAME: usize = 31;
 
@@ -779,6 +779,7 @@ impl Output {
         names: &[Defined],
         found: &mut Found,
         input: usize,
+        run: &Run,
     ) -> Result<Vec<Node>, Error> {
         let mut own: HashSet<String> = names.iter().map(|d| d.key.clone()).collect();
         own.extend(tables.iter().map(|t| t.name.to_lowercase()));
@@ -796,9 +797,11 @@ impl Output {
         let none = HashSet::new();
         let wide: Vec<&Defined> = names.iter().filter(|d| d.sheet.is_none()).collect();
         // A name equal to the output's stops being equal when a name it uses is renamed; one
-        // pass per link of such a chain, up to a depth no real workbook reaches.
-        for _ in 0..NAME_ROUNDS {
-            let mut changed = false;
+        // pass per link of such a chain.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            run.on_time()?;
             for d in &wide {
                 let Some(there) = self.used.get(&d.key) else {
                     continue;
@@ -818,9 +821,6 @@ impl Output {
                     found.note(input, "defined_name", &d.name, &new);
                     changed = true;
                 }
-            }
-            if !changed {
-                break;
             }
         }
         let first = self.sheet_count - found.locals.len();
@@ -879,8 +879,8 @@ impl Output {
 
     /// An appended workbook's list entry, spelled the way the output spells them and with the
     /// relationship id `id`.
-    fn with_id(&self, mut node: Node, local: &str, id: &str) -> Node {
-        let r = prefix_of(&self.book.tree.attrs, R).unwrap_or("r");
+    fn with_id(&mut self, mut node: Node, local: &str, id: &str) -> Node {
+        let r = declared_prefix(&mut self.book.tree, R, "r");
         node.name = format!("{}{local}", prefix(&self.book.tree));
         node.attrs.retain(|a| a.ns != R);
         node.attrs.push(Attr::new(&format!("{r}:id"), R, id));
@@ -936,7 +936,7 @@ impl Output {
         }
         found.renames.links = self.copy_links(plan, inputs, i, &book)?;
         let tables = tables(&mut inputs[i])?;
-        let added = self.settle_names(&tables, &names, &mut found, i + 1)?;
+        let added = self.settle_names(&tables, &names, &mut found, i + 1, &origin.run)?;
         if !added.is_empty() {
             let after = ["sheets", "functionGroups", "externalReferences"];
             let list = self.book.tree.child_or_insert(S, "definedNames", &after);

@@ -200,6 +200,25 @@ impl<'a> Reader<'a> {
             .resolve_prefix(QName(&name).prefix(), false))
     }
 
+    /// The first name on `e` whose prefix nothing in scope declares.
+    pub fn unbound(&self, e: &BytesStart<'a>) -> Result<Option<String>, Error> {
+        let spell = |n: QName| n.as_ref().to_string();
+        let resolver = self.inner.resolver();
+        let unknown = |r: ResolveResult| matches!(r, ResolveResult::Unknown(_));
+        if unknown(resolver.resolve_element(e.name()).0) {
+            return Ok(Some(spell(e.name())));
+        }
+        for a in e.attributes() {
+            let a = a.map_err(|e| self.malformed(&e.to_string()))?;
+            if a.key.as_namespace_binding().is_none()
+                && unknown(resolver.resolve_attribute(a.key).0)
+            {
+                return Ok(Some(spell(a.key)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Each attribute of `e` that isn't a namespace declaration: (namespace, local name, value
     /// with references resolved and whitespace normalised).
     pub fn attributes(&self, e: &BytesStart<'a>) -> Result<Vec<(&str, String, String)>, Error> {
@@ -696,6 +715,24 @@ pub fn prefix_of<'a>(root: &'a [Attr], ns: &str) -> Option<&'a str> {
     root.iter()
         .find(|a| a.is_declaration() && a.value == ns && !a.local.is_empty())
         .map(|a| a.local.as_str())
+}
+
+/// The prefix `root` binds to `ns`, declaring one based on `wanted` when it has none.
+pub fn declared_prefix(root: &mut Node, ns: &str, wanted: &str) -> String {
+    if let Some(p) = prefix_of(&root.attrs, ns) {
+        return p.to_string();
+    }
+    let mut name = wanted.to_string();
+    while root
+        .attrs
+        .iter()
+        .any(|a| a.is_declaration() && a.local == name)
+    {
+        name.push_str(wanted);
+    }
+    root.attrs
+        .push(Attr::new(&format!("xmlns:{name}"), XMLNS, ns));
+    name
 }
 
 /// The namespace declarations and `mc:Ignorable` prefixes a merged part's root element carries:

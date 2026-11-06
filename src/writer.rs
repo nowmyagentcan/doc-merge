@@ -517,7 +517,8 @@ pub fn planned_text(part: &Part, inputs: &mut [Package]) -> Result<Option<String
 
 /// The generic rules every merged package meets (each kind adds its own): every internal
 /// relationship target exists, every relationship-id attribute of a written XML part
-/// resolves in that part's relationships, every part is typed, no override names a missing
+/// resolves in that part's relationships, every prefix of a written XML part is declared,
+/// every part is typed, no override names a missing
 /// part, and no two names are equal ignoring case.
 pub fn check(plan: &Plan, inputs: &mut [Package]) -> Result<(), Error> {
     let internal = |d: String| Err(Error::internal(&d));
@@ -573,6 +574,9 @@ pub fn check(plan: &Plan, inputs: &mut [Package]) -> Result<(), Error> {
             match r.event()? {
                 Event::Eof => break,
                 Event::Start(e) | Event::Empty(e) => {
+                    if let Some(name) = r.unbound(&e)? {
+                        return internal(format!("{name} in {} has no declared prefix", p.name));
+                    }
                     for (ns, local, value) in r.attributes(&e)? {
                         if ns == R && !value.is_empty() && !ids.contains(value.as_str()) {
                             return internal(format!(
